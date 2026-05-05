@@ -9,6 +9,7 @@ if [ -z "$VPS_COMMON_LOADED" ]; then
 fi
 detect_os
 check_dependencies
+
 # -------- 防火墙 --------
 detect_firewall() {
     if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
