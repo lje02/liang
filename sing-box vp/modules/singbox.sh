@@ -1,11 +1,11 @@
 #!/bin/bash
-# 模块：sing-box 管理
+# sing‑box 管理模块
 
 if [ -z "$VPS_COMMON_LOADED" ]; then
-    source /usr/local/share/vps_modules/common.sh 2>/dev/null || {
+    source /usr/local/share/vp_modules/common.sh 2>/dev/null || {
         echo "无法加载公共函数库"
         exit 1
-    fi
+    }
 fi
 
 run_singbox_menu() {
