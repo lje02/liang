@@ -125,7 +125,8 @@ main_menu() {
             1) run_module "firewall_fail2ban.sh" ;;
             2) run_module "system_optimize.sh" ;;
             3) run_module "singbox.sh" ;;
-            4) run_module "remote_jump.sh" ;;
+            4) run_module "traffic_monitor.sh" ;;
+            5) run_module "remote_jump.sh" ;;
             u) update_script ;;
             m) update_modules ;;
             x) uninstall_script ;;
