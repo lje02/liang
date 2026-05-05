@@ -39,28 +39,38 @@ detect_firewall() {
 }
 
 install_firewall() {
+    local ssh_port=$(get_ssh_port)
     printf "${BLUE}正在安装防火墙...${NC}\n"
     if [ "$OS_FAMILY" = "debian" ]; then
         apt-get update -qq && apt-get install -y ufw || {
             printf "${RED}UFW 安装失败${NC}\n"; return
         }
-        printf "${GREEN}UFW 安装完成${NC}\n"
+        ufw allow "$ssh_port"/tcp      # 预置 SSH 规则
+        printf "${GREEN}UFW 安装完成，SSH 端口已预放行（防火墙未启用）${NC}\n"
     else
         yum install -y firewalld || {
             printf "${RED}firewalld 安装失败${NC}\n"; return
         }
         systemctl start firewalld && systemctl enable firewalld
-        printf "${GREEN}firewalld 安装完成${NC}\n"
+        firewall-cmd --zone=public --add-service=ssh --permanent
+        firewall-cmd --reload
+        printf "${GREEN}firewalld 安装并已启用，SSH 服务已放行${NC}\n"
     fi
 }
 
 enable_firewall() {
+    local ssh_port=$(get_ssh_port)   # 动态获取当前 SSH 端口
     if command -v ufw &>/dev/null; then
-        ufw --force enable && systemctl enable ufw
-        printf "${GREEN}UFW 已开启并设为开机自启${NC}\n"
+        ufw allow "$ssh_port"/tcp     # 提前放行 SSH
+        ufw --force enable
+        systemctl enable ufw
+        printf "${GREEN}UFW 已开启，SSH 端口 $ssh_port 已放行，并设为开机自启${NC}\n"
     elif command -v firewall-cmd &>/dev/null; then
+        firewall-cmd --zone=public --add-service=ssh --permanent 2>/dev/null || \
+        firewall-cmd --zone=public --add-port="${ssh_port}/tcp" --permanent
+        firewall-cmd --reload
         systemctl start firewalld && systemctl enable firewalld
-        printf "${GREEN}firewalld 已开启并设为开机自启${NC}\n"
+        printf "${GREEN}firewalld 已开启，SSH 服务已放行，并设为开机自启${NC}\n"
     else
         printf "${RED}未找到防火墙，请先安装${NC}\n"
     fi
