@@ -7,6 +7,8 @@ if [ -z "$VPS_COMMON_LOADED" ]; then
         exit 1
     }
 fi
+detect_os
+check_dependencies
 
 show_system_info() {
     clear
