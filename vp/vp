@@ -16,7 +16,7 @@ detect_os
 check_dependencies
 
 MODULE_DIR="/usr/local/share/vp_modules"
-MODULES_LIST=("firewall_fail2ban.sh" "system_optimize.sh" "remote_jump.sh" "singbox.sh")
+MODULES_LIST=("firewall_fail2ban.sh" "system_optimize.sh" "remote_jump.sh" "singbox.sh" "traffic_monitor.sh")
 
 # 自安装
 install_self() {
