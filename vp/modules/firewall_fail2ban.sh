@@ -12,12 +12,27 @@ check_dependencies
 
 # -------- 防火墙 --------
 detect_firewall() {
-    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
-        printf "${GREEN}已安装 (UFW)${NC}\n"
-    elif command -v firewall-cmd &>/dev/null && firewall-cmd --state 2>/dev/null | grep -q "running"; then
-        printf "${GREEN}已安装 (firewalld)${NC}\n"
+    if command -v ufw &>/dev/null; then
+        if ufw status | grep -q "Status: active"; then
+            printf "${GREEN}UFW 运行中${NC}\n"
+        else
+            printf "${YELLOW}UFW 已安装（未运行）${NC}\n"
+        fi
+    elif command -v firewall-cmd &>/dev/null; then
+        if firewall-cmd --state 2>/dev/null | grep -q "running"; then
+            printf "${GREEN}firewalld 运行中${NC}\n"
+        else
+            printf "${YELLOW}firewalld 已安装（未运行）${NC}\n"
+        fi
     elif command -v iptables &>/dev/null; then
-        printf "${YELLOW}已安装 (iptables)${NC}\n"
+        # iptables 检测：如果 INPUT 链有非 ACCEPT 策略或存在额外规则，视为“运行中”
+        local policy=$(iptables -L INPUT -n 2>/dev/null | head -1 | awk '{print $4}')
+        local rules_count=$(iptables -L INPUT -n 2>/dev/null | grep -c '^[0-9]')
+        if [ "$policy" != "ACCEPT" ] || [ "$rules_count" -gt 0 ]; then
+            printf "${GREEN}iptables 运行中${NC}\n"
+        else
+            printf "${YELLOW}iptables 已安装（未运行）${NC}\n"
+        fi
     else
         printf "${RED}未安装${NC}\n"
     fi
