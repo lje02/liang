@@ -16,8 +16,9 @@ detect_os
 check_dependencies
 
 MODULE_DIR="/usr/local/share/vp_modules"
+MODULES_LIST=("firewall_fail2ban.sh" "system_optimize.sh" "remote_jump.sh" "singbox.sh")
 
-# 自安装（--install 参数）
+# 自安装
 install_self() {
     local install_path="/usr/local/bin/vp"
     if [[ "$1" == "--install" ]]; then
@@ -28,24 +29,51 @@ install_self() {
     fi
 }
 
-# 更新
+# 更新主控脚本
 update_script() {
-    printf "${BLUE}正在从 GitHub 下载最新版本...${NC}\n"
+    printf "${BLUE}正在检查主控脚本更新...${NC}\n"
     local tmpfile="/tmp/vp_latest.sh"
     if curl -sL "$GITHUB_RAW_URL" -o "$tmpfile"; then
         local real_script
         real_script=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
         if diff "$real_script" "$tmpfile" &>/dev/null; then
-            printf "${GREEN}当前已是最新版本${NC}\n"; rm -f "$tmpfile"
+            printf "${GREEN}主控脚本已是最新版本${NC}\n"
+            rm -f "$tmpfile"
         else
             chmod +x "$tmpfile"
             mv "$tmpfile" "$real_script"
-            printf "${GREEN}脚本已更新，重新执行...${NC}\n"
+            printf "${GREEN}主控脚本已更新，重新执行...${NC}\n"
             exec "$real_script" "$@"
         fi
     else
-        printf "${RED}下载失败，请检查网络或仓库地址${NC}\n"
+        printf "${RED}下载失败，请检查网络${NC}\n"
     fi
+    read -p "按回车键继续..." dummy
+}
+
+# 更新所有模块
+update_modules() {
+    printf "${BLUE}正在同步所有模块...${NC}\n"
+    local base_url="https://raw.githubusercontent.com/lje02/liang/main/vp/modules"
+    local updated=0
+    for mod in "${MODULES_LIST[@]}"; do
+        printf "检查 %s ... " "$mod"
+        local tmp="/tmp/${mod}.new"
+        if curl -sSL "$base_url/$mod" -o "$tmp"; then
+            if [ -f "$MODULE_DIR/$mod" ] && diff "$MODULE_DIR/$mod" "$tmp" &>/dev/null; then
+                printf "${GREEN}已是最新${NC}\n"
+            else
+                mv "$tmp" "$MODULE_DIR/$mod"
+                chmod +x "$MODULE_DIR/$mod"
+                printf "${YELLOW}已更新${NC}\n"
+                ((updated++))
+            fi
+        else
+            printf "${RED}下载失败${NC}\n"
+            [ -f "$tmp" ] && rm -f "$tmp"
+        fi
+    done
+    [ $updated -gt 0 ] && printf "${GREEN}共更新了 %d 个模块。${NC}\n" $updated || printf "${GREEN}所有模块均为最新。${NC}\n"
     read -p "按回车键继续..." dummy
 }
 
@@ -88,7 +116,7 @@ main_menu() {
         printf "${BLUE}--- 远程管理 ---${PLAIN}\n"
         echo -e "4. 远程 SSH 跳转"
         echo -e "--------------------------------------------"
-        echo -e "u. 检查脚本更新  x. 卸载脚本  0. 退出"
+        echo -e "u. 检查主控更新  m. 更新所有模块  x. 卸载脚本  0. 退出"
         echo -e "--------------------------------------------"
         read -p "请输入选项: " main_choice
 
@@ -98,6 +126,7 @@ main_menu() {
             3) run_module "singbox.sh" ;;
             4) run_module "remote_jump.sh" ;;
             u) update_script ;;
+            m) update_modules ;;
             x) uninstall_script ;;
             0) exit 0 ;;
             *) printf "${RED}无效选项${NC}\n" && sleep 1 ;;
