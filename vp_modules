@@ -1,0 +1,110 @@
+#!/bin/bash
+# VPS 管理面板主控脚本
+
+# 加载公共库
+COMMON_PATH="/usr/local/share/vp_modules/common.sh"
+if [ -z "$VPS_COMMON_LOADED" ]; then
+    if [ -f "$COMMON_PATH" ]; then
+        source "$COMMON_PATH"
+    else
+        echo "错误：找不到公共库 $COMMON_PATH"
+        exit 1
+    fi
+fi
+
+check_root
+detect_os
+check_dependencies
+
+MODULE_DIR="/usr/local/share/vp_modules"
+
+# 全局安装
+install_self() {
+    local install_path="/usr/local/bin/vp"
+    if [[ "$1" == "--install" ]]; then
+        ln -sf "$(realpath "$0")" "$install_path"
+        chmod +x "$install_path"
+        printf "${GREEN}✔ 安装成功！现在输入 'vp' 即可启动面板。${PLAIN}\n"
+        exit 0
+    fi
+}
+
+# 更新主脚本
+update_script() {
+    printf "${BLUE}正在从 GitHub 下载最新主控脚本...${NC}\n"
+    local tmpfile="/tmp/vp_latest.sh"
+    if curl -sL "$GITHUB_RAW_URL" -o "$tmpfile"; then
+        local real_script
+        real_script=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
+        if diff "$real_script" "$tmpfile" &>/dev/null; then
+            printf "${GREEN}当前已是最新版本${NC}\n"; rm -f "$tmpfile"
+        else
+            chmod +x "$tmpfile"
+            mv "$tmpfile" "$real_script"
+            printf "${GREEN}脚本已更新，重新执行...${NC}\n"
+            exec "$real_script" "$@"
+        fi
+    else
+        printf "${RED}下载失败，请检查网络或仓库地址${NC}\n"
+    fi
+    read -p "按回车键继续..." dummy
+}
+
+# 卸载脚本
+uninstall_script() {
+    read -p "确定要卸载此管理脚本吗？此操作不可恢复！[y/N] " confirm
+    [[ ! $confirm =~ ^[Yy]$ ]] && return
+    local script_path
+    script_path=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
+    printf "${YELLOW}正在删除脚本文件: $script_path${NC}\n"
+    rm -f "$script_path"
+    rm -f /usr/local/bin/vp 2>/dev/null
+    rm -rf "$MODULE_DIR"
+    printf "${GREEN}卸载完成，再见！${NC}\n"
+    exit 0
+}
+
+# 模块调用辅助
+run_module() {
+    local mod_name="$1"
+    local mod_path="$MODULE_DIR/$mod_name"
+    if [ -f "$mod_path" ]; then
+        bash "$mod_path"
+    else
+        printf "${RED}模块 $mod_name 不存在，请安装后重试。${NC}\n"
+        read -p "按回车键继续..." dummy
+    fi
+}
+
+# 主菜单
+main_menu() {
+    while true; do
+        clear
+        printf "${GREEN}========== VPS 综合管理面板 (vp) ==========${PLAIN}\n"
+        printf "${BLUE}--- 本地运维 ---${PLAIN}\n"
+        echo -e "1. 防火墙 / Fail2Ban 管理"
+        echo -e "2. 系统信息与优化 (BBR/Swap)"
+        printf "${BLUE}--- 业务管理 ---${PLAIN}\n"
+        echo -e "3. sing-box 安装/管理"
+        printf "${BLUE}--- 远程管理 ---${PLAIN}\n"
+        echo -e "4. 远程 SSH 跳转"
+        echo -e "--------------------------------------------"
+        echo -e "u. 检查脚本更新  x. 卸载脚本  0. 退出"
+        echo -e "--------------------------------------------"
+        read -p "请输入选项: " main_choice
+
+        case "$main_choice" in
+            1) run_module "firewall_fail2ban.sh" ;;
+            2) run_module "system_optimize.sh" ;;
+            3) run_module "singbox.sh" ;;
+            4) run_module "remote_jump.sh" ;;
+            u) update_script ;;
+            x) uninstall_script ;;
+            0) exit 0 ;;
+            *) printf "${RED}无效选项${NC}\n" && sleep 1 ;;
+        esac
+    done
+}
+
+install_self "$1"
+main_menu
