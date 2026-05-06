@@ -16,7 +16,7 @@ detect_os
 check_dependencies
 
 MODULE_DIR="/usr/local/share/vp_modules"
-MODULES_LIST=("firewall_fail2ban.sh" "system_optimize.sh" "remote_jump.sh" "singbox.sh" "traffic_monitor.sh")
+MODULES_LIST=("firewall_fail2ban.sh" "system_optimize.sh" "remote_jump.sh" "singbox.sh" "ssh_harden.sh" "traffic_monitor.sh")
 
 # 自安装
 install_self() {
@@ -114,8 +114,9 @@ main_menu() {
         printf "${BLUE}--- 业务管理 ---${PLAIN}\n"
         echo -e "3. sing-box 安装/管理"
         echo -e "4. 流量监控 (vnstat)"
+        echo -e "5. SSH 安全配置"
         printf "${BLUE}--- 远程管理 ---${PLAIN}\n"
-        echo -e "5. 远程 SSH 跳转"
+        echo -e "99. 远程 SSH 跳转"
         echo -e "--------------------------------------------"
         echo -e "u. 检查主控更新  m. 更新所有模块  x. 卸载脚本  0. 退出"
         echo -e "--------------------------------------------"
@@ -126,7 +127,8 @@ main_menu() {
             2) run_module "system_optimize.sh" ;;
             3) run_module "singbox.sh" ;;
             4) run_module "traffic_monitor.sh" ;;
-            5) run_module "remote_jump.sh" ;;
+            5) run_module "ssh_harden.sh" ;;
+            99) run_module "remote_jump.sh" ;;
             u) update_script ;;
             m) update_modules ;;
             x) uninstall_script ;;
