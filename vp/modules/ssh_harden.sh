@@ -23,6 +23,7 @@ backup_ssh() {
 }
 
 # ---------- 生成密钥对 ----------
+# ---------- 生成密钥对 ----------
 generate_key() {
     printf "${BLUE}===== 生成 SSH 密钥对 =====${NC}\n"
     printf "密钥类型: 1. RSA (4096)   2. Ed25519 (推荐)\n"
@@ -55,13 +56,21 @@ generate_key() {
     printf "  公钥: %s.pub\n" "$key_path"
     echo ""
 
-    # 显示公钥
-    printf "${YELLOW}公钥内容 (用于添加到服务器):${NC}\n"
-    printf "${GREEN}================================${NC}\n"
-    cat "${key_path}.pub"
-    printf "${GREEN}================================${NC}\n"
+    # ===== 打印私钥 =====
+    printf "${YELLOW}========== 私钥内容 (请妥善保管，不要泄露) ==========${NC}\n"
+    printf "${RED}"
+    cat "$key_path"
+    printf "${NC}"
+    printf "${YELLOW}========== 私钥结束 ==========${NC}\n"
     echo ""
 
+    # ===== 打印公钥 =====
+    printf "${GREEN}========== 公钥内容 (用于添加到服务器 authorized_keys) ==========${NC}\n"
+    cat "${key_path}.pub"
+    printf "${GREEN}========== 公钥结束 ==========${NC}\n"
+    echo ""
+
+    printf "${YELLOW}提示：请将私钥下载到本地并妥善保存，然后删除服务器上的私钥文件。${NC}\n"
     read -p "按回车键继续..." dummy
 }
 
