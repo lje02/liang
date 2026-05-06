@@ -1,4 +1,5 @@
 #!/bin/bash
+# sing-box 管理模块
 
 if [ -z "$VPS_COMMON_LOADED" ]; then
     source /usr/local/share/vp_modules/common.sh 2>/dev/null || {
@@ -10,12 +11,26 @@ fi
 detect_os
 check_dependencies
 
-CONFIG_FILE="/usr/local/etc/sing-box/config.json"
-SERVICE_NAME="sing-box"
-
-# 检查 sing-box 状态
-check_singbox() {
+# ----------------- 路径检测（适配多种安装方式） -----------------
+find_singbox() {
+    # 尝试多个常见路径
+    for path in /usr/local/bin/sing-box /usr/bin/sing-box /opt/sing-box/sing-box; do
+        if [ -x "$path" ]; then
+            SINGBOX_BIN="$path"
+            return 0
+        fi
+    done
+    # 最后通过 which 查找
     if command -v sing-box &>/dev/null; then
+        SINGBOX_BIN="sing-box"
+        return 0
+    fi
+    return 1
+}
+
+# ----------------- 状态检查 -----------------
+check_status() {
+    if find_singbox; then
         if systemctl is-active --quiet sing-box 2>/dev/null || pgrep -x sing-box &>/dev/null; then
             printf "${GREEN}运行中${NC}"
         else
@@ -26,117 +41,120 @@ check_singbox() {
     fi
 }
 
-# 安装
-install_singbox() {
+# ----------------- 安装 -----------------
+do_install() {
     printf "${BLUE}正在安装 sing-box...${NC}\n"
-    bash <(curl -sSL "$SINGBOX_INSTALL_URL") || {
-        printf "${RED}安装失败，请检查网络。${NC}\n"
-        read -p "按回车继续..." dummy
-        return 1
-    }
-    printf "${GREEN}安装完成！${NC}\n"
-    read -p "按回车继续..." dummy
+    if bash <(curl -sSL "$SINGBOX_INSTALL_URL"); then
+        sleep 2
+        if find_singbox; then
+            printf "${GREEN}安装成功！检测到: %s${NC}\n" "$SINGBOX_BIN"
+        else
+            printf "${YELLOW}安装脚本完成，但未检测到可执行文件。请手动检查。${NC}\n"
+        fi
+    else
+        printf "${RED}安装失败，请检查网络或仓库地址。${NC}\n"
+    fi
+    read -p "按回车键继续..." dummy
 }
 
-# 启动/停止/重启/状态
-manage_service() {
-    if ! command -v sing-box &>/dev/null; then
-        printf "${RED}sing-box 未安装${NC}\n"
-        read -p "按回车继续..." dummy
+# ----------------- 服务控制 -----------------
+service_menu() {
+    if ! find_singbox; then
+        printf "${RED}sing-box 未安装。${NC}\n"
+        read -p "按回车键继续..." dummy
         return
     fi
-
     while true; do
         clear
-        printf "${BLUE}===== sing-box 服务管理 =====${NC}\n"
-        printf "状态: "; check_singbox
+        printf "${BLUE}====== sing-box 服务管理 ======${NC}\n"
+        printf "状态: "; check_status
         echo ""
-        echo "1. 启动 sing-box"
-        echo "2. 停止 sing-box"
-        echo "3. 重启 sing-box"
-        echo "4. 查看运行日志"
-        echo "0. 返回"
-        read -p "选择: " svc_choice
-        case $svc_choice in
-            1) systemctl start sing-box 2>/dev/null || service sing-box start
-               printf "${GREEN}已启动${NC}\n"; sleep 1 ;;
-            2) systemctl stop sing-box 2>/dev/null || service sing-box stop
-               printf "${YELLOW}已停止${NC}\n"; sleep 1 ;;
-            3) systemctl restart sing-box 2>/dev/null || service sing-box restart
-               printf "${GREEN}已重启${NC}\n"; sleep 1 ;;
-            4) journalctl -u sing-box -n 50 --no-pager 2>/dev/null || tail -50 /var/log/sing-box.log 2>/dev/null || echo "无日志"
-               read -p "按回车继续..." dummy ;;
-            0) break ;;
-            *) printf "${RED}无效选项${NC}\n"; sleep 1 ;;
+        echo "1. 启动"
+        echo "2. 停止"
+        echo "3. 重启"
+        echo "4. 查看状态 (详细)"
+        echo "5. 查看实时日志"
+        echo "0. 返回上级"
+        read -p "选择: " c
+        case $c in
+            1) systemctl start sing-box 2>/dev/null || service sing-box start; sleep 1;;
+            2) systemctl stop sing-box 2>/dev/null || service sing-box stop; sleep 1;;
+            3) systemctl restart sing-box 2>/dev/null || service sing-box restart; sleep 1;;
+            4)
+                if command -v systemctl &>/dev/null; then
+                    systemctl status sing-box --no-pager 2>/dev/null
+                else
+                    service sing-box status 2>/dev/null
+                fi
+                read -p "按回车键继续..." dummy
+                ;;
+            5) journalctl -u sing-box -f 2>/dev/null || tail -f /var/log/sing-box.log 2>/dev/null || printf "${RED}无日志可显示${NC}\n"; sleep 2;;
+            0) break;;
+            *) printf "${RED}无效选项${NC}\n"; sleep 1;;
         esac
     done
 }
 
-# 查看/编辑配置
+# ----------------- 配置管理 -----------------
 config_menu() {
-    if ! command -v sing-box &>/dev/null; then
-        printf "${RED}sing-box 未安装${NC}\n"
-        read -p "按回车继续..." dummy
+    if ! find_singbox; then
+        printf "${RED}sing-box 未安装。${NC}\n"
+        read -p "按回车键继续..." dummy
         return
+    fi
+    local conf="/usr/local/etc/sing-box/config.json"
+    if [ ! -f "$conf" ]; then
+        conf="/etc/sing-box/config.json"
     fi
 
     while true; do
         clear
-        printf "${BLUE}===== sing-box 配置管理 =====${NC}\n"
+        printf "${BLUE}====== sing-box 配置管理 ======${NC}\n"
+        echo "配置文件: $conf"
         echo "1. 查看配置"
         echo "2. 编辑配置 (nano)"
-        echo "3. 验证配置语法"
-        echo "0. 返回"
-        read -p "选择: " cfg_choice
-        case $cfg_choice in
+        echo "3. 校验配置语法"
+        echo "0. 返回上级"
+        read -p "选择: " c
+        case $c in
             1)
-                if [ -f "$CONFIG_FILE" ]; then
-                    cat "$CONFIG_FILE"
-                else
-                    printf "${RED}配置文件不存在: $CONFIG_FILE${NC}\n"
-                fi
-                read -p "按回车继续..." dummy ;;
+                [ -f "$conf" ] && cat "$conf" || printf "${RED}文件不存在${NC}\n"
+                read -p "按回车键继续..." dummy
+                ;;
             2)
-                if [ -f "$CONFIG_FILE" ]; then
-                    nano "$CONFIG_FILE"
-                else
-                    printf "${RED}配置文件不存在: $CONFIG_FILE${NC}\n"
-                    read -p "按回车继续..." dummy
-                fi ;;
+                [ -f "$conf" ] && nano "$conf" || printf "${RED}文件不存在${NC}\n"
+                ;;
             3)
-                if [ -f "$CONFIG_FILE" ]; then
-                    sing-box check -c "$CONFIG_FILE" 2>/dev/null && \
-                    printf "${GREEN}配置有效${NC}\n" || printf "${RED}配置有误${NC}\n"
+                if [ -f "$conf" ]; then
+                    "$SINGBOX_BIN" check -c "$conf" 2>&1 && printf "${GREEN}配置正确${NC}\n" || printf "${RED}配置有误${NC}\n"
                 else
-                    printf "${RED}配置文件不存在${NC}\n"
+                    printf "${RED}文件不存在${NC}\n"
                 fi
-                read -p "按回车继续..." dummy ;;
-            0) break ;;
-            *) printf "${RED}无效选项${NC}\n"; sleep 1 ;;
+                read -p "按回车键继续..." dummy
+                ;;
+            0) break;;
+            *) printf "${RED}无效选项${NC}\n"; sleep 1;;
         esac
     done
 }
 
-# 主菜单
-singbox_menu() {
-    while true; do
-        clear
-        printf "${BLUE}===== sing-box 管理 =====${NC}\n"
-        printf "状态: "; check_singbox
-        echo ""
-        echo "1. 安装/重新安装"
-        echo "2. 服务管理 (启动/停止/日志)"
-        echo "3. 配置管理 (查看/编辑)"
-        echo "0. 返回主菜单"
-        read -p "请选择: " choice
-        case $choice in
-            1) install_singbox ;;
-            2) manage_service ;;
-            3) config_menu ;;
-            0) break ;;
-            *) printf "${RED}无效选项${NC}\n"; sleep 1 ;;
-        esac
-    done
-}
+# ----------------- 主菜单 -----------------
+while true; do
+    clear
+    printf "${BLUE}========== sing-box 管理 ==========${NC}\n"
+    printf "状态: "; check_status
+    printf "\n"
+    echo "1. 安装 / 重新安装"
+    echo "2. 服务管理"
+    echo "3. 配置管理"
+    echo "0. 返回主菜单"
+    read -p "选择: " main_choice
 
-singbox_menu
+    case $main_choice in
+        1) do_install ;;
+        2) service_menu ;;
+        3) config_menu ;;
+        0) break ;;
+        *) printf "${RED}无效选项${NC}\n"; sleep 1 ;;
+    esac
+done
