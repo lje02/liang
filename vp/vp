@@ -16,7 +16,7 @@ detect_os
 check_dependencies
 
 MODULE_DIR="/usr/local/share/vp_modules"
-MODULES_LIST=("firewall_fail2ban.sh" "system_optimize.sh" "remote_jump.sh" "singbox.sh" "ssh_harden.sh" "traffic_monitor.sh")
+MODULES_LIST=("firewall_fail2ban.sh" "system_optimize.sh" "remote_jump.sh" "singbox.sh" "traffic_monitor.sh" "ssh_harden.sh")
 
 # 自安装
 install_self() {
@@ -116,7 +116,7 @@ main_menu() {
         echo -e "4. 流量监控 (vnstat)"
         echo -e "5. SSH 安全配置"
         printf "${BLUE}--- 远程管理 ---${PLAIN}\n"
-        echo -e "99. 远程 SSH 跳转"
+        echo -e "99. 远程 SSH 管理"
         echo -e "--------------------------------------------"
         echo -e "u. 检查主控更新  m. 更新所有模块  x. 卸载脚本  0. 退出"
         echo -e "--------------------------------------------"
