@@ -1,65 +1,34 @@
-#!/bin/bash
-# sing-box 管理模块
-
-if [ -z "$VPS_COMMON_LOADED" ]; then
-    source /usr/local/share/vp_modules/common.sh 2>/dev/null || {
-        echo "无法加载公共函数库"
-        exit 1
-    }
-fi
-
-detect_os
-check_dependencies
-
-# 检查 ssb 命令是否存在
-ssb_exists() {
-    command -v ssb &>/dev/null
-}
-
-# 安装 sing-box 脚本
 install_singbox() {
     printf "${BLUE}正在安装 sing-box 脚本...${NC}\n"
     if bash <(curl -sSL "$SINGBOX_INSTALL_URL"); then
-        printf "${GREEN}安装成功！${NC}\n"
+        printf "${GREEN}sing-box 安装完成！${NC}\n"
+        
+        # 如果 ssb 命令不存在，尝试创建
+        if ! command -v ssb &>/dev/null; then
+            # 方法1：查找 sing-box 可执行文件所在目录，看有没有 ssb
+            local singbox_dir=$(dirname "$(which sing-box 2>/dev/null)" 2>/dev/null)
+            
+            if [ -x "$singbox_dir/ssb" ]; then
+                # ssb 和 sing-box 在同一目录，创建软链接
+                ln -sf "$singbox_dir/ssb" /usr/local/bin/ssb
+                printf "${GREEN}已创建 ssb 软链接。${NC}\n"
+            elif [ -x /usr/local/bin/ssb ]; then
+                # ssb 在 /usr/local/bin 但没被 PATH 找到（极少情况）
+                export PATH="$PATH:/usr/local/bin"
+                printf "${GREEN}ssb 已存在，已更新 PATH。${NC}\n"
+            else
+                # ssb 文件找不到，尝试从 GitHub 单独下载
+                printf "${YELLOW}未找到 ssb，正在尝试下载...${NC}\n"
+                local ssb_url="https://raw.githubusercontent.com/lje02/sing/main/ssb.sh"
+                curl -sSL "$ssb_url" -o /usr/local/bin/ssb && chmod +x /usr/local/bin/ssb && \
+                printf "${GREEN}ssb 已下载并安装到 /usr/local/bin/ssb${NC}\n" || \
+                printf "${YELLOW}ssb 下载失败，请检查 sing-box 仓库中是否有 ssb.sh 文件。${NC}\n"
+            fi
+        else
+            printf "${GREEN}ssb 命令已就绪。${NC}\n"
+        fi
     else
         printf "${RED}安装失败，请检查网络。${NC}\n"
     fi
     read -p "按回车键继续..." dummy
 }
-
-# 进入 sing-box 管理界面
-enter_singbox() {
-    if ssb_exists; then
-        printf "${GREEN}正在进入 sing-box 管理界面...${NC}\n"
-        sleep 1
-        ssb
-        echo ""
-        read -p "ssb 已退出，按回车键返回..." dummy
-    else
-        printf "${RED}ssb 命令不存在，请先执行选项 1 安装。${NC}\n"
-        read -p "按回车键继续..." dummy
-    fi
-}
-
-# 主菜单
-while true; do
-    clear
-    printf "${BLUE}===== sing-box 安装/管理 =====${NC}\n"
-    if ssb_exists; then
-        printf "ssb 状态: ${GREEN}可用${NC}\n"
-    else
-        printf "ssb 状态: ${RED}未安装${NC}\n"
-    fi
-    echo ""
-    echo "1. 安装 sing-box 脚本"
-    echo "2. 进入 (调用 ssb 命令)"
-    echo "0. 返回主菜单"
-    read -p "请选择: " choice
-
-    case $choice in
-        1) install_singbox ;;
-        2) enter_singbox ;;
-        0) break ;;
-        *) printf "${RED}无效选项${NC}\n"; sleep 1 ;;
-    esac
-done
