@@ -11,55 +11,42 @@ fi
 detect_os
 check_dependencies
 
+# ---------- 安装 sing-box ----------
 install_singbox() {
-    printf "${BLUE}正在安装 sing-box 脚本...${NC}\n"
-    local tmp_install="/tmp/singbox_install.sh"
-    curl -sSL "$SINGBOX_INSTALL_URL" -o "$tmp_install"
+    printf "${BLUE}正在安装 sing-box...${NC}\n"
 
-    if [ ! -s "$tmp_install" ]; then
-        printf "${RED}下载安装脚本失败，请检查网络。${NC}\n"
-        read -p "按回车键继续..." dummy
-        return 1
-    fi
+    # 仿照一键安装命令：下载 install.sh 并保存为 ssb
+    if curl -Ls "$SINGBOX_INSTALL_URL" -o /usr/local/bin/ssb; then
+        chmod +x /usr/local/bin/ssb
+        printf "${GREEN}安装脚本已下载为 /usr/local/bin/ssb${NC}\n"
 
-    chmod +x "$tmp_install"
+        # 执行安装
+        printf "${BLUE}执行安装进程...${NC}\n"
+        bash /usr/local/bin/ssb
 
-    if bash "$tmp_install"; then
-        printf "${GREEN}sing-box 安装完成！${NC}\n"
-
-        sleep 1
+        # 安装脚本内部会执行 cp "$0" /usr/local/bin/ssb，确保 ssb 存在
         hash -r 2>/dev/null
-
-        if ! command -v ssb &>/dev/null; then
-            printf "${YELLOW}ssb 命令未自动创建，尝试手动修复...${NC}\n"
-            if [ -f "$tmp_install" ]; then
-                cp "$tmp_install" /usr/local/bin/ssb
-                chmod +x /usr/local/bin/ssb
-            else
-                curl -sSL "$SINGBOX_INSTALL_URL" -o /usr/local/bin/ssb
-                chmod +x /usr/local/bin/ssb
-            fi
+        if command -v ssb &>/dev/null; then
+            printf "${GREEN}安装完成！ssb 命令已就绪。${NC}\n"
+        else
+            # 手动兜底
+            [ -f /usr/local/bin/ssb ] && chmod +x /usr/local/bin/ssb && hash -r
+            printf "${YELLOW}安装完成，已尝试激活 ssb。${NC}\n"
         fi
-
-        rm -f "$tmp_install"
-        printf "${GREEN}ssb 已就绪。${NC}\n"
     else
-        printf "${RED}安装失败。${NC}\n"
-        rm -f "$tmp_install"
+        printf "${RED}下载安装脚本失败，请检查网络。${NC}\n"
     fi
     read -p "按回车键继续..." dummy
 }
 
+# ---------- 进入 sing-box 管理界面 ----------
 enter_singbox() {
     if command -v ssb &>/dev/null; then
         printf "${GREEN}正在进入 sing-box 管理界面...${NC}\n"
         sleep 1
-        
-        # ssb 即使 exit 也不终止脚本
         ssb || true
-        
         echo ""
-        printf "${YELLOW}sing-box 面板已退出。${NC}\n"
+        printf "${YELLOW}ssb 已退出。${NC}\n"
         read -p "按回车键返回主菜单..." dummy
     else
         printf "${RED}ssb 命令不存在，请先执行选项 1 安装。${NC}\n"
@@ -67,6 +54,7 @@ enter_singbox() {
     fi
 }
 
+# ---------- 主菜单 ----------
 while true; do
     clear
     printf "${BLUE}===== sing-box 安装/管理 =====${NC}\n"
@@ -77,7 +65,7 @@ while true; do
     fi
     echo ""
     echo "1. 安装 sing-box 脚本"
-    echo "2. 管理sing-box"
+    echo "2. 进入 (调用 ssb 命令)"
     echo "0. 返回主菜单"
     read -p "请选择: " choice
 
