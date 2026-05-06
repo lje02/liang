@@ -10,7 +10,10 @@ fi
 
 run_singbox_menu() {
     if command -v ssb &>/dev/null; then
-        ssb
+        ssb                              # ssb 本身是交互式菜单，会停留
+        # ssb 退出后显示提示
+        printf "${YELLOW}sing-box 管理面板已退出。${NC}\n"
+        read -p "按回车键继续..." dummy
     else
         printf "${YELLOW}sing-box 管理脚本未安装。${NC}\n"
         echo "你可以手动安装："
@@ -19,10 +22,16 @@ run_singbox_menu() {
         if [[ $confirm =~ ^[Yy]?$ ]]; then
             bash <(curl -sSL "$SINGBOX_INSTALL_URL") || {
                 printf "${RED}sing-box 安装失败，请检查网络或仓库地址。${NC}\n"
+                read -p "按回车键继续..." dummy
                 return
             }
-            if command -v ssb &>/dev/null; then ssb
-            else printf "${RED}安装后未找到 ssb 命令，请手动检查。${NC}\n"; fi
+            if command -v ssb &>/dev/null; then
+                ssb
+                read -p "按回车键继续..." dummy
+            else
+                printf "${RED}安装后未找到 ssb 命令，请手动检查。${NC}\n"
+                read -p "按回车键继续..." dummy
+            fi
         fi
     fi
 }
