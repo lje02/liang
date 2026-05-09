@@ -52,9 +52,27 @@ init_config() {
 }
 
 get_ip() {
-    local ip4=$(curl -s4 --connect-timeout 5 icanhazip.com || curl -s4 --connect-timeout 5 ifconfig.me)
-    local ip6=$(curl -s6 --connect-timeout 5 icanhazip.com || curl -s6 --connect-timeout 5 ifconfig.me)
-    if [[ -n "$ip4" ]]; then echo "$ip4"; elif [[ -n "$ip6" ]]; then echo "[$ip6]"; else echo "127.0.0.1"; fi
+    local mode=${1:-"all"} # 参数可选: all, 4, 6
+    local ip4 ip6
+
+    # 同时探测
+    ip4=$(curl -s4 --connect-timeout 3 icanhazip.com || curl -s4 --connect-timeout 3 ifconfig.me)
+    ip6=$(curl -s6 --connect-timeout 3 icanhazip.com || curl -s6 --connect-timeout 3 ifconfig.me)
+
+    case $mode in
+        4) echo "$ip4" ;;
+        6) [[ -n "$ip6" ]] && echo "[$ip6]" ;;
+        "all")
+            # 逻辑：优先返回 v4，如果没有 v4 则返回带括号的 v6
+            if [[ -n "$ip4" ]]; then
+                echo "$ip4"
+            elif [[ -n "$ip6" ]]; then
+                echo "[$ip6]"
+            else
+                echo "127.0.0.1"
+            fi
+            ;;
+    esac
 }
 
 show_status() {
