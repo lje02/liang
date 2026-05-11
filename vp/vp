@@ -144,6 +144,7 @@ main_menu() {
         echo -e "7. 密钥生成/禁用密码"
         printf "${BLUE}--- 远程管理 ---${PLAIN}\n"
         echo -e "8. 远程 SSH 跳转"
+        echo -e "9. 安装sing-box脚本"
         echo -e "--------------------------------------------"
         echo -e "u. 更新全部 (主控+模块)   x. 卸载   0. 退出"
         echo -e "--------------------------------------------"
@@ -158,6 +159,7 @@ main_menu() {
             6) run_module "logs.sh" ;;
             7) run_module "ssh_harden.sh" ;;
             8) run_module "remote_jump.sh" ;;
+            9) run_module "singbox_install.sh" ;;
             u) update_all ;;
             x) uninstall_script ;;
             0) exit 0 ;;
