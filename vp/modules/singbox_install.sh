@@ -13,7 +13,7 @@ install_singbox() {
         if bash "$tmp_install"; then
             rm -f "$tmp_install"
             hash -r 2>/dev/null
-            #printf "${GREEN}✔ 安装完成，ssb 命令已就绪。${NC}\n"
+            printf "${GREEN}✔ 第一次是这样的，不影响使用。${NC}\n"
         else
             rm -f "$tmp_install"
             printf "${RED}✖ 安装过程出错。${NC}\n"
