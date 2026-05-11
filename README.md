@@ -4,7 +4,7 @@
 curl -sSL https://raw.githubusercontent.com/lje02/liang/main/vp/install.sh | bash
 
 
-# sing-box 综合管理脚本 (ssb)
+# sing-box 综合管理脚本 vp
 
 `ssb` (sing-box stack bash) 是一个为 Linux 服务器打造的、全功能自动化管理工具。它通过模块化的 Bash 脚本，将复杂的 `sing-box` JSON 配置转化为直观的交互式菜单，旨在提供“原子化”的操作体验。
 
