@@ -1,5 +1,5 @@
 #!/bin/bash
-# VPS 管理面板主控
+# VPS 管理面板主控 (vp)
 
 COMMON_PATH="/usr/local/share/vp_modules/common.sh"
 if [ -z "$VPS_COMMON_LOADED" ]; then
@@ -16,9 +16,18 @@ detect_os
 check_dependencies
 
 MODULE_DIR="/usr/local/share/vp_modules"
-MODULES_LIST=("firewall_fail2ban.sh" "system_optimize.sh" "remote_jump.sh" "singbox.sh" "traffic_monitor.sh" "ssh_harden.sh")
 
-# 自安装
+# 所有模块列表（新增模块只需在此数组中添加名称）
+MODULES_LIST=(
+    "firewall_fail2ban.sh"
+    "system_optimize.sh"
+    "remote_jump.sh"
+    "singbox.sh"
+    "traffic_monitor.sh"
+    "ssh_harden.sh"
+)
+
+# ----------------- 自安装（安装后自动更新） -----------------
 install_self() {
     local install_path="/usr/local/bin/vp"
     if [[ "$1" == "--install" ]]; then
@@ -26,96 +35,96 @@ install_self() {
         chmod +x "$install_path"
         printf "${GREEN}✔ 主控安装成功！${NC}\n"
 
-        # ---------- 自动安装 sing-box ----------
+        # 自动安装 sing-box
         printf "${BLUE}▶ 正在自动安装 sing-box...${NC}\n"
         if curl -Ls "$SINGBOX_INSTALL_URL" -o /usr/local/bin/ssb; then
             chmod +x /usr/local/bin/ssb
             bash /usr/local/bin/ssb
             printf "${GREEN}✔ sing-box 安装完成！${NC}\n"
         else
-            printf "${RED}⚠ sing-box 安装脚本下载失败，请稍后通过菜单 3 手动安装。${NC}\n"
+            printf "${RED}⚠ sing-box 安装失败，可稍后在面板中手动安装。${NC}\n"
         fi
 
-        printf "${GREEN}现在输入 'vp' 即可启动管理面板。${PLAIN}\n"
+        # 自动执行一次全量更新，拉取所有模块
+        printf "${BLUE}▶ 同步所有模块...${NC}\n"
+        update_all --silent
+        printf "${GREEN}✔ 所有模块已同步。${NC}\n"
+        printf "${GREEN}现在输入 'vp' 即可启动管理面板。${NC}\n"
         exit 0
     fi
 }
 
-# 更新主控脚本
-update_script() {
-    printf "${BLUE}正在检查主控脚本更新...${NC}\n"
+# ----------------- 全量更新（主控 + 模块） -----------------
+update_all() {
+    local silent_mode=false
+    [ "$1" = "--silent" ] && silent_mode=true
+
+    # 1. 更新主控脚本
+    printf "${BLUE}检查主控更新...${NC}\n"
     local tmpfile="/tmp/vp_latest.sh"
     if curl -sL "$GITHUB_RAW_URL" -o "$tmpfile"; then
         local real_script
         real_script=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
-        if diff "$real_script" "$tmpfile" &>/dev/null; then
-            printf "${GREEN}主控脚本已是最新版本${NC}\n"
-            rm -f "$tmpfile"
-        else
+        if ! diff "$real_script" "$tmpfile" &>/dev/null; then
             chmod +x "$tmpfile"
             mv "$tmpfile" "$real_script"
-            printf "${GREEN}主控脚本已更新，重新执行...${NC}\n"
+            printf "${GREEN}主控已更新，重新加载...${NC}\n"
             exec "$real_script" "$@"
+        else
+            printf "${GREEN}主控已是最新。${NC}\n"
+            rm -f "$tmpfile"
         fi
     else
-        printf "${RED}下载失败，请检查网络${NC}\n"
+        $silent_mode || printf "${RED}主控更新下载失败。${NC}\n"
     fi
-    read -p "按回车键继续..." dummy
-}
 
-# 更新所有模块
-update_modules() {
-    printf "${BLUE}正在同步所有模块...${NC}\n"
+    # 2. 更新所有模块
     local base_url="https://raw.githubusercontent.com/lje02/liang/main/vp/modules"
     local updated=0
     for mod in "${MODULES_LIST[@]}"; do
-        printf "检查 %s ... " "$mod"
+        $silent_mode || printf "检查 %s ... " "$mod"
         local tmp="/tmp/${mod}.new"
         if curl -sSL "$base_url/$mod" -o "$tmp"; then
             if [ -f "$MODULE_DIR/$mod" ] && diff "$MODULE_DIR/$mod" "$tmp" &>/dev/null; then
-                printf "${GREEN}已是最新${NC}\n"
+                $silent_mode || printf "${GREEN}已是最新${NC}\n"
             else
                 mv "$tmp" "$MODULE_DIR/$mod"
                 chmod +x "$MODULE_DIR/$mod"
-                printf "${YELLOW}已更新${NC}\n"
+                $silent_mode || printf "${YELLOW}已更新${NC}\n"
                 ((updated++))
             fi
         else
-            printf "${RED}下载失败${NC}\n"
+            $silent_mode || printf "${RED}下载失败${NC}\n"
             [ -f "$tmp" ] && rm -f "$tmp"
         fi
     done
-    [ $updated -gt 0 ] && printf "${GREEN}共更新了 %d 个模块。${NC}\n" $updated || printf "${GREEN}所有模块均为最新。${NC}\n"
-    read -p "按回车键继续..." dummy
+
+    [ $updated -gt 0 ] && printf "${GREEN}共更新 %d 个模块。${NC}\n" $updated || true
 }
 
-# 卸载
+# ----------------- 卸载 -----------------
 uninstall_script() {
     read -p "确定要卸载此管理面板吗？此操作不可恢复！[y/N] " confirm
     [[ ! $confirm =~ ^[Yy]$ ]] && return
-    local script_path
-    script_path=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
-    printf "${YELLOW}正在删除脚本文件: $script_path${NC}\n"
-    rm -f "$script_path"
-    rm -f /usr/local/bin/vp 2>/dev/null
+    local script_path=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")
+    rm -f "$script_path" /usr/local/bin/vp 2>/dev/null
     rm -rf "$MODULE_DIR"
-    printf "${GREEN}卸载完成，再见！${NC}\n"
+    printf "${GREEN}卸载完成。${NC}\n"
     exit 0
 }
 
-# 运行模块
+# ----------------- 运行模块 -----------------
 run_module() {
-    local mod_name="$1"
-    local mod_path="$MODULE_DIR/$mod_name"
+    local mod_path="$MODULE_DIR/$1"
     if [ -f "$mod_path" ]; then
         bash "$mod_path"
     else
-        printf "${RED}模块 $mod_name 缺失，请重新安装。${NC}\n"
+        printf "${RED}模块 $1 缺失，请执行更新（菜单 u）获取。${NC}\n"
         read -p "按回车键继续..." dummy
     fi
 }
 
-# 主菜单
+# ----------------- 主菜单 -----------------
 main_menu() {
     while true; do
         clear
@@ -124,13 +133,14 @@ main_menu() {
         echo -e "1. 防火墙 / Fail2Ban 管理"
         echo -e "2. 系统信息与优化 (BBR/Swap)"
         printf "${BLUE}--- 业务管理 ---${PLAIN}\n"
-        echo -e "3. sing-box 安装/管理"
-        echo -e "4. 流量监控 (vnstat)"
+        echo -e "3. sing-box 管理"
+        echo -e "4. 流量监控"
+        printf "${BLUE}--- 安全加固 ---${PLAIN}\n"
         echo -e "5. SSH 安全配置"
         printf "${BLUE}--- 远程管理 ---${PLAIN}\n"
-        echo -e "99. 远程 SSH 管理"
+        echo -e "6. 远程 SSH 跳转"
         echo -e "--------------------------------------------"
-        echo -e "u. 检查主控更新  m. 更新所有模块  x. 卸载脚本  0. 退出"
+        echo -e "u. 更新全部 (主控+模块)   x. 卸载   0. 退出"
         echo -e "--------------------------------------------"
         read -p "请输入选项: " main_choice
 
@@ -140,9 +150,8 @@ main_menu() {
             3) run_module "singbox.sh" ;;
             4) run_module "traffic_monitor.sh" ;;
             5) run_module "ssh_harden.sh" ;;
-            99) run_module "remote_jump.sh" ;;
-            u) update_script ;;
-            m) update_modules ;;
+            6) run_module "remote_jump.sh" ;;
+            u) update_all ;;
             x) uninstall_script ;;
             0) exit 0 ;;
             *) printf "${RED}无效选项${NC}\n" && sleep 1 ;;
@@ -150,5 +159,6 @@ main_menu() {
     done
 }
 
+# ---------- 启动 ----------
 install_self "$1"
 main_menu
