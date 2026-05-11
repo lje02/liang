@@ -23,7 +23,7 @@ MODULES_LIST=(
     "system_optimize.sh"
     "remote_jump.sh"
     "singbox.sh"
-    "traffic_monitor.sh"
+    "monitor.sh"
     "ssh_harden.sh"
 )
 
