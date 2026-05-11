@@ -138,7 +138,7 @@ main_menu() {
         echo -e "3. sing-box 管理"
         echo -e "4. 系统实时监控"
         echo -e "5. 流量统计"
-        echo -e "6. 日志查看"
+        echo -e "6. 日志查看/分析"
         printf "${BLUE}--- 安全加固 ---${PLAIN}\n"
         echo -e "7. 密钥生成/禁用密码"
         printf "${BLUE}--- 远程管理 ---${PLAIN}\n"
