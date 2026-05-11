@@ -344,7 +344,6 @@ firewall_menu() {
             0) break ;;
             *) printf "${RED}无效选项${NC}\n" ;;
         esac
-        echo ""; read -p "按回车键继续..." dummy
     done
 }
 
