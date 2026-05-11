@@ -1352,6 +1352,7 @@ while true; do
                 systemctl daemon-reload
                 rm -f /usr/local/bin/ssb /usr/local/bin/sing-box
                 rm -rf /etc/sing-box
+                rm -f /usr/bin/ssb /usr/local/sing-box /opt/sing-box/sing-box 2>/dev/null
                 echo -e "${GREEN}✔ Sing-box 及相关配置已彻底卸载。${PLAIN}"
                 exit 0
             fi
