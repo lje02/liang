@@ -6,18 +6,16 @@ if [ -z "$VPS_COMMON_LOADED" ]; then
     source /usr/local/share/vp_modules/common.sh 2>/dev/null || true
 fi
 
-# 如果 SINGBOX_INSTALL_URL 变量未定义，使用默认地址
 SINGBOX_INSTALL_URL="${SINGBOX_INSTALL_URL:-https://raw.githubusercontent.com/lje02/sing/main/install.sh}"
 
 install_singbox() {
     printf "${BLUE}▶ 正在下载并安装 sing-box ...${NC}\n"
 
-    # 完全仿照你的一键命令：下载 -> 保存为 ssb -> 执行安装
     if curl -Ls "$SINGBOX_INSTALL_URL" -o /usr/local/bin/ssb; then
         chmod +x /usr/local/bin/ssb
         if /usr/local/bin/ssb; then
             hash -r 2>/dev/null
-            printf "${GREEN}✔ 安装完成，ssb 已就绪。${NC}\n"
+            #printf "${GREEN}✔ 安装完成，ssb 已就绪。${NC}\n"
         else
             printf "${RED}✖ 安装脚本执行失败。${NC}\n"
         fi
