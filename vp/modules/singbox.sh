@@ -376,12 +376,12 @@ EOF
     # ---------- 自复制脚本（避免覆盖自身） ----------
     if [[ "$0" != "/usr/local/bin/ssb" ]]; then
         cp "$0" /usr/local/bin/ssb && chmod +x /usr/local/bin/ssb
-        echo -e "${GREEN}已安装 ssb 到 /usr/local/bin/ssb${PLAIN}"
+        echo -e "${GREEN}已安装 到 /usr/local/bin/ssb${PLAIN}"
     fi
 
     # ---------- 启动服务 ----------
     systemctl start sing-box
-    echo -e "${GREEN}安装完成！请输入 ssb 管理。${PLAIN}"
+    echo -e "${GREEN}安装完成...... ${PLAIN}"
     pause
 }
 
