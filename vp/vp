@@ -25,6 +25,7 @@ MODULES_LIST=(
     "singbox.sh"
     "monitor.sh"
     "ssh_harden.sh"
+    "traffic_monitor.sh"
 )
 
 # ----------------- 自安装（安装后自动更新） -----------------
