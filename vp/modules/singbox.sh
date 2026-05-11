@@ -14,5 +14,3 @@ if command -v ssb &>/dev/null; then
 else
     printf "${RED}未安装 sing-box脚本。请先使用菜单中的“安装/重装”功能。${NC}\n"
 fi
-
-read -p "按回车键返回主菜单..." dummy
