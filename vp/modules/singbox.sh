@@ -1356,9 +1356,7 @@ while true; do
                 exit 0
             fi
             ;;
-        0) 
-            echo -e "${GREEN}脚本已退出。${PLAIN}"
-            exit 0 
+        0)  exit 0 
             ;;
         *) 
             echo -e "${RED}✘ 输入错误，请重新选择${PLAIN}"
