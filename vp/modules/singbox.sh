@@ -9,7 +9,7 @@ if command -v ssb &>/dev/null; then
     sleep 1
     ssb
     echo ""
-    printf "${YELLOW}ssb 已退出。${NC}\n"
+    #printf "${YELLOW}ssb 已退出。${NC}\n"
 else
     printf "${RED}未安装 sing-box脚本。请先使用菜单中的“安装/重装”功能。${NC}\n"
 fi
