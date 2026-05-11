@@ -9,8 +9,9 @@ BLUE='\033[0;34m'
 PLAIN='\033[0m'
 NC='\033[0m'
 
-# 路径
+# 资源路径
 GITHUB_RAW_URL="https://raw.githubusercontent.com/lje02/liang/main/vp/vp"
+SINGBOX_INSTALL_URL="https://raw.githubusercontent.com/lje02/sing/main/install.sh"
 
 # 临时文件清理
 cleanup() {
