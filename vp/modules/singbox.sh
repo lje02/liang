@@ -16,7 +16,7 @@ LINK_DIR="/etc/sing-box/links"
 CERT_DIR="/etc/sing-box/certs"
 BACKUP_DIR="/root/singbox_backup"
 SB_BIN=$(command -v sing-box || echo "/usr/local/bin/sing-box")
-UPDATE_URL="https://raw.githubusercontent.com/lje02/sing/main/install.sh"
+UPDATE_URL="https://raw.githubusercontent.com/lje02/box/main/install.sh"
 
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误: 必须使用 root 运行！${PLAIN}" && exit 1
 
