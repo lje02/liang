@@ -134,11 +134,12 @@ main_menu() {
         echo -e "2. 系统信息与优化 (BBR/Swap)"
         printf "${BLUE}--- 业务管理 ---${PLAIN}\n"
         echo -e "3. sing-box 管理"
-....... echo -e "4. 系统实时监控"
+        echo -e "4. 系统实时监控"
+        echo -e "5. 流量统计"
         printf "${BLUE}--- 安全加固 ---${PLAIN}\n"
-        echo -e "5. SSH密钥生成/禁用密码"
+        echo -e "6. 密钥生成/禁用密码"
         printf "${BLUE}--- 远程管理 ---${PLAIN}\n"
-        echo -e "6. 远程 SSH 跳转"
+        echo -e "7. 远程 SSH 跳转"
         echo -e "--------------------------------------------"
         echo -e "u. 更新全部 (主控+模块)   x. 卸载   0. 退出"
         echo -e "--------------------------------------------"
@@ -149,8 +150,9 @@ main_menu() {
             2) run_module "system_optimize.sh" ;;
             3) run_module "singbox.sh" ;;
             4) run_module "monitor.sh" ;;
-            5) run_module "ssh_harden.sh" ;;
-            6) run_module "remote_jump.sh" ;;
+            5) run_module "traffic_monitor.sh" ;;
+            6) run_module "ssh_harden.sh" ;;
+            7) run_module "remote_jump.sh" ;;
             u) update_all ;;
             x) uninstall_script ;;
             0) exit 0 ;;
