@@ -6,7 +6,7 @@ if [ -z "$VPS_COMMON_LOADED" ]; then
     source /usr/local/share/vp_modules/common.sh 2>/dev/null || true
 fi
 
-SINGBOX_INSTALL_URL="${SINGBOX_INSTALL_URL:-https://raw.githubusercontent.com/lje02/liang/main/install.sh}"
+SINGBOX_INSTALL_URL="${SINGBOX_INSTALL_URL:-https://raw.githubusercontent.com/lje02/box/main/install.sh}"
 
 install_singbox() {
     printf "${BLUE}▶ 正在下载并安装 sing-box ...${NC}\n"
