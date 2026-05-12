@@ -1190,7 +1190,7 @@ while true; do
     echo -e " ${GREEN}12.${PLAIN} 安装官方WARP并自动对接Sing-box"
     echo -e "-----------------------------------------------"
     #底部菜单
-    echo -e " ${GREEN}[88]${PLAIN} 启动  ${GREEN}[99]${PLAIN} 停止  ${GREEN}[66]${PLAIN} 重启  ${RED}[77]${PLAIN} 卸载  ${YELLOW}[0]${PLAIN} 退出"
+    echo -e " ${GREEN}[88]${PLAIN} 启动  ${GREEN}[99]${PLAIN} 停止  ${GREEN}[66]${PLAIN} 重启  ${RED}[77]${PLAIN} 卸载  ${RED}[0]${PLAIN} 退出"
     echo -e "==============================================="
     read -p " 请输入对应数字选择: " choice
     
