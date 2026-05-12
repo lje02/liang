@@ -392,7 +392,6 @@ add_node() {
 
     [[ "$choice" == "0" || -z "$choice" ]] && return
 
-    # --- 基础变量初始化 ---
     local IP=$(get_ip)
     local UUID=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)
     local LINK="" TAG=""
@@ -442,7 +441,6 @@ add_node() {
                 SNI_NAME="apple.com"; ALLOW_INS="1"
             fi
 
-            # 动态生成特定协议的 Json 结构 (避免冗余的 jq 调用)
             tls_json="{\"enabled\":true,\"certificate_path\":\"$CERT_PATH\",\"key_path\":\"$KEY_PATH\"}"
             case "$p_type" in
                 tuic)
@@ -453,11 +451,13 @@ add_node() {
                     usr_json="[{\"password\":\"$PASS\"}]"
                     LINK="hysteria2://$PASS@$IP:$PORT?insecure=$ALLOW_INS&sni=$SNI_NAME#$TAG" ;;
                 trojan)
-                    usr_json="[{\"password\":\"$PASS\"}]" # Trojan 严格只接受 password
-                    LINK="trojan://$PASS@$SNI_NAME:$PORT?security=tls&sni=$SNI_NAME&allowInsecure=$ALLOW_INS#$TAG" ;;
+                    usr_json="[{\"password\":\"$PASS\"}]"
+                    # 修正：使用 $IP 作为连接地址，SNI 放在参数里
+                    LINK="trojan://$PASS@$IP:$PORT?security=tls&sni=$SNI_NAME&allowInsecure=$ALLOW_INS#$TAG" ;;
                 http)
-                    usr_json="[{\"username\":\"$PASS\",\"password\":\"$PASS\"}]" # HTTP 需要 user 和 pass
-                    LINK="https://$PASS:$PASS@$SNI_NAME:$PORT?security=tls&sni=$SNI_NAME&allowInsecure=$ALLOW_INS#$TAG" ;;
+                    usr_json="[{\"username\":\"$PASS\",\"password\":\"$PASS\"}]"
+                    # 修正：使用 $IP 作为连接地址，SNI 放在参数里
+                    LINK="https://$PASS:$PASS@$IP:$PORT?security=tls&sni=$SNI_NAME&allowInsecure=$ALLOW_INS#$TAG" ;;
             esac
 
             jq --arg port "$PORT" --arg type "$p_type" --arg tag "$TAG" \
