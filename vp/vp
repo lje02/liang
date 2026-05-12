@@ -56,7 +56,7 @@ install_self() {
     fi
 }
 
-# ----------------- 全量更新（主控 + 模块） -----------------
+# ----------------- 全量更新（主控 + 模块+公共库） -----------------
 update_all() {
     local silent_mode=false
     [ "$1" = "--silent" ] && silent_mode=true
@@ -101,7 +101,24 @@ update_all() {
         fi
     done
 
-    [ $updated -gt 0 ] && printf "${GREEN}共更新 %d 个模块。${NC}\n" $updated || true
+    # 3. 额外更新公共库 common.sh
+    $silent_mode || printf "检查公共库 common.sh ... "
+    local tmp_common="/tmp/common.sh.new"
+    local common_url="https://raw.githubusercontent.com/lje02/liang/main/vp/common.sh"
+    if curl -sSL "$common_url" -o "$tmp_common"; then
+        if [ -f "$MODULE_DIR/common.sh" ] && diff "$MODULE_DIR/common.sh" "$tmp_common" &>/dev/null; then
+            $silent_mode || printf "${GREEN}已是最新${NC}\n"
+        else
+            mv "$tmp_common" "$MODULE_DIR/common.sh"
+            $silent_mode || printf "${YELLOW}已更新（下次运行 vp 生效）${NC}\n"
+            ((updated++))
+        fi
+    else
+        $silent_mode || printf "${RED}下载失败${NC}\n"
+        [ -f "$tmp_common" ] && rm -f "$tmp_common"
+    fi
+
+    [ $updated -gt 0 ] && printf "${GREEN}共更新 %d 个文件。${NC}\n" $updated || true
 }
 
 # ----------------- 卸载 -----------------
