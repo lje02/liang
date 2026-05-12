@@ -9,11 +9,13 @@ set -e
 
 mkdir -p "$MODULES_DIR"
 
-# 公共库和主控先下载（为了获取模块列表）
-curl -sSL "$REPO_URL/common.sh" -o "$MODULES_DIR/common.sh"
-curl -sSL "$REPO_URL/vp" -o "$INSTALL_DIR/vp"
+# 下载公共库和主控
+echo "下载公共库和主控..."
+curl -sSL "$REPO_URL/common.sh" -o "$MODULES_DIR/common.sh" || { echo "公共库下载失败"; exit 1; }
+curl -sSL "$REPO_URL/vp" -o "$INSTALL_DIR/vp" || { echo "主控下载失败"; exit 1; }
 chmod +x "$INSTALL_DIR/vp"
 
+# 静态后备模块列表
 BASE_MODULES=(
     "firewall_fail2ban.sh"
     "system_optimize.sh"
@@ -22,18 +24,25 @@ BASE_MODULES=(
     "singbox_install.sh"
 )
 
-# 尝试动态提取
+# 动态提取主控中的 MODULES_LIST
+modules=()
 if [ -f "$INSTALL_DIR/vp" ]; then
-    modules=($(awk '/^MODULES_LIST=\(/ {flag=1; next} /^\)/ {flag=0} flag {gsub(/"/); print $1}' "$INSTALL_DIR/vp"))
+    modules=($(awk '/^MODULES_LIST=\(/ {flag=1; next} /^\)/ {flag=0} flag {gsub(/"/, ""); if ($1 ~ /\.sh$/) print $1}' "$INSTALL_DIR/vp"))
 fi
 
-# 若提取为空，使用静态列表
-[ ${#modules[@]} -eq 0 ] && modules=("${BASE_MODULES[@]}")
+# 提取为空时使用静态列表
+if [ ${#modules[@]} -eq 0 ]; then
+    modules=("${BASE_MODULES[@]}")
+    echo "使用静态模块列表"
+fi
 
 echo "下载模块..."
 for mod in "${modules[@]}"; do
     echo "  -> $mod"
-    curl -sSL "$REPO_URL/modules/$mod" -o "$MODULES_DIR/$mod" || echo " [失败，跳過]"
+    if ! curl -sSL "$REPO_URL/modules/$mod" -o "$MODULES_DIR/$mod"; then
+        echo "    [警告] 模块 $mod 下载失败，跳过"
+        continue
+    fi
     chmod +x "$MODULES_DIR/$mod" 2>/dev/null
 done
 
