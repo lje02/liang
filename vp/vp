@@ -27,7 +27,6 @@ MODULES_LIST=(
     "ssh_harden.sh"
     "traffic_monitor.sh"
     "logs.sh"
-    "singbox_install.sh"
 )
 
 # ----------------- 自安装（安装后自动更新） -----------------
@@ -39,14 +38,14 @@ install_self() {
         printf "${GREEN}✔ 主控安装成功！${NC}\n"
 
         # 自动安装 sing-box
-        printf "${BLUE}▶ 正在自动安装 sing-box...${NC}\n"
-        if curl -Ls "$SINGBOX_INSTALL_URL" -o /usr/local/bin/ssb; then
-            chmod +x /usr/local/bin/ssb
-            bash /usr/local/bin/ssb
-            printf "${GREEN}✔ sing-box 安装完成！${NC}\n"
-        else
-            printf "${RED}⚠ sing-box 安装失败，可稍后在面板中手动安装。${NC}\n"
-        fi
+        #printf "${BLUE}▶ 正在自动安装 sing-box...${NC}\n"
+        #if curl -Ls "$SINGBOX_INSTALL_URL" -o /usr/local/bin/ssb; then
+            #chmod +x /usr/local/bin/ssb
+            #bash /usr/local/bin/ssb
+            #printf "${GREEN}✔ sing-box 安装完成！${NC}\n"
+        #else
+            #printf "${RED}⚠ sing-box 安装失败，可稍后在面板中手动安装。${NC}\n"
+        #fi
 
         # 自动执行一次全量更新，拉取所有模块
         printf "${BLUE}▶ 同步所有模块...${NC}\n"
@@ -144,7 +143,6 @@ main_menu() {
         echo -e "7. 密钥生成/禁用密码"
         printf "${BLUE}--- 远程管理 ---${PLAIN}\n"
         echo -e "8. 远程 SSH 跳转"
-        echo -e "9. 安装sing-box脚本"
         echo -e "--------------------------------------------"
         echo -e "u. 更新全部 (主控+模块)   x. 卸载   0. 退出"
         echo -e "--------------------------------------------"
@@ -159,7 +157,6 @@ main_menu() {
             6) run_module "logs.sh" ;;
             7) run_module "ssh_harden.sh" ;;
             8) run_module "remote_jump.sh" ;;
-            9) run_module "singbox_install.sh" ;;
             u) update_all ;;
             x) uninstall_script ;;
             0) exit 0 ;;
