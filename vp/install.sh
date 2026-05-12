@@ -14,11 +14,21 @@ curl -sSL "$REPO_URL/common.sh" -o "$MODULES_DIR/common.sh"
 curl -sSL "$REPO_URL/vp" -o "$INSTALL_DIR/vp"
 chmod +x "$INSTALL_DIR/vp"
 
-# 从 vp 脚本中提取 MODULES_LIST 数组内容
-MAPfile -t modules < <(grep -E '^[[:space:]]*"' "$INSTALL_DIR/vp" | grep -E '\.sh"' | tr -d '[:space:]"')
+BASE_MODULES=(
+    "firewall_fail2ban.sh"
+    "system_optimize.sh"
+    "remote_jump.sh"
+    "singbox.sh"
+    "singbox_install.sh"
+)
 
-# 或者用更精确的 sed 提取
-# modules=($(sed -n '/^MODULES_LIST=(/,/)/p' "$INSTALL_DIR/vp" | grep '\.sh' | tr -d '" '))
+# 尝试动态提取
+if [ -f "$INSTALL_DIR/vp" ]; then
+    modules=($(awk '/^MODULES_LIST=\(/ {flag=1; next} /^\)/ {flag=0} flag {gsub(/"/); print $1}' "$INSTALL_DIR/vp"))
+fi
+
+# 若提取为空，使用静态列表
+[ ${#modules[@]} -eq 0 ] && modules=("${BASE_MODULES[@]}")
 
 echo "下载模块..."
 for mod in "${modules[@]}"; do
