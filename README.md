@@ -10,6 +10,7 @@ curl -sSL https://raw.githubusercontent.com/lje02/liang/main/vp/install.sh | bas
 
 curl -fsSL https://raw.githubusercontent.com/lje02/liang/main/infra-shared.sh -o /usr/local/bin/infra-shared.sh
 chmod +x /usr/local/bin/infra-shared.sh
+
 infra-shared.sh
 
 # 查看密码
