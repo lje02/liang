@@ -40,7 +40,7 @@ MARIADB_IMAGE="${MARIADB_IMAGE:-mariadb:11}"
 REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
 
 # ── 颜色输出 ────────────────────────────────────────────────
-_c() { printf "\e[${1}m${2}\e[0m\n"; }
+_c() { printf "\033[${1}m${2}\033[0m\n"; }
 log()    { _c "32" "[OK]  $*"; }
 info()   { _c "36" "[..] $*"; }
 warn()   { _c "33" "[!!] $*"; }
