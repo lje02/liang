@@ -14,7 +14,9 @@ curl -fsSL https://raw.githubusercontent.com/lje02/liang/main/infra-shared.sh -o
 
 grep REDIS_PASSWORD /srv/infra/.env
 
-greg MARIADB_PASSWORD /srv/infra/.env
+cd /srv/infra
+
+sudo cat .env
 
 # 运行管理
 
