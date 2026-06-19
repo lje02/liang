@@ -183,9 +183,10 @@ INI
     # ── Redis 配置 ────────────────────────────────────────
     mkdir -p "${DIR}/redis-conf"
     cat > "${DIR}/redis-conf/redis.conf" <<CONF
-# 只监听 WireGuard 接口 + 本地回环
-bind ${WG_IP} 127.0.0.1
+# 容器内监听所有
+bind 0.0.0.0
 port ${REDIS_PORT}
+requirepass ${REDIS_PASSWORD}
 
 # 认证
 requirepass ${REDIS_PASSWORD}
@@ -237,7 +238,8 @@ services:
       - ./redis:/data
       - ./redis-conf/redis.conf:/etc/redis/redis.conf:ro
     command: redis-server /etc/redis/redis.conf
-    network_mode: host
+    ports:
+      - "${WG_IP}:${REDIS_PORT}:${REDIS_PORT}"
     healthcheck:
       test: ["CMD", "redis-cli", "-a", "\${REDIS_PASSWORD}", "ping"]
       interval: 10s
