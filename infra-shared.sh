@@ -1,26 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
 # infra-shared.sh — 共享 MariaDB + Redis（仅监听 WireGuard 网口）
-#
-# 用法：
-#   bash infra-shared.sh <子命令> [参数...]
-#
-# 子命令：
-#   deploy  [DIR] [WG_IP]   部署 MariaDB + Redis
-#   add-db  [DIR] <DB> <USER> <PW>
-#                           在运行中的 MariaDB 新建库和用户
-#   del-db  [DIR] <DB> <USER>
-#                           删除库和用户
-#   list-db [DIR]           列出所有业务库和用户
-#   passwd  [DIR] <USER> <NEW_PW>
-#                           修改用户密码
-#   status  [DIR]           显示运行状态
-#   backup  [DIR] [DEST]    备份所有库到本地目录
-#   restore [DIR] <SQL文件>  恢复单个库
-#   stop    [DIR]           停止服务
-#   start   [DIR]           启动服务
-#   logs    [DIR] <db|redis> 查看日志
-#
 # 前置条件：
 #   - WireGuard 已启动（wg0 接口存在）
 #   - docker compose v2 已安装
@@ -28,7 +8,6 @@
 # WG_IP 默认读取 wg0 接口当前地址，也可显式传入
 # ============================================================
 set -euo pipefail
-trap 'echo "[TRAP] 脚本在第 $LINENO 行异常退出，退出码: $?" >&2' EXIT
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
@@ -51,7 +30,7 @@ header() { echo; _c "1;34" "══ $* ══"; }
 # 修复 #10：去掉 `true` 掩盖 SIGPIPE 的做法，改用 2>/dev/null 抑制
 # tr 因 head 关闭管道收到 SIGPIPE 本属正常，重定向 stderr 即可。
 randpw() {
-    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 32
+    (set +o pipefail; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
 }
 
 # ── 获取 WireGuard 接口 IP ──────────────────────────────────
