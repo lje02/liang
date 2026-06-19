@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 # ============================================================
 # infra-shared.sh — 共享 MariaDB + Redis（仅监听 WireGuard 网口）
+#
+# 用法：
+#   bash infra-shared.sh <子命令> [参数...]
+#
+# 子命令：
+#   deploy  [DIR] [WG_IP]   部署 MariaDB + Redis
+#   add-db  [DIR] <DB> <USER> <PW>
+#                           在运行中的 MariaDB 新建库和用户
+#   del-db  [DIR] <DB> <USER>
+#                           删除库和用户
+#   list-db [DIR]           列出所有业务库和用户
+#   passwd  [DIR] <USER> <NEW_PW>
+#                           修改用户密码
+#   status  [DIR]           显示运行状态
+#   backup  [DIR] [DEST]    备份所有库到本地目录
+#   restore [DIR] <SQL文件>  恢复单个库
+#   stop    [DIR]           停止服务
+#   start   [DIR]           启动服务
+#   logs    [DIR] <db|redis> 查看日志
+#
 # 前置条件：
 #   - WireGuard 已启动（wg0 接口存在）
 #   - docker compose v2 已安装
@@ -20,7 +40,7 @@ export MARIADB_IMAGE="${MARIADB_IMAGE:-mariadb:11}"
 export REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
 
 # ── 颜色输出 ────────────────────────────────────────────────
-_c()     { printf "\033[${1}m${2}\033[0m\n"; }
+_c()     { printf "\033[%sm%s\033[0m\n" "${1}" "${2}"; }
 log()    { _c "32"   "[OK]  $*"; }
 info()   { _c "36"   "[..] $*"; }
 warn()   { _c "33"   "[!!] $*"; }
