@@ -31,13 +31,13 @@ set -euo pipefail
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
-# ── 默认值 ──────────────────────────────────────────────────
-DEFAULT_DIR="${BASE_DIR:-/srv}/infra"
-WG_IFACE="${WG_IFACE:-wg0}"
-MARIADB_PORT="${MARIADB_PORT:-3306}"
-REDIS_PORT="${REDIS_PORT:-6379}"
-MARIADB_IMAGE="${MARIADB_IMAGE:-mariadb:11}"
-REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
+# ── 默认值（显式导出，确保所有子进程和 printf 均可平稳读取） ──
+export DEFAULT_DIR="${BASE_DIR:-/srv}/infra"
+export WG_IFACE="${WG_IFACE:-wg0}"
+export MARIADB_PORT="${MARIADB_PORT:-3306}"
+export REDIS_PORT="${REDIS_PORT:-6379}"
+export MARIADB_IMAGE="${MARIADB_IMAGE:-mariadb:11}"
+export REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
 
 # ── 颜色输出 ────────────────────────────────────────────────
 _c() { printf "\033[${1}m${2}\033[0m\n"; }
