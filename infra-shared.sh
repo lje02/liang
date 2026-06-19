@@ -520,7 +520,7 @@ cmd_status() {
     if MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
             dc "$DIR" exec -T \
                 -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
-                db mariadb-admin -h 127.0.0.1 -uroot ping --silent 2>/dev/null; then
+                db mariadb-admin -h 127.0.0.1 --skip-ssl -uroot ping --silent 2>/dev/null; then
         log "✓ MariaDB 响应正常"
         mariadb_exec "$DIR" -e "SHOW STATUS LIKE 'Threads_connected';"
     else
