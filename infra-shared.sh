@@ -172,7 +172,7 @@ character-set-server     = utf8mb4
 collation-server         = utf8mb4_unicode_ci
 
 # 只监听 WireGuard 接口
-bind-address             = ${WG_IP}
+bind-address             = 0.0.0.0
 
 # 慢查询日志
 slow_query_log           = 1
@@ -223,7 +223,8 @@ services:
     volumes:
       - ./db:/var/lib/mysql
       - ./mariadb-conf/custom.cnf:/etc/mysql/conf.d/custom.cnf:ro
-    network_mode: host
+    ports:
+      - "${WG_IP}:${MARIADB_PORT}:3306"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
