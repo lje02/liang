@@ -242,7 +242,7 @@ services:
     ports:
       - "${WG_IP}:${REDIS_PORT}:${REDIS_PORT}"
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "\${REDIS_PASSWORD}", "ping"]
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "-a", "\${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -520,7 +520,7 @@ cmd_status() {
     if MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
             dc "$DIR" exec -T \
                 -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
-                db mariadb-admin -uroot ping --silent 2>/dev/null; then
+                db mariadb-admin -h 127.0.0.1 -uroot ping --silent 2>/dev/null; then
         log "✓ MariaDB 响应正常"
         mariadb_exec "$DIR" -e "SHOW STATUS LIKE 'Threads_connected';"
     else
@@ -530,10 +530,10 @@ cmd_status() {
     echo ""
     header "Redis 连通性"
     if dc "$DIR" exec -T redis \
-            redis-cli -a "${REDIS_PASSWORD}" ping 2>/dev/null | grep -q PONG; then
+            redis-cli -h 127.0.0.1 -a "${REDIS_PASSWORD}" ping 2>/dev/null | grep -q PONG; then
         log "✓ Redis 响应正常"
         dc "$DIR" exec -T redis \
-            redis-cli -a "${REDIS_PASSWORD}" info server 2>/dev/null \
+            redis-cli -h 127.0.0.1 -a "${REDIS_PASSWORD}" info server 2>/dev/null \
             | grep -E "redis_version|used_memory_human|connected_clients"
     else
         warn "✗ Redis 无响应"
