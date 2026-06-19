@@ -224,7 +224,7 @@ services:
       - ./db:/var/lib/mysql
       - ./mariadb-conf/custom.cnf:/etc/mysql/conf.d/custom.cnf:ro
     ports:
-      - "${WG_IP}:${MARIADB_PORT}:3306"
+      - "\${WG_IP}:\${MARIADB_PORT}:3306"
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
@@ -240,7 +240,7 @@ services:
       - ./redis-conf/redis.conf:/etc/redis/redis.conf:ro
     command: redis-server /etc/redis/redis.conf
     ports:
-      - "${WG_IP}:${REDIS_PORT}:${REDIS_PORT}"
+      - "\${WG_IP}:\${REDIS_PORT}:\${REDIS_PORT}"
     healthcheck:
       test: ["CMD", "redis-cli", "-h", "127.0.0.1", "-a", "\${REDIS_PASSWORD}", "ping"]
       interval: 10s
