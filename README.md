@@ -3,8 +3,11 @@
 
 # 下载
 curl -fsSL https://raw.githubusercontent.com/lje02/liang/main/infra-mariadb.sh -o infra-mariadb.sh
+chmod +x infra-mariadb.sh
+
+
 curl -fsSL https://raw.githubusercontent.com/lje02/liang/main/infra-redis.sh   -o infra-redis.sh
-chmod +x infra-mariadb.sh infra-redis.sh
+chmod +x infra-redis.sh
 
 
 
