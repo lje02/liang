@@ -2,7 +2,23 @@
 # ============================================================
 # infra-shared.sh — 共享 MariaDB + Redis（仅监听 WireGuard 网口）
 #
+# 用法:
+#   ./infra-shared.sh                        # 交互菜单
+#   ./infra-shared.sh deploy [DIR] [WG_IP]   # 部署
+#   ./infra-shared.sh add-db [DIR] <DB> <USER> [PW]
+#   ./infra-shared.sh del-db [DIR] <DB> <USER>
+#   ./infra-shared.sh list-db [DIR]
+#   ./infra-shared.sh passwd  [DIR] <USER> [NEW_PW]
+#   ./infra-shared.sh backup  [DIR] [DEST]
+#   ./infra-shared.sh restore [DIR] <SQL文件>
+#   ./infra-shared.sh status  [DIR]
+#   ./infra-shared.sh stop    [DIR]
+#   ./infra-shared.sh start   [DIR]
+#   ./infra-shared.sh logs    [DIR] <db|redis>
+#   ./infra-shared.sh help
+#
 # 前置条件：
+#   - 以 root 身份运行
 #   - WireGuard 已启动（wg0 接口存在）
 #   - docker compose v2 已安装
 #
@@ -28,10 +44,18 @@ warn()   { _c "33"   "[!!] $*"; }
 error()  { _c "31"   "[EE] $*"; exit 1; }
 header() { echo; _c "1;34" "══ $* ══"; }
 
-# 修复 #10：去掉 `true` 掩盖 SIGPIPE 的做法，改用 2>/dev/null 抑制
-# tr 因 head 关闭管道收到 SIGPIPE 本属正常，重定向 stderr 即可。
+# ── 随机密码（修复 #12：低熵环境回退到 openssl）──────────────
 randpw() {
-    (set +o pipefail; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)
+    local PW
+    # 优先 /dev/urandom；超时 5 秒后回退到 openssl
+    PW=$(set +o pipefail
+         timeout 5 sh -c \
+             "LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32" \
+             2>/dev/null) \
+    || PW=$(openssl rand -base64 48 \
+             | LC_ALL=C tr -dc 'A-Za-z0-9' \
+             | head -c 32)
+    printf '%s' "$PW"
 }
 
 # ── 获取 WireGuard 接口 IP ──────────────────────────────────
@@ -43,24 +67,40 @@ get_wg_ip() {
     echo "$IP"
 }
 
+# ── 简单 IPv4 格式校验 ──────────────────────────────────────
+_validate_ipv4() {
+    local IP="$1"
+    [[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] \
+        || error "IP 格式无效: '${IP}'"
+    local IFS='.'
+    read -ra OCTETS <<< "$IP"
+    for O in "${OCTETS[@]}"; do
+        (( O <= 255 )) || error "IP 地址段超出范围: '${IP}'"
+    done
+}
+
 # ── 读取 .env（仅在当前 shell，不导出到子进程环境）──────────
 load_env() {
     local DIR="$1"
     [[ -f "$DIR/.env" ]] || error ".env 不存在: $DIR/.env"
+    # 修复 #5：每次 load_env 都强制确保 .env 权限为 600
+    chmod 600 "$DIR/.env" 2>/dev/null || true
     # shellcheck disable=SC1090
     source "$DIR/.env"
 }
 
-# ── compose 快捷执行 ────────────────────────────────────────
-# 修复 #13：避免函数名遮蔽系统 dc(1) 命令，改名为 compose_run
+# ── compose 快捷执行（修复 #13：加 --project-directory 避免多实例冲突）──
 compose_run() {
     local DIR="$1"; shift
-    docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" "$@"
+    docker compose \
+        --project-directory "$DIR" \
+        -f "$DIR/docker-compose.yml" \
+        --env-file "$DIR/.env" \
+        "$@"
 }
 
 # ── MariaDB 执行 SQL ────────────────────────────────────────
-# 修复 #4：去掉宿主机侧无效的 MYSQL_PWD 前置赋值，
-# 仅通过 docker compose exec -e 将变量注入容器内进程。
+# 通过 docker compose exec -e 将密码注入容器内进程，不在宿主机暴露
 mariadb_exec() {
     local DIR="$1"; shift
     load_env "$DIR"
@@ -70,22 +110,23 @@ mariadb_exec() {
 }
 
 # ── 等待 MariaDB 就绪 ───────────────────────────────────────
-# 修复 #7：调用者已 load_env，内部不再重复 source；
-# 改为接收密码参数，避免依赖外部变量状态。
+# 修复 #9：改用 while (( RETRIES-- > 0 )) 消除差一错误
 wait_db_ready() {
     local DIR="$1"
     local ROOT_PW="$2"
     local RETRIES="${3:-20}"
     info "等待 MariaDB 就绪..."
-    while ! compose_run "$DIR" exec -T \
-            -e MYSQL_PWD="${ROOT_PW}" \
-            db mariadb-admin -uroot \
-            ping --silent 2>/dev/null; do
+    while (( RETRIES-- > 0 )); do
+        if compose_run "$DIR" exec -T \
+                -e MYSQL_PWD="${ROOT_PW}" \
+                db mariadb-admin -uroot \
+                ping --silent 2>/dev/null; then
+            log "MariaDB 就绪"
+            return 0
+        fi
         sleep 3
-        (( RETRIES-- ))
-        [[ $RETRIES -gt 0 ]] || error "MariaDB 启动超时"
     done
-    log "MariaDB 就绪"
+    error "MariaDB 启动超时"
 }
 
 # ── 校验标识符（库名 / 用户名）──────────────────────────────
@@ -95,27 +136,52 @@ _validate_identifier() {
         || error "${LABEL} 只能包含字母、数字、下划线，长度 1-64，实际值: '${VALUE}'"
 }
 
+# ── 校验密码（修复 #6：拒绝包含单引号的密码，防止 SQL 注入）──
+_validate_password() {
+    local PW="$1" LABEL="${2:-密码}"
+    [[ -n "$PW" ]] || error "${LABEL} 不能为空"
+    [[ "$PW" != *"'"* ]] || error "${LABEL} 不能包含单引号（'），请更换密码"
+    [[ ${#PW} -ge 8 ]]   || error "${LABEL} 长度至少 8 个字符"
+}
+
 # ── 从 .env 解析 WG_IP，若缺失则探测接口 ───────────────────
-# 修复 #1 #2：集中处理 WG_IP 获取，供 cmd_add_db / cmd_del_db 使用
 _resolve_wg_ip() {
     local DIR="$1"
-    local IP="${WG_IP:-}"          # load_env 可能已设置
+    local IP="${WG_IP:-}"
     if [[ -z "$IP" ]]; then
         warn ".env 中未找到 WG_IP，尝试从 ${WG_IFACE} 接口获取"
         IP=$(get_wg_ip)
     fi
+    _validate_ipv4 "$IP"
     echo "$IP"
+}
+
+# ── 获取 Docker 网桥子网（修复 #4：缩小授权范围）────────────
+# 返回形如 172.17.% 的 host 通配符，供 GRANT 语句使用
+_docker_host_pattern() {
+    local SUBNET
+    SUBNET=$(docker network inspect bridge \
+        --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)
+    if [[ "$SUBNET" =~ ^([0-9]+\.[0-9]+)\. ]]; then
+        echo "${BASH_REMATCH[1]}.%"
+    else
+        # 回退：覆盖常见 Docker 默认网段，但不再是 172.% 整段
+        echo "172.17.%"
+    fi
 }
 
 # ════════════════════════════════════════════════════════════
 # deploy [DIR] [WG_IP]
 # ════════════════════════════════════════════════════════════
 cmd_deploy() {
+    # 修复 #2：root 检查提到函数最开头
+    [[ $EUID -eq 0 ]] || error "需要 root 权限"
+
     local DIR="${1:-$DEFAULT_DIR}"
     local WG_IP="${2:-$(get_wg_ip)}"
 
+    _validate_ipv4 "$WG_IP"
     header "部署共享基础设施 → ${DIR}  (监听 ${WG_IP})"
-    [[ $EUID -eq 0 ]] || error "需要 root 权限"
 
     ip link show "${WG_IFACE}" &>/dev/null || \
         error "${WG_IFACE} 接口不存在，请先启动 WireGuard"
@@ -141,6 +207,8 @@ EOF
         log ".env 已生成: ${DIR}/.env"
     else
         warn ".env 已存在，跳过生成密码（使用已有凭据）"
+        # 修复 #5：无论走哪个分支都强制修正权限
+        chmod 600 "${DIR}/.env"
         sed -i "s|^WG_IP=.*|WG_IP=${WG_IP}|" "${DIR}/.env"
     fi
 
@@ -167,7 +235,6 @@ long_query_time                 = 2
 INI
 
     # ── Redis 配置 ────────────────────────────────────────
-    # 修复 #3：删除重复的 requirepass 行
     mkdir -p "${DIR}/redis-conf"
     cat > "${DIR}/redis-conf/redis.conf" <<CONF
 bind 0.0.0.0
@@ -229,12 +296,16 @@ YAML
     grep -q 'vm.overcommit_memory' /etc/sysctl.conf \
         || echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
 
-    compose_run "${DIR}" up -d 2>&1 || error "docker compose up 失败，请检查上方错误信息"
+    compose_run "${DIR}" up -d 2>&1 \
+        || error "docker compose up 失败，请检查上方错误信息"
 
-    # 修复 #7：显式传递密码，不依赖 load_env 重复调用
     wait_db_ready "${DIR}" "${MARIADB_ROOT_PASSWORD}"
 
-    _grant_wg_access "${DIR}" "${MARIADB_DATABASE}" "${MARIADB_USER}" "${MARIADB_PASSWORD}" "${WG_IP}"
+    _grant_wg_access "${DIR}" \
+        "${MARIADB_DATABASE}" \
+        "${MARIADB_USER}" \
+        "${MARIADB_PASSWORD}" \
+        "${WG_IP}"
 
     echo ""
     compose_run "${DIR}" ps
@@ -243,48 +314,58 @@ YAML
 }
 
 # ── 授权 WG 网段访问（内部使用）──────────────────────────────
+# 修复 #3：先保存参数，再 load_env，变量覆盖关系清晰
+# 修复 #4：Docker 授权范围从 172.% 缩小到实际网桥子网
 _grant_wg_access() {
     local DIR="$1" DB="$2" USER="$3" PW="$4"
-    local _ARG_WG_IP="${5:-}"
+    local CALLER_WG_IP="${5:-}"
+
     load_env "$DIR"
-    local WG_IP="${_ARG_WG_IP:-${WG_IP}}"
+
+    # 调用者明确传入时优先使用，否则从 .env 读取
+    local WG_IP="${CALLER_WG_IP:-${WG_IP:-}}"
+    [[ -n "$WG_IP" ]] || WG_IP=$(get_wg_ip)
+
     local WG_SUBNET="${WG_IP%.*}.%"
+    local DOCKER_SUBNET
+    DOCKER_SUBNET=$(_docker_host_pattern)
 
     mariadb_exec "$DIR" <<SQL
-CREATE USER IF NOT EXISTS '${USER}'@'${WG_SUBNET}' IDENTIFIED BY '${PW}';
+CREATE USER IF NOT EXISTS '${USER}'@'${WG_SUBNET}'   IDENTIFIED BY '${PW}';
 GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${USER}'@'${WG_SUBNET}';
-CREATE USER IF NOT EXISTS '${USER}'@'172.%' IDENTIFIED BY '${PW}';
-GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${USER}'@'172.%';
+CREATE USER IF NOT EXISTS '${USER}'@'${DOCKER_SUBNET}' IDENTIFIED BY '${PW}';
+GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${USER}'@'${DOCKER_SUBNET}';
 FLUSH PRIVILEGES;
 SQL
-    log "已授权 ${USER}@${WG_SUBNET} 和 ${USER}@172.% 访问 ${DB}"
+    log "已授权 ${USER}@${WG_SUBNET} 和 ${USER}@${DOCKER_SUBNET} 访问 ${DB}"
 }
 
 # ── 打印凭据摘要 ─────────────────────────────────────────────
-# 修复 #8：改用自适应宽度，避免长值破坏表格边框
+# 修复 #14：改为简单键值对，彻底回避固定宽度表格与长值的错位问题
 _print_credentials() {
     local DIR="$1"
     load_env "$DIR"
 
-    local DB_ADDR="${WG_IP}:${MARIADB_PORT}"
-    local RE_ADDR="${WG_IP}:${REDIS_PORT}"
-
     echo ""
-    echo "┌─────────────────────────────────────────────────────┐"
-    echo "│              共享基础设施连接信息                     │"
-    echo "├─────────────────────────────────────────────────────┤"
-    printf "│  %-10s %s\n│\n" "MariaDB"  "${DB_ADDR}"
-    printf "│  %-10s %s / %s\n│\n" "用户/密码" "${MARIADB_USER}" "${MARIADB_PASSWORD}"
-    printf "│  %-10s %s\n│\n" "库名"     "${MARIADB_DATABASE}"
-    echo "├─────────────────────────────────────────────────────┤"
-    printf "│  %-10s %s\n│\n" "Redis"    "${RE_ADDR}"
-    printf "│  %-10s %s\n│\n" "密码"     "${REDIS_PASSWORD}"
-    echo "├─────────────────────────────────────────────────────┤"
-    printf "│  %-10s %s\n" "凭据文件" "${DIR}/.env"
-    echo "└─────────────────────────────────────────────────────┘"
+    echo "┌─── 共享基础设施连接信息 ───────────────────────────────"
+    echo "│"
+    echo "│  [MariaDB]"
+    echo "│    地址      : ${WG_IP}:${MARIADB_PORT}"
+    echo "│    用户      : ${MARIADB_USER}"
+    echo "│    密码      : ${MARIADB_PASSWORD}"
+    echo "│    数据库    : ${MARIADB_DATABASE}"
+    echo "│"
+    echo "│  [Redis]"
+    echo "│    地址      : ${WG_IP}:${REDIS_PORT}"
+    echo "│    密码      : ${REDIS_PASSWORD}"
+    echo "│"
+    echo "│  凭据文件    : ${DIR}/.env"
+    echo "│"
+    echo "└────────────────────────────────────────────────────────"
     echo ""
     warn "请将 .env 安全传输到各 WordPress 节点（scp over WireGuard）"
-    echo "  scp -i /etc/wireguard/keys/id_ed25519 ${DIR}/.env root@<节点WG_IP>:/srv/wordpress/.env-infra"
+    echo "  scp -i /etc/wireguard/keys/id_ed25519 \\"
+    echo "      ${DIR}/.env root@<节点WG_IP>:/srv/wordpress/.env-infra"
 }
 
 # ════════════════════════════════════════════════════════════
@@ -298,21 +379,25 @@ cmd_add_db() {
 
     _validate_identifier "$DB_NAME" "数据库名"
     _validate_identifier "$USER"    "用户名"
+    _validate_password   "$PW"      "密码"
 
     load_env "$DIR"
 
-    # 修复 #1：WG_IP 缺失时自动探测，不依赖 set -u 崩溃
     local WG_IP
     WG_IP=$(_resolve_wg_ip "$DIR")
+
+    local DOCKER_SUBNET
+    DOCKER_SUBNET=$(_docker_host_pattern)
 
     header "新建数据库: ${DB_NAME} / 用户: ${USER}"
 
     mariadb_exec "$DIR" <<SQL
-CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS '${USER}'@'${WG_IP%.*}.%' IDENTIFIED BY '${PW}';
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`
+    CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '${USER}'@'${WG_IP%.*}.%'   IDENTIFIED BY '${PW}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'${WG_IP%.*}.%';
-CREATE USER IF NOT EXISTS '${USER}'@'172.%' IDENTIFIED BY '${PW}';
-GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'172.%';
+CREATE USER IF NOT EXISTS '${USER}'@'${DOCKER_SUBNET}' IDENTIFIED BY '${PW}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'${DOCKER_SUBNET}';
 FLUSH PRIVILEGES;
 SQL
 
@@ -334,9 +419,11 @@ cmd_del_db() {
 
     load_env "$DIR"
 
-    # 修复 #2：WG_IP 缺失时自动探测
     local WG_IP
     WG_IP=$(_resolve_wg_ip "$DIR")
+
+    local DOCKER_SUBNET
+    DOCKER_SUBNET=$(_docker_host_pattern)
 
     warn "即将删除数据库 ${DB_NAME} 和用户 ${USER}，此操作不可逆！"
     read -rp "确认删除? 输入库名确认: " CONFIRM
@@ -345,7 +432,7 @@ cmd_del_db() {
     mariadb_exec "$DIR" <<SQL
 DROP DATABASE IF EXISTS \`${DB_NAME}\`;
 DROP USER IF EXISTS '${USER}'@'${WG_IP%.*}.%';
-DROP USER IF EXISTS '${USER}'@'172.%';
+DROP USER IF EXISTS '${USER}'@'${DOCKER_SUBNET}';
 FLUSH PRIVILEGES;
 SQL
     log "数据库 ${DB_NAME} 和用户 ${USER} 已删除"
@@ -362,7 +449,8 @@ cmd_list_db() {
         "SELECT schema_name AS '数据库', \
                 default_character_set_name AS '字符集' \
          FROM information_schema.schemata \
-         WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');"
+         WHERE schema_name NOT IN
+             ('mysql','information_schema','performance_schema','sys');"
     echo ""
     header "用户列表"
     mariadb_exec "$DIR" -e \
@@ -372,14 +460,16 @@ cmd_list_db() {
 }
 
 # ════════════════════════════════════════════════════════════
-# passwd [DIR] <USER> <NEW_PW>
+# passwd [DIR] <USER> [NEW_PW]
 # ════════════════════════════════════════════════════════════
 cmd_passwd() {
     local DIR="${1:-$DEFAULT_DIR}"
-    local USER="${2:?用法: passwd [DIR] <用户名> <新密码>}"
-    local NEW_PW="${3:?}"
+    local USER="${2:?用法: passwd [DIR] <用户名> [新密码]}"
+    local NEW_PW="${3:-$(randpw)}"
 
-    _validate_identifier "$USER" "用户名"
+    _validate_identifier "$USER"   "用户名"
+    # 修复 #6：密码校验，拒绝含单引号的值
+    _validate_password   "$NEW_PW" "新密码"
 
     load_env "$DIR"
 
@@ -393,9 +483,6 @@ cmd_passwd() {
         return 1
     fi
 
-    # 修复 #11：循环内避免重复 load_env（mariadb_exec 内部会调用），
-    # 此处 load_env 已在上方执行，MARIADB_ROOT_PASSWORD 已在作用域内，
-    # mariadb_exec 的内部 load_env 幂等，多次 source 同一文件无副作用，可接受。
     while IFS= read -r HOST; do
         [[ -n "$HOST" ]] || continue
         mariadb_exec "$DIR" -e \
@@ -405,6 +492,7 @@ cmd_passwd() {
 
     mariadb_exec "$DIR" -e "FLUSH PRIVILEGES;"
     log "用户 ${USER} 所有 host 密码已更新"
+    log "新密码: ${NEW_PW}"
 }
 
 # ════════════════════════════════════════════════════════════
@@ -423,9 +511,9 @@ cmd_backup() {
     local DBS
     DBS=$(mariadb_exec "$DIR" -sN -e \
         "SELECT schema_name FROM information_schema.schemata \
-         WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');")
+         WHERE schema_name NOT IN
+             ('mysql','information_schema','performance_schema','sys');")
 
-    # 修复 #12：用 while read 代替 for，避免库名含空格时 word splitting
     local FAILED=0
     while IFS= read -r DB; do
         [[ -n "$DB" ]] || continue
@@ -433,7 +521,6 @@ cmd_backup() {
         local TMP="${OUT}.tmp"
         info "备份 ${DB} → ${OUT}"
 
-        # 修复 #6：先写临时文件，成功后原子移动；失败时删除残缺文件
         if compose_run "$DIR" exec -T \
                 -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
                 db mariadb-dump \
@@ -454,6 +541,7 @@ cmd_backup() {
 
     if [[ $FAILED -gt 0 ]]; then
         warn "备份完成，但有 ${FAILED} 个库失败，请检查上方日志"
+        return 1
     else
         log "备份完成: ${DEST}"
     fi
@@ -469,7 +557,6 @@ cmd_restore() {
     load_env "$DIR"
     [[ -f "$SQL_FILE" ]] || error "文件不存在: ${SQL_FILE}"
 
-    # 修复 #5：gz 文件先校验完整性，避免损坏文件静默写入空数据
     if [[ "$SQL_FILE" == *.gz ]]; then
         info "校验压缩文件完整性..."
         gzip -t "$SQL_FILE" || error "gz 文件损坏，请检查备份来源: ${SQL_FILE}"
@@ -477,8 +564,7 @@ cmd_restore() {
 
     local BASENAME
     BASENAME=$(basename "$SQL_FILE")
-    local DB_NAME
-    DB_NAME="${BASENAME%.sql.gz}"
+    local DB_NAME="${BASENAME%.sql.gz}"
     DB_NAME="${DB_NAME%.sql}"
     DB_NAME="${DB_NAME%_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]}"
 
@@ -493,10 +579,12 @@ cmd_restore() {
     [[ "${CONFIRM,,}" == "y" ]] || { info "已取消"; return; }
 
     mariadb_exec "$DIR" -e \
-        "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`
+         CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 
+    # 修复 #7：改用 gzip -dc 代替 zcat，兼容 macOS 和 Linux
     if [[ "$SQL_FILE" == *.gz ]]; then
-        zcat "$SQL_FILE" | compose_run "$DIR" exec -T \
+        gzip -dc "$SQL_FILE" | compose_run "$DIR" exec -T \
             -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
             db mariadb -uroot "${DB_NAME}"
     else
@@ -522,7 +610,8 @@ cmd_status() {
     header "MariaDB 连通性"
     if compose_run "$DIR" exec -T \
             -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
-            db mariadb-admin -h 127.0.0.1 --skip-ssl -uroot ping --silent 2>/dev/null; then
+            db mariadb-admin -h 127.0.0.1 --skip-ssl -uroot \
+            ping --silent 2>/dev/null; then
         log "✓ MariaDB 响应正常"
         mariadb_exec "$DIR" -e "SHOW STATUS LIKE 'Threads_connected';"
     else
@@ -532,11 +621,13 @@ cmd_status() {
     echo ""
     header "Redis 连通性"
     if compose_run "$DIR" exec -T redis \
-            redis-cli -h 127.0.0.1 -a "${REDIS_PASSWORD}" ping 2>/dev/null \
+            redis-cli -h 127.0.0.1 -a "${REDIS_PASSWORD}" \
+            ping 2>/dev/null \
             | grep -q PONG; then
         log "✓ Redis 响应正常"
         compose_run "$DIR" exec -T redis \
-            redis-cli -h 127.0.0.1 -a "${REDIS_PASSWORD}" info server 2>/dev/null \
+            redis-cli -h 127.0.0.1 -a "${REDIS_PASSWORD}" \
+            info server 2>/dev/null \
             | grep -E "redis_version|used_memory_human|connected_clients"
     else
         warn "✗ Redis 无响应"
@@ -633,6 +724,12 @@ menu_deploy() {
         _pause; return
     fi
 
+    # 修复 #11：在菜单层也做 IP 格式校验，给出友好提示
+    if ! [[ "$WG_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        warn "IP 格式无效: '${WG_IP}'，已取消"
+        _pause; return
+    fi
+
     echo
     warn "即将部署到 ${DIR}，WireGuard IP: ${WG_IP}"
     read -rp "  确认继续? [y/N] " C
@@ -687,12 +784,16 @@ menu_logs() {
     info "Ctrl+C 退出日志查看"
     echo
 
-    # 修复 #9：trap SIGINT，确保 Ctrl+C 后能正常返回菜单而非退出脚本
+    # 修复 #8：正确恢复 SIGINT trap
     local _OLD_TRAP
     _OLD_TRAP=$(trap -p INT)
     trap 'true' INT
     cmd_logs "$DIR" "$SVC" || true
-    eval "${_OLD_TRAP:-trap - INT}"
+    if [[ -n "$_OLD_TRAP" ]]; then
+        eval "$_OLD_TRAP"
+    else
+        trap - INT
+    fi
 
     _pause
 }
@@ -730,7 +831,7 @@ menu_db_add() {
     _ask "用户名" DB_USER ""
     [[ -n "$DB_USER" ]] || { warn "用户名不能为空"; _pause; return; }
     local AUTO_PW; AUTO_PW=$(randpw)
-    _ask "密码" DB_PW "$AUTO_PW"
+    _ask "密码（留空自动生成）" DB_PW "$AUTO_PW"
     echo
     cmd_add_db "$DIR" "$DB_NAME" "$DB_USER" "$DB_PW"
     _pause
@@ -746,7 +847,8 @@ menu_db_del() {
     echo
     _ask "要删除的数据库名" DB_NAME ""
     _ask "要删除的用户名"   DB_USER ""
-    [[ -n "$DB_NAME" && -n "$DB_USER" ]] || { warn "名称不能为空"; _pause; return; }
+    [[ -n "$DB_NAME" && -n "$DB_USER" ]] \
+        || { warn "名称不能为空"; _pause; return; }
     echo
     cmd_del_db "$DIR" "$DB_NAME" "$DB_USER"
     _pause
@@ -766,8 +868,9 @@ menu_db_passwd() {
     echo
     _ask "部署目录" DIR "$DEFAULT_DIR"
     _ask "用户名"   DB_USER ""
-    _ask "新密码（留空自动生成）" NEW_PW "$(randpw)"
     [[ -n "$DB_USER" ]] || { warn "用户名不能为空"; _pause; return; }
+    local AUTO_PW; AUTO_PW=$(randpw)
+    _ask "新密码（留空自动生成）" NEW_PW "$AUTO_PW"
     echo
     cmd_passwd "$DIR" "$DB_USER" "$NEW_PW"
     _pause
@@ -838,9 +941,10 @@ main() {
         stop)     cmd_stop    "$@" ;;
         start)    cmd_start   "$@" ;;
         logs)     cmd_logs    "$@" ;;
-        # 修复 #14：仅输出头部用法注释块，不输出内部实现注释
+        # 修复 #10：匹配文件头部注释块作为帮助文本
         help|--help|-h)
-            sed -n '/^# 用法/,/^# WG_IP/p' "$0" | sed 's/^# \{0,2\}//'
+            sed -n '/^# 用法/,/^# WG_IP/p' "$0" \
+                | sed 's/^# \{0,2\}//'
             ;;
         *) error "未知子命令: ${CMD}，执行 help 查看用法" ;;
     esac
