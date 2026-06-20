@@ -313,10 +313,8 @@ YAML
     grep -q 'vm.overcommit_memory' /etc/sysctl.conf \
         || echo 'vm.overcommit_memory = 1' >> /etc/sysctl.conf
 
-    compose_run "${DIR}" up -d 2>&1 \
-        || error "docker compose up 失败，请检查上方错误信息"
-
-    wait_db_ready "${DIR}" "${MARIADB_ROOT_PASSWORD}"
+    compose_run "${DIR}" up -d --wait 2>&1 \
+        || error "docker compose up 失败，请检查上方错误信息"
 
     _grant_wg_access "${DIR}" \
         "${MARIADB_DATABASE}" \
