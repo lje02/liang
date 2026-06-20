@@ -80,13 +80,15 @@ _validate_ipv4() {
 }
 
 # ── 读取 .env（仅在当前 shell，不导出到子进程环境）──────────
+# 关键：重定向 stdin 为 /dev/null，防止 source 消费调用方的 stdin
+# （heredoc 通过 stdin 传给 mariadb，source 不能抢占同一个 fd）
 load_env() {
     local DIR="$1"
     [[ -f "$DIR/.env" ]] || error ".env 不存在: $DIR/.env"
     # 修复 #5：每次 load_env 都强制确保 .env 权限为 600
     chmod 600 "$DIR/.env" 2>/dev/null || true
     # shellcheck disable=SC1090
-    source "$DIR/.env"
+    source "$DIR/.env" </dev/null
 }
 
 # ── compose 快捷执行（修复 #13：加 --project-directory 避免多实例冲突）──
@@ -99,14 +101,29 @@ compose_run() {
         "$@"
 }
 
-# ── MariaDB 执行 SQL ────────────────────────────────────────
-# 通过 docker compose exec -e 将密码注入容器内进程，不在宿主机暴露
+# ── MariaDB 执行 SQL（单条语句 / 额外参数）──────────────────
+# 调用方必须已执行 load_env，此处不再重复 source，
+# 避免 source 消费调用方通过 stdin 传入的 heredoc 数据。
 mariadb_exec() {
     local DIR="$1"; shift
-    load_env "$DIR"
     compose_run "$DIR" exec -T \
         -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
         db mariadb -uroot "$@"
+}
+
+# ── MariaDB 执行多行 SQL（用进程替换传递，完全绕开 stdin 竞争）──
+# 用法：mariadb_sql "$DIR" "SQL语句1; SQL语句2; ..."
+# 或：  mariadb_sql "$DIR" "$(cat <<'SQL'
+#           ...
+#       SQL
+#       )"
+mariadb_sql() {
+    local DIR="$1"
+    local SQL="$2"
+    compose_run "$DIR" exec -T \
+        -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
+        db mariadb -uroot \
+        < <(printf '%s\n' "$SQL")
 }
 
 # ── 等待 MariaDB 就绪 ───────────────────────────────────────
@@ -330,13 +347,13 @@ _grant_wg_access() {
     local DOCKER_SUBNET
     DOCKER_SUBNET=$(_docker_host_pattern)
 
-    mariadb_exec "$DIR" <<SQL
-CREATE USER IF NOT EXISTS '${USER}'@'${WG_SUBNET}'   IDENTIFIED BY '${PW}';
+    mariadb_sql "$DIR" "
+CREATE USER IF NOT EXISTS '${USER}'@'${WG_SUBNET}'    IDENTIFIED BY '${PW}';
 GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${USER}'@'${WG_SUBNET}';
 CREATE USER IF NOT EXISTS '${USER}'@'${DOCKER_SUBNET}' IDENTIFIED BY '${PW}';
 GRANT ALL PRIVILEGES ON \`${DB}\`.* TO '${USER}'@'${DOCKER_SUBNET}';
 FLUSH PRIVILEGES;
-SQL
+"
     log "已授权 ${USER}@${WG_SUBNET} 和 ${USER}@${DOCKER_SUBNET} 访问 ${DB}"
 }
 
@@ -391,15 +408,15 @@ cmd_add_db() {
 
     header "新建数据库: ${DB_NAME} / 用户: ${USER}"
 
-    mariadb_exec "$DIR" <<SQL
+    mariadb_sql "$DIR" "
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`
     CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER IF NOT EXISTS '${USER}'@'${WG_IP%.*}.%'   IDENTIFIED BY '${PW}';
+CREATE USER IF NOT EXISTS '${USER}'@'${WG_IP%.*}.%'    IDENTIFIED BY '${PW}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'${WG_IP%.*}.%';
-CREATE USER IF NOT EXISTS '${USER}'@'${DOCKER_SUBNET}' IDENTIFIED BY '${PW}';
+CREATE USER IF NOT EXISTS '${USER}'@'${DOCKER_SUBNET}'  IDENTIFIED BY '${PW}';
 GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${USER}'@'${DOCKER_SUBNET}';
 FLUSH PRIVILEGES;
-SQL
+"
 
     log "数据库 ${DB_NAME} 已创建"
     log "用户: ${USER}  密码: ${PW}"
@@ -429,12 +446,12 @@ cmd_del_db() {
     read -rp "确认删除? 输入库名确认: " CONFIRM
     [[ "$CONFIRM" == "$DB_NAME" ]] || { info "已取消"; return; }
 
-    mariadb_exec "$DIR" <<SQL
+    mariadb_sql "$DIR" "
 DROP DATABASE IF EXISTS \`${DB_NAME}\`;
 DROP USER IF EXISTS '${USER}'@'${WG_IP%.*}.%';
 DROP USER IF EXISTS '${USER}'@'${DOCKER_SUBNET}';
 FLUSH PRIVILEGES;
-SQL
+"
     log "数据库 ${DB_NAME} 和用户 ${USER} 已删除"
 }
 
