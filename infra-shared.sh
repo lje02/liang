@@ -98,6 +98,23 @@ _docker_subnet() {
     [[ "$s" =~ ^([0-9]+\.[0-9]+)\. ]] && echo "${BASH_REMATCH[1]}.%" || echo "172.17.%"
 }
 
+# ── 依赖检查 ─────────────────────────────────────────────────
+_check_deps() {
+    local missing=()
+    for cmd in docker ip awk grep; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+
+    # 明确检查 docker compose 插件（V2）
+    if ! docker compose version >/dev/null 2>&1; then
+        missing+=("docker compose (插件)")
+    fi
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        error "缺少依赖命令: ${missing[*]}。请安装并确保在 PATH 中"
+    fi
+}
+
 compose_run() { local d="$1"; shift
     docker compose --project-directory "$d" -f "$d/docker-compose.yml" --env-file "$d/.env" "$@"
 }
@@ -730,6 +747,7 @@ menu_bk_restore() {
 # 入口
 # ════════════════════════════════════════════════════════════
 main() {
+    _check_deps
     [[ $# -eq 0 ]] && { menu_main; return; }
     local cmd="$1"; shift
     case "$cmd" in
