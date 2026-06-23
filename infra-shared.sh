@@ -101,17 +101,17 @@ _docker_subnet() {
 # ── 依赖检查 ─────────────────────────────────────────────────
 _check_deps() {
     local missing=()
+    # 检查核心命令
     for cmd in docker ip awk grep; do
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
-
-    # 明确检查 docker compose 插件（V2）
-    if ! docker compose version >/dev/null 2>&1; then
+    # 检查 docker compose 插件（V2）
+    if command -v docker >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
         missing+=("docker compose (插件)")
     fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        error "缺少依赖命令: ${missing[*]}。请安装并确保在 PATH 中"
+        error "缺少依赖命令: ${missing[*]}\n请安装后再运行本脚本。\nDocker 安装参考: curl -fsSL https://get.docker.com | sudo bash"
     fi
 }
 
