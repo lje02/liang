@@ -7,7 +7,10 @@ curl -fsSL https://get.docker.com | sh
 
 systemctl enable docker --now
 
-curl -fsSL https://raw.githubusercontent.com/lje02/liang/main/wp-deploy.sh -o /usr/local/bin/wp-deploy.sh && chmod +x /usr/local/bin/wp-deploy.sh && /usr/local/bin/wp-deploy.sh
+
+# wireguard组网
+
+curl -fsSL https://raw.githubusercontent.com/lje02/liang/main/wireguard-mesh.sh -o /usr/local/bin/wireguard-mesh.sh && chmod +x /usr/local/bin/wireguard-mesh.sh && /usr/local/bin/wireguard-mesh.sh
 
 # 分布式wordpress
 
