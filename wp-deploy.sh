@@ -364,7 +364,6 @@ _write_wp_config_extra() {
         printf '// 更新与调试\n'
         printf "define('AUTOMATIC_UPDATER_DISABLED', true);\n"
         printf "define('WP_AUTO_UPDATE_CORE',        false);\n"
-        printf "define('WP_DEBUG',                   false);\n\n"
 
         printf '// WP-Cron: 禁用内置触发，由宿主机 cron 调用 wp-cli\n'
         printf "define('DISABLE_WP_CRON',    true);\n"
