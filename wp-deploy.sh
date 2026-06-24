@@ -413,11 +413,11 @@ _write_master_dockerfile() {
 FROM php:8.4-fpm-alpine
 
 RUN apk add --no-cache \
-        nginx supervisor curl bash less mariadb-client \
+        nginx supervisor curl bash \
         libpng libpng-dev libjpeg-turbo libjpeg-turbo-dev \
         libwebp-dev freetype freetype-dev icu-dev libzip-dev zip unzip \
     && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
-    && docker-php-ext-install -j$(nproc) gd mysqli pdo_mysql zip intl exif opcache bcmath \
+    && docker-php-ext-install -j$(nproc) gd mysqli zip intl exif opcache \
     && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
     && pecl install redis \
     && docker-php-ext-enable redis \
@@ -471,11 +471,11 @@ _write_init_dockerfile() {
 FROM php:8.4-fpm-alpine
 
 RUN apk add --no-cache \
-        nginx supervisor curl bash less mariadb-client \
+        nginx supervisor curl bash \
         libpng libpng-dev libjpeg-turbo libjpeg-turbo-dev \
         libwebp-dev freetype freetype-dev icu-dev libzip-dev zip unzip \
     && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
-    && docker-php-ext-install -j$(nproc) gd mysqli pdo_mysql zip intl exif opcache bcmath \
+    && docker-php-ext-install -j$(nproc) gd mysqli zip intl exif opcache \
     && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
     && pecl install redis \
     && docker-php-ext-enable redis \
