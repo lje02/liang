@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
-# v4.3  修复版（网络与安全增强）
-#   - 修复: 主节点 volume 覆盖核心 -> 仅挂载动态目录
-#   - 修复: 工作节点自动生成 wp-config.php 并挂载
-#   - 修复: 镜像层泄漏、密码暴露、临时目录残留
-#   - 新增: 端口检测、网络连通性预检、jq 依赖
-#   - 改进: heredoc 统一、仓库 tag 解析稳健性
+# v4.9
+#   变更: 移除所有 S3/对象存储相关代码（BREAKING）
+#         S3 插件在 WordPress 后台配置完成后随镜像打包分发，脚本不再介入
+#   继承 v4.8 全部修复
 # ============================================================
-set -uo pipefail
+set -euo pipefail
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
@@ -25,9 +23,6 @@ warn()   { _c "33"   "[警告] $*"; }
 error()  { _c "31"   "[错误] $*"; exit 1; }
 header() { echo; _c "1;34" "=== $* ==="; }
 
-# ════════════════════════════════════════════════════════
-# 依赖检查（增加 jq、端口检测辅助）
-# ════════════════════════════════════════════════════════
 check_deps() {
     local MISSING=()
     command -v docker  &>/dev/null || MISSING+=("docker")
@@ -48,9 +43,10 @@ check_deps() {
     docker info &>/dev/null || error "Docker daemon 未运行或当前用户无权限"
 }
 
+# v4.7: 简化正则，覆盖 IPv4/IPv6/*:PORT 等所有 ss 输出格式
 check_port() {
     local IP="$1" PORT="$2"
-    if ss -tlnp | grep -q "${IP}:${PORT} "; then
+    if ss -tlnp | awk '{print $4}' | grep -qE ":${PORT}$"; then
         error "端口 ${IP}:${PORT} 已被占用，请先停止对应服务"
     fi
 }
@@ -59,8 +55,12 @@ check_network() {
     local targets=("$@")
     for target in "${targets[@]}"; do
         IFS=: read -r host port <<< "$target"
-        if ! timeout 3 bash -c "echo >/dev/tcp/$host/$port" 2>/dev/null; then
-            warn "无法连接 $host:$port，请检查网络/防火墙"
+        if [[ ! "$host" =~ ^[a-zA-Z0-9._-]+$ ]] || [[ ! "$port" =~ ^[0-9]+$ ]]; then
+            warn "check_network: 无效地址格式 '$target'，跳过"
+            continue
+        fi
+        if ! timeout 3 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
+            warn "无法连接 ${host}:${port}，请检查网络/防火墙"
             return 1
         fi
     done
@@ -86,7 +86,7 @@ dc() {
 
 read_secret() {
     local PROMPT="$1" VAR_NAME="$2" VALUE=""
-    IFS= read -rp "$PROMPT" VALUE
+    IFS= read -rp "$PROMPT" VALUE || true
     VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
     VALUE="${VALUE%"${VALUE##*[![:space:]]}"}"
     printf -v "$VAR_NAME" '%s' "$VALUE"
@@ -99,9 +99,11 @@ env_get() {
 
 _register_node() {
     local IP="$1"
+    if [[ ! "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        error "_register_node: 无效 IP 格式：${IP}"
+    fi
     touch "$NODES_FILE"
     if ! grep -qxF "$IP" "$NODES_FILE"; then
-        # 确保文件末尾有换行
         [[ -s "$NODES_FILE" && "$(tail -c1 "$NODES_FILE")" != "" ]] && echo "" >> "$NODES_FILE"
         echo "$IP" >> "$NODES_FILE"
         log "节点 ${IP} 已注册到 ${NODES_FILE}"
@@ -109,11 +111,10 @@ _register_node() {
 }
 
 # ════════════════════════════════════════════════════════
-# 配置文件生成函数（统一使用带引号 heredoc + printf）
+# 配置文件生成函数
 # ════════════════════════════════════════════════════════
 
-_write_supervisord_conf() {
-    cat > "$1" <<'CONF'
+_write_supervisord_conf()  { cat > "$1" <<'CONF'
 [supervisord]
 nodaemon=true
 user=root
@@ -143,8 +144,7 @@ stderr_logfile_maxbytes=0
 CONF
 }
 
-_write_nginx_main_conf() {
-    cat > "$1" <<'CONF'
+_write_nginx_main_conf() { cat > "$1" <<'CONF'
 user www-data;
 worker_processes auto;
 error_log /var/log/nginx/error.log warn;
@@ -184,8 +184,7 @@ CONF
 }
 
 _write_nginx_wp_conf() {
-    local DEST="$1" WG_IP="$2"
-    # 使用 printf 动态替换 __WG_IP__，避免 heredoc 展开
+    local DEST="$1" WG_IP="$2" WP_PORT="${3:-80}"
     local TEMPLATE
     TEMPLATE=$(cat <<'TEMPLATE'
 map $http_x_forwarded_proto $fastcgi_https {
@@ -194,7 +193,7 @@ map $http_x_forwarded_proto $fastcgi_https {
 }
 
 server {
-    listen __WG_IP__:80 default_server;
+    listen __WG_IP__:__WP_PORT__ default_server;
     root /var/www/html;
     index index.php index.html;
     client_max_body_size 2048M;
@@ -235,26 +234,27 @@ server {
 }
 TEMPLATE
 )
-    printf "%s" "${TEMPLATE//__WG_IP__/${WG_IP:-__WG_IP__}}" > "$DEST"
+    TEMPLATE="${TEMPLATE//__WG_IP__/${WG_IP:-__WG_IP__}}"
+    printf "%s" "${TEMPLATE//__WP_PORT__/${WP_PORT}}" > "$DEST"
 }
 
+# v4.8: entrypoint 不再做任何 sed 替换。
+# 原因：Alpine 容器内 bind-mount 文件执行 sed -i 或 cp 均会因 rename(2) 跨设备失败
+# ("Resource busy" / "File exists") 导致容器无限重启。
+# 解决方案：nginx-wp.conf 在宿主机生成时就写入真实 IP/PORT（主节点），
+# 或在容器启动前由宿主机脚本预替换（工作节点），容器内无需再修改。
 _write_entrypoint_script() {
-    cat > "$1" <<'ENTRYPOINT'
+    local DEST="$1"
+    cat > "$DEST" <<'ENTRYPOINT'
 #!/bin/sh
 set -e
-if [ -n "${WG_IP}" ]; then
-    sed -i "s/__WG_IP__/${WG_IP}/g" /etc/nginx/http.d/default.conf
-    echo "Nginx listen IP set to ${WG_IP}"
-else
-    echo "WARNING: WG_IP not set, using placeholder" >&2
-fi
+echo "Starting supervisord..."
 exec /usr/bin/supervisord -c /etc/supervisord.conf
 ENTRYPOINT
-    chmod +x "$1"
+    chmod +x "$DEST"
 }
 
-_write_php_uploads_ini() {
-    cat > "$1" <<'INI'
+_write_php_uploads_ini() { cat > "$1" <<'INI'
 upload_max_filesize = 2048M
 post_max_size       = 2048M
 memory_limit        = 512M
@@ -264,8 +264,7 @@ max_input_vars      = 10000
 INI
 }
 
-_write_opcache_ini() {
-    cat > "$1" <<'INI'
+_write_opcache_ini() { cat > "$1" <<'INI'
 opcache.enable=1
 opcache.memory_consumption=256
 opcache.interned_strings_buffer=16
@@ -277,68 +276,35 @@ opcache.enable_cli=0
 INI
 }
 
-_write_php_fpm_www_conf() {
-    cat > "$1" <<'CONF'
+_write_php_fpm_www_conf() { cat > "$1" <<'CONF'
 [www]
 user  = www-data
 group = www-data
-
-; 显式绑定回环，防止 fpm 暴露到宿主网络
 listen = 127.0.0.1:9000
-
 listen.owner = www-data
 listen.group = www-data
 listen.mode  = 0660
-
 pm                   = dynamic
 pm.max_children      = 20
 pm.start_servers     = 4
 pm.min_spare_servers = 2
 pm.max_spare_servers = 6
 pm.max_requests      = 500
-
 php_admin_value[error_log]  = /dev/stderr
 php_admin_flag[log_errors]  = on
-
-; 只允许执行 .php 文件
 security.limit_extensions = .php
 CONF
 }
 
-_write_s3_config_php() {
-    cat > "$1" <<'PHP'
-<?php
-define('ILAB_MEDIA_S3_ACCESS_KEY',      getenv('AWS_ACCESS_KEY_ID'));
-define('ILAB_MEDIA_S3_SECRET',          getenv('AWS_SECRET_ACCESS_KEY'));
-define('ILAB_MEDIA_S3_BUCKET',          getenv('S3_BUCKET'));
-define('ILAB_MEDIA_S3_REGION',          getenv('S3_REGION') ?: 'auto');
-define('ILAB_MEDIA_S3_ENDPOINT',        getenv('S3_ENDPOINT') ?: '');
-define('ILAB_MEDIA_S3_USE_PATH_STYLE',  false);
-define('ILAB_MEDIA_S3_CDN_BASE',        getenv('S3_CDN_DOMAIN') ?: '');
-define('ILAB_MEDIA_S3_DELETE_UPLOADS',  false);
-define('ILAB_MEDIA_S3_UPLOAD_IMAGES',   true);
-define('ILAB_MEDIA_S3_UPLOAD_VIDEOS',   true);
-define('ILAB_MEDIA_S3_UPLOAD_AUDIO',    true);
-define('ILAB_MEDIA_S3_UPLOAD_DOCS',     true);
-PHP
-}
 
 _write_wp_config_extra() {
     local DEST="$1" NODE_ROLE="${2:-worker}"
-    local DISALLOW_BLOCK=""
-    [[ "$NODE_ROLE" == "worker" ]] && DISALLOW_BLOCK="define('DISALLOW_FILE_MODS', true);"
-
-    # 使用 printf 注入变量，其余内容用单引号 heredoc 保护
     cat > "$DEST" <<'PHP_HEAD'
 <?php
 define('AUTOMATIC_UPDATER_DISABLED', true);
 define('WP_AUTO_UPDATE_CORE',        false);
-add_filter('auto_update_plugin', '__return_false');
-add_filter('auto_update_theme',  '__return_false');
 PHP_HEAD
-    if [[ -n "$DISALLOW_BLOCK" ]]; then
-        printf "define('DISALLOW_FILE_MODS', true);\n" >> "$DEST"
-    fi
+    [[ "$NODE_ROLE" == "worker" ]] && printf "define('DISALLOW_FILE_MODS', true);\n" >> "$DEST"
     cat >> "$DEST" <<'PHP_BODY'
 
 function _wp_is_trusted_proxy(string $ip): bool {
@@ -383,30 +349,28 @@ if (!defined('WP_REDIS_HOST')) {
 }
 define('WP_MEMORY_LIMIT',     '512M');
 define('WP_MAX_MEMORY_LIMIT', '1024M');
-if (extension_loaded('redis') && php_sapi_name() !== 'cli') {
+
+// v4.6: 加 !headers_sent() 防止 Warning
+if (extension_loaded('redis') && php_sapi_name() !== 'cli' && !headers_sent()) {
     ini_set('session.save_handler', 'redis');
     ini_set('session.save_path',
         'tcp://' . $_redis_host . ':6379?auth=' . urlencode($_redis_pw));
 }
 
-if (file_exists('/etc/wordpress/s3-config.php')) {
-    require_once '/etc/wordpress/s3-config.php';
-}
 PHP_BODY
 }
 
-# ── 主节点 Dockerfile（含 .dockerignore）──
 _write_master_dockerfile() {
     local DIR="$1"
     cat > "$DIR/Dockerfile" <<'DOCKERFILE'
-FROM php:8.3-fpm-alpine
+FROM php:8.4-fpm-alpine
 
 RUN apk add --no-cache \
-        nginx supervisor curl bash less mariadb-client \
+        nginx supervisor curl bash \
         libpng libpng-dev libjpeg-turbo libjpeg-turbo-dev \
         libwebp-dev freetype freetype-dev icu-dev libzip-dev zip unzip \
     && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
-    && docker-php-ext-install -j$(nproc) gd mysqli pdo_mysql zip intl exif opcache bcmath \
+    && docker-php-ext-install -j$(nproc) gd mysqli zip intl exif opcache \
     && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
     && pecl install redis \
     && docker-php-ext-enable redis \
@@ -417,34 +381,37 @@ RUN curl -4 -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/
         -o /usr/local/bin/wp \
     && chmod +x /usr/local/bin/wp
 
-# WordPress 核心
 COPY wp-core/ /var/www/html/
-# 双重保险删除敏感文件（.dockerignore 已阻止拷贝，此处防止遗留）
 RUN rm -f /var/www/html/wp-config.php /var/www/html/wp-config-sample.php
 
 COPY wp-content/themes/   /var/www/html/wp-content/themes/
 COPY wp-content/plugins/  /var/www/html/wp-content/plugins/
 
-COPY conf/nginx.conf      /etc/nginx/nginx.conf
-COPY conf/nginx-wp.conf   /etc/nginx/http.d/default.conf
-COPY conf/php-uploads.ini /usr/local/etc/php/conf.d/uploads.ini
-COPY conf/opcache.ini     /usr/local/etc/php/conf.d/opcache.ini
+COPY conf/nginx.conf       /etc/nginx/nginx.conf
+COPY conf/nginx-wp.conf    /etc/nginx/http.d/default.conf
+COPY conf/php-uploads.ini  /usr/local/etc/php/conf.d/uploads.ini
+COPY conf/opcache.ini      /usr/local/etc/php/conf.d/opcache.ini
 COPY conf/php-fpm-www.conf /usr/local/etc/php-fpm.d/www.conf
 COPY conf/supervisord.conf /etc/supervisord.conf
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 RUN mkdir -p /var/log/nginx /var/log/supervisor /run/nginx \
+             /var/lib/nginx/tmp/client_body \
+             /var/lib/nginx/tmp/fastcgi \
+             /var/lib/nginx/tmp/proxy \
+             /var/lib/nginx/tmp/scgi \
+             /var/lib/nginx/tmp/uwsgi \
              /var/www/html/wp-content/uploads \
              /var/www/html/wp-content/cache /etc/wordpress \
     && chown -R www-data:www-data /var/www/html \
+    && chown -R www-data:www-data /var/lib/nginx \
     && chmod -R 755 /var/www/html
 
 EXPOSE 80
 CMD ["/entrypoint.sh"]
 DOCKERFILE
 
-    # 生成 .dockerignore，彻底阻止敏感文件进入构建上下文
     cat > "$DIR/.dockerignore" <<'IGNORE'
 wp-config.php
 wp-config-sample.php
@@ -460,14 +427,14 @@ IGNORE
 _write_init_dockerfile() {
     local DIR="$1"
     cat > "$DIR/Dockerfile" <<'DOCKERFILE'
-FROM php:8.3-fpm-alpine
+FROM php:8.4-fpm-alpine
 
 RUN apk add --no-cache \
-        nginx supervisor curl bash less mariadb-client \
+        nginx supervisor curl bash \
         libpng libpng-dev libjpeg-turbo libjpeg-turbo-dev \
         libwebp-dev freetype freetype-dev icu-dev libzip-dev zip unzip \
     && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
-    && docker-php-ext-install -j$(nproc) gd mysqli pdo_mysql zip intl exif opcache bcmath \
+    && docker-php-ext-install -j$(nproc) gd mysqli zip intl exif opcache \
     && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
     && pecl install redis \
     && docker-php-ext-enable redis \
@@ -484,19 +451,23 @@ RUN curl -4 -fsSL https://wordpress.org/latest.tar.gz \
     && chmod -R 755 /var/www/html
 
 COPY conf/php-fpm-www.conf /usr/local/etc/php-fpm.d/www.conf
-
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 RUN mkdir -p /var/log/nginx /var/log/supervisor /run/nginx \
-             /var/www/html/wp-content/uploads /etc/wordpress
+             /var/lib/nginx/tmp/client_body \
+             /var/lib/nginx/tmp/fastcgi \
+             /var/lib/nginx/tmp/proxy \
+             /var/lib/nginx/tmp/scgi \
+             /var/lib/nginx/tmp/uwsgi \
+             /var/www/html/wp-content/uploads /etc/wordpress \
+    && chown -R www-data:www-data /var/lib/nginx
 
 EXPOSE 80
 CMD ["/entrypoint.sh"]
 DOCKERFILE
 }
 
-# ── 主节点 compose（修复：不再挂载整个 /var/www/html）──
 _write_init_compose() {
     local DIR="$1"
     cat > "$DIR/docker-compose.yml" <<'YAML'
@@ -510,23 +481,15 @@ services:
     network_mode: host
     environment:
       WG_IP:                  ${WG_IP}
+      WP_PORT:                ${WP_PORT:-80}
       WORDPRESS_DB_HOST:      ${DB_HOST}:3306
       WORDPRESS_DB_NAME:      ${WORDPRESS_DB_NAME}
       WORDPRESS_DB_USER:      ${WORDPRESS_DB_USER}
       WORDPRESS_DB_PASSWORD:  ${WORDPRESS_DB_PASSWORD}
-      AWS_ACCESS_KEY_ID:      ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY:  ${AWS_SECRET_ACCESS_KEY}
-      S3_BUCKET:              ${S3_BUCKET}
-      S3_REGION:              ${S3_REGION}
-      S3_PROVIDER:            ${S3_PROVIDER}
-      S3_ENDPOINT:            ${S3_ENDPOINT}
-      S3_CDN_DOMAIN:          ${S3_CDN_DOMAIN}
       REDIS_HOST:             ${REDIS_HOST}
       REDIS_PW:               ${REDIS_PW}
       WP_SITEURL_FALLBACK:    ${WP_SITEURL_FALLBACK}
-      WORDPRESS_CONFIG_EXTRA: "require_once('/etc/wordpress/wp-config-extra.php');"
     volumes:
-      # 仅挂载上传目录和缓存，核心文件保留在镜像内
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./data/cache:/var/www/html/wp-content/cache
       - ./conf/nginx.conf:/etc/nginx/nginx.conf:ro
@@ -535,12 +498,12 @@ services:
       - ./conf/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
       - ./conf/php-fpm-www.conf:/usr/local/etc/php-fpm.d/www.conf:ro
       - ./conf/supervisord.conf:/etc/supervisord.conf:ro
-      - ./conf/s3-config.php:/etc/wordpress/s3-config.php:ro
       - ./conf/wp-config-extra.php:/etc/wordpress/wp-config-extra.php:ro
       - ./logs:/var/log/nginx
 YAML
 }
 
+# v4.7: 补充 data/cache 挂载，与主节点 compose 对齐
 _write_worker_compose() {
     local DIR="$1"
     cat > "$DIR/docker-compose.yml" <<'YAML'
@@ -551,32 +514,26 @@ services:
     network_mode: host
     environment:
       WG_IP:                  ${WG_IP}
+      WP_PORT:                ${WP_PORT:-80}
       WORDPRESS_DB_HOST:      ${DB_HOST}:3306
       WORDPRESS_DB_NAME:      ${WORDPRESS_DB_NAME}
       WORDPRESS_DB_USER:      ${WORDPRESS_DB_USER}
       WORDPRESS_DB_PASSWORD:  ${WORDPRESS_DB_PASSWORD}
-      AWS_ACCESS_KEY_ID:      ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY:  ${AWS_SECRET_ACCESS_KEY}
-      S3_BUCKET:              ${S3_BUCKET}
-      S3_REGION:              ${S3_REGION}
-      S3_PROVIDER:            ${S3_PROVIDER}
-      S3_ENDPOINT:            ${S3_ENDPOINT}
-      S3_CDN_DOMAIN:          ${S3_CDN_DOMAIN}
       REDIS_HOST:             ${REDIS_HOST}
       REDIS_PW:               ${REDIS_PW}
       WP_SITEURL_FALLBACK:    ${WP_SITEURL_FALLBACK}
-      WORDPRESS_CONFIG_EXTRA: "require_once('/etc/wordpress/wp-config-extra.php');"
     volumes:
       - ./data/uploads:/var/www/html/wp-content/uploads
+      - ./data/cache:/var/www/html/wp-content/cache
+      - ./conf/nginx-wp.conf:/etc/nginx/http.d/default.conf:ro
       - ./conf/wp-config.php:/var/www/html/wp-config.php:ro
-      - ./conf/s3-config.php:/etc/wordpress/s3-config.php:ro
       - ./conf/wp-config-extra.php:/etc/wordpress/wp-config-extra.php:ro
       - ./logs:/var/log/nginx
 YAML
 }
 
 # ════════════════════════════════════════════════════════
-# 缓存刷新（保持原样，已较完善）
+# 缓存刷新
 # ════════════════════════════════════════════════════════
 _flush_all_caches() {
     local DIR="$1"
@@ -597,9 +554,11 @@ _flush_all_caches() {
     NGINX_CACHE_DIR=$(dc "$DIR" exec -T wordpress \
         sh -c 'grep -r fastcgi_cache_path /etc/nginx/ 2>/dev/null \
                | grep -oP "(?<=fastcgi_cache_path )[^ ]+" | head -1' 2>/dev/null || true)
-    if [[ -n "$NGINX_CACHE_DIR" ]]; then
+    if [[ -n "$NGINX_CACHE_DIR" && "$NGINX_CACHE_DIR" =~ ^/[a-zA-Z0-9/_-]+$ ]]; then
         dc "$DIR" exec -T wordpress sh -c "rm -rf ${NGINX_CACHE_DIR}/* 2>/dev/null || true" \
         && info "  Nginx fastcgi_cache 已清理" || warn "  Nginx cache 清理失败"
+    elif [[ -n "$NGINX_CACHE_DIR" ]]; then
+        warn "  NGINX_CACHE_DIR 路径格式异常，已跳过清理: ${NGINX_CACHE_DIR}"
     fi
 
     local CF_TOKEN CF_ZONE_ID
@@ -620,6 +579,9 @@ _flush_all_caches() {
     log "缓存刷新完成"
 }
 
+# ════════════════════════════════════════════════════════
+# _setup_plugins
+# ════════════════════════════════════════════════════════
 _setup_plugins() {
     local DIR="$1"
     local IS_AUTO_INSTALL="${2:-false}"
@@ -628,7 +590,8 @@ _setup_plugins() {
 
     info "等待 WordPress 容器就绪..."
     local RETRIES=30
-    while ! dc "$DIR" exec -T wordpress wp --allow-root cli version &>/dev/null; do
+    local -a WP=(dc "$DIR" exec -T wordpress wp --allow-root)
+    while ! "${WP[@]}" cli version &>/dev/null; do
         sleep 3
         RETRIES=$((RETRIES - 1))
         [[ $RETRIES -le 0 ]] && { warn "容器未就绪，中止插件配置。"; return 1; }
@@ -642,24 +605,19 @@ _setup_plugins() {
         DB_PW=$(env_get "$DIR/.env" "WORDPRESS_DB_PASSWORD")
         DB_HOST=$(env_get "$DIR/.env" "DB_HOST")
 
-        dc "$DIR" exec -T wordpress wp --allow-root config create \
+        "${WP[@]}" config create \
             --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PW" \
-            --dbhost="$DB_HOST" --dbcharset=utf8mb4 \
-            --extra-php <<'PHP' || { warn "wp-config.php 创建失败，请检查数据库连接。"; return 1; }
-define('WP_MEMORY_LIMIT', '512M');
-define('WP_MAX_MEMORY_LIMIT', '1024M');
-PHP
+            --dbhost="$DB_HOST" --dbcharset=utf8mb4 --skip-check \
+            || { warn "wp-config.php 创建失败，请检查数据库连接。"; return 1; }
         dc "$DIR" exec -T wordpress sh -c \
-            "echo \"require_once('/etc/wordpress/wp-config-extra.php');\" >> /var/www/html/wp-config.php" || true
+            "sed -i \"/require_once.*wp-settings/i require_once('\/etc\/wordpress\/wp-config-extra.php');\" /var/www/html/wp-config.php" || true
         log "wp-config.php 已自动生成。"
     fi
 
-    local WP="dc $DIR exec -T wordpress wp --allow-root"
-
     if [[ "$IS_AUTO_INSTALL" == "true" ]]; then
-        if ! $WP core is-installed &>/dev/null; then
+        if ! "${WP[@]}" core is-installed &>/dev/null; then
             info "安装 WordPress 核心..."
-            $WP core install \
+            "${WP[@]}" core install \
                 --url="$URL" --title="$TITLE" \
                 --admin_user="$ADMIN" --admin_password="$PASS" \
                 --admin_email="$EMAIL" --locale="$LOCALE" --skip-email \
@@ -670,11 +628,11 @@ PHP
 
             if [[ "$LOCALE" != "en_US" && -n "$LOCALE" ]]; then
                 info "安装语言包: ${LOCALE}..."
-                $WP language core install "$LOCALE" 2>/dev/null || true
-                $WP option update WPLANG "$LOCALE" || true
+                "${WP[@]}" language core install "$LOCALE" 2>/dev/null || true
+                "${WP[@]}" option update WPLANG "$LOCALE" || true
                 local ADMIN_ID
-                ADMIN_ID=$($WP user get "$ADMIN" --field=ID 2>/dev/null || echo "1")
-                $WP user meta update "$ADMIN_ID" locale "$LOCALE" 2>/dev/null || true
+                ADMIN_ID=$("${WP[@]}" user get "$ADMIN" --field=ID 2>/dev/null || echo "1")
+                "${WP[@]}" user meta update "$ADMIN_ID" locale "$LOCALE" 2>/dev/null || true
                 log "界面语言已设为 ${LOCALE}"
             fi
         else
@@ -685,22 +643,11 @@ PHP
     info "修复文件权限..."
     dc "$DIR" exec -T wordpress chown -R www-data:www-data /var/www/html/wp-content || true
 
-    info "配置 Media Cloud 插件..."
-    if $WP plugin is-installed amazon-s3-and-cloudfront &>/dev/null; then
-        $WP plugin deactivate amazon-s3-and-cloudfront 2>/dev/null || true
-        $WP plugin delete amazon-s3-and-cloudfront 2>/dev/null || true
-    fi
-    if $WP plugin is-installed ilab-media-tools &>/dev/null; then
-        $WP plugin activate ilab-media-tools || warn "Media Cloud 激活失败"
-    else
-        $WP plugin install ilab-media-tools --activate || warn "Media Cloud 安装失败"
-    fi
-
     info "配置 Redis 插件..."
-    if $WP plugin is-installed redis-cache &>/dev/null; then
-        $WP plugin activate redis-cache || warn "Redis 插件激活失败"
+    if "${WP[@]}" plugin is-installed redis-cache &>/dev/null; then
+        "${WP[@]}" plugin activate redis-cache || warn "Redis 插件激活失败"
     else
-        $WP plugin install redis-cache --activate || warn "Redis 插件安装失败"
+        "${WP[@]}" plugin install redis-cache --activate || warn "Redis 插件安装失败"
     fi
 
     info "探测 Redis 连通性..."
@@ -708,44 +655,56 @@ PHP
     REDIS_HOST_VAL=$(env_get "$DIR/.env" "REDIS_HOST")
     local PROBE="\$c=@fsockopen('${REDIS_HOST_VAL}',6379,\$e,\$s,5);if(\$c){fclose(\$c);exit(0);}exit(1);"
     if dc "$DIR" exec -T wordpress php -r "$PROBE" 2>/dev/null; then
-        $WP redis enable && log "Redis 对象缓存已启用！" || warn "redis enable 失败"
+        "${WP[@]}" redis enable && log "Redis 对象缓存已启用！" || warn "redis enable 失败"
     else
         warn "无法连接 Redis (${REDIS_HOST_VAL}:6379)，跳过启用"
     fi
 }
 
 # ════════════════════════════════════════════════════════
-# 仓库部署（增加端口检测）
+# 仓库部署
 # ════════════════════════════════════════════════════════
 cmd_registry() {
     header "部署私有镜像仓库"
     local WG_IP
     WG_IP=$(get_wg_ip)
 
-    read -rp "仓库监听端口 [默认: 5000]: " REG_PORT
+    read -rp "仓库监听端口 [默认: 5000]: " REG_PORT || true
     REG_PORT="${REG_PORT:-5000}"
     [[ "$REG_PORT" =~ ^[0-9]+$ ]] || error "无效端口"
+    (( REG_PORT >= 1 && REG_PORT <= 65535 )) || error "端口范围必须在 1-65535 之间"
     check_port "$WG_IP" "$REG_PORT"
 
-    read -rp "仓库认证用户名 [默认: wpregistry]: " REG_USER
+    read -rp "仓库认证用户名 [默认: wpregistry]: " REG_USER || true
     REG_USER="${REG_USER:-wpregistry}"
     local REG_PASS=""
     read_secret "仓库认证密码 [留空随机生成]: " REG_PASS
     if [[ -z "$REG_PASS" ]]; then
-        REG_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)
+        REG_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 20; true)
         info "已生成随机密码: ${REG_PASS}"
     fi
 
     mkdir -p "$REGISTRY_DIR"/{data,auth,certs}
+
+    local HTPASSWD_TMP; HTPASSWD_TMP=$(mktemp)
+    trap 'rm -f "$HTPASSWD_TMP"' RETURN ERR
+    local HTPASSWD_OK=false
     if command -v htpasswd &>/dev/null; then
-        htpasswd -Bbn "$REG_USER" "$REG_PASS" > "$REGISTRY_DIR/auth/htpasswd"
-    elif docker run --rm --entrypoint htpasswd \
-            httpd:alpine -Bbn "$REG_USER" "$REG_PASS" \
-            > "$REGISTRY_DIR/auth/htpasswd" 2>/dev/null; then
-        true
-    else
-        error "无法生成 htpasswd，请安装 apache2-utils"
+        htpasswd -Bbn "$REG_USER" "$REG_PASS" > "$HTPASSWD_TMP" && HTPASSWD_OK=true
     fi
+    if [[ "$HTPASSWD_OK" != "true" ]]; then
+        if docker run --rm --entrypoint htpasswd \
+                httpd:alpine -Bbn "$REG_USER" "$REG_PASS" \
+                > "$HTPASSWD_TMP" 2>/dev/null; then
+            HTPASSWD_OK=true
+        fi
+    fi
+    if [[ "$HTPASSWD_OK" != "true" ]] || [[ ! -s "$HTPASSWD_TMP" ]]; then
+        rm -f "$HTPASSWD_TMP"
+        error "无法生成 htpasswd，请安装 apache2-utils 或确保 Docker 可用"
+    fi
+    mv "$HTPASSWD_TMP" "$REGISTRY_DIR/auth/htpasswd"
+    chmod 600 "$REGISTRY_DIR/auth/htpasswd"
 
     cat > "$REGISTRY_DIR/docker-compose.yml" <<YAML
 services:
@@ -754,7 +713,7 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      REGISTRY_HTTP_ADDR:               0.0.0.0:${REG_PORT}
+      REGISTRY_HTTP_ADDR:               ${WG_IP}:${REG_PORT}
       REGISTRY_AUTH:                    htpasswd
       REGISTRY_AUTH_HTPASSWD_REALM:     "WP Registry"
       REGISTRY_AUTH_HTPASSWD_PATH:      /auth/htpasswd
@@ -764,6 +723,7 @@ services:
       - ./data:/data
       - ./auth:/auth
 YAML
+
     cat > "$REGISTRY_DIR/.env" <<EOF
 REGISTRY_HOST=${WG_IP}:${REG_PORT}
 REGISTRY_USER=${REG_USER}
@@ -772,20 +732,33 @@ EOF
     chmod 600 "$REGISTRY_DIR/.env"
     docker compose -f "$REGISTRY_DIR/docker-compose.yml" up -d || error "仓库启动失败"
 
+    info "等待仓库服务就绪..."
+    local _RETRIES=20
+    until curl -sf -u "${REG_USER}:${REG_PASS}" \
+            "http://${WG_IP}:${REG_PORT}/v2/" &>/dev/null; do
+        sleep 2; _RETRIES=$(( _RETRIES - 1 ))
+        [[ $_RETRIES -le 0 ]] && error "仓库服务未能在预期时间内就绪，请检查容器日志"
+    done
+
     local DAEMON_JSON="/etc/docker/daemon.json"
     local REGISTRY_ADDR="${WG_IP}:${REG_PORT}"
     if [[ -f "$DAEMON_JSON" ]]; then
-        if ! jq -e --arg addr "$REGISTRY_ADDR" '.["insecure-registries"]? | index($addr)' "$DAEMON_JSON" &>/dev/null; then
+        local _JQ_RC=0
+        local _JQ_OUT
+        _JQ_OUT=$(jq -e --arg addr "$REGISTRY_ADDR" \
+            '.["insecure-registries"]? | index($addr)' "$DAEMON_JSON" 2>&1) || _JQ_RC=$?
+        if [[ $_JQ_RC -eq 0 ]]; then
+            :
+        elif echo "$_JQ_OUT" | grep -qE "^null$|^false$"; then
             warn "请手动在 ${DAEMON_JSON} 中添加："
             warn "  \"insecure-registries\": [\"${REGISTRY_ADDR}\"]"
             warn "然后执行: systemctl restart docker"
+        else
+            warn "daemon.json 解析失败，请手动确认后添加 insecure-registries: ${REGISTRY_ADDR}"
+            warn "解析错误: ${_JQ_OUT}"
         fi
     else
-        cat > "$DAEMON_JSON" <<JSON
-{
-  "insecure-registries": ["${REGISTRY_ADDR}"]
-}
-JSON
+        printf '{\n  "insecure-registries": ["%s"]\n}\n' "${REGISTRY_ADDR}" > "$DAEMON_JSON"
         systemctl restart docker && log "Docker daemon 已更新并重启"
     fi
 
@@ -797,122 +770,95 @@ JSON
 }
 
 # ════════════════════════════════════════════════════════
-# 主节点初始化（增加端口检测、网络探测）
+# 主节点初始化
 # ════════════════════════════════════════════════════════
 cmd_master_init() {
     header "主节点初始化（全自动建站）"
-    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR
+    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR || true
     DIR="${DIR:-$DEFAULT_DIR}"
 
     info "--- 站点配置 ---"
-    read -rp "站点 URL（如 https://example.com）: " WP_URL
-    [[ -z "$WP_URL" ]] && error "URL 不能为空"
-    read -rp "站点名称 [默认: My WordPress]: " WP_TITLE
+    read -rp "站点 URL（如 https://example.com）: " WP_URL || true
+    [[ -n "$WP_URL" ]] || error "URL 不能为空"
+    read -rp "站点名称 [默认: My WordPress]: " WP_TITLE || true
     WP_TITLE="${WP_TITLE:-My WordPress}"
-    read -rp "安装语言 [默认: zh_CN]: " WP_LOCALE
+    read -rp "安装语言 [默认: zh_CN]: " WP_LOCALE || true
     WP_LOCALE="${WP_LOCALE:-zh_CN}"
-    read -rp "管理员用户名 [默认: wpadmin]: " WP_ADMIN
+    read -rp "管理员用户名 [默认: wpadmin]: " WP_ADMIN || true
     WP_ADMIN="${WP_ADMIN:-wpadmin}"
     local WP_PASS=""
     read_secret "管理员密码 [留空随机生成]: " WP_PASS
     if [[ -z "$WP_PASS" ]]; then
-        WP_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()' < /dev/urandom | head -c 16)
+        WP_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()' < /dev/urandom 2>/dev/null | head -c 16; true)
         info "已生成随机密码: ${WP_PASS}"
     fi
-    read -rp "管理员邮箱 [默认: admin@example.com]: " WP_EMAIL
+    read -rp "管理员邮箱 [默认: admin@example.com]: " WP_EMAIL || true
     WP_EMAIL="${WP_EMAIL:-admin@example.com}"
 
     info "--- 数据库 ---"
-    read -rp "MariaDB WireGuard IP: " DB_HOST
-    [[ -z "$DB_HOST" ]] && error "数据库 IP 不能为空"
+    read -rp "MariaDB WireGuard IP: " DB_HOST || true
+    [[ -n "$DB_HOST" ]] || error "数据库 IP 不能为空"
     DB_HOST="${DB_HOST%%:*}"
-    read -rp "数据库名 [默认: wordpress]: " DB_NAME
-    DB_NAME="${DB_NAME:-wordpress}"
-    read -rp "数据库用户名 [默认: wpuser]: " DB_USER
-    DB_USER="${DB_USER:-wpuser}"
+    read -rp "数据库名 [默认: wordpress]: " DB_NAME || true; DB_NAME="${DB_NAME:-wordpress}"
+    read -rp "数据库用户名 [默认: wpuser]: " DB_USER || true; DB_USER="${DB_USER:-wpuser}"
     local DB_PW=""
     read_secret "数据库密码: " DB_PW
-    [[ -z "$DB_PW" ]] && error "数据库密码不能为空"
+    [[ -n "$DB_PW" ]] || error "数据库密码不能为空"
 
     info "--- Redis ---"
-    read -rp "Redis WireGuard IP [默认同数据库 ${DB_HOST}]: " REDIS_HOST
-    REDIS_HOST="${REDIS_HOST:-$DB_HOST}"
-    REDIS_HOST="${REDIS_HOST%%:*}"
+    read -rp "Redis WireGuard IP [默认同数据库 ${DB_HOST}]: " REDIS_HOST || true
+    REDIS_HOST="${REDIS_HOST:-$DB_HOST}"; REDIS_HOST="${REDIS_HOST%%:*}"
     local REDIS_PW=""
     read_secret "Redis 密码: " REDIS_PW
-    [[ -z "$REDIS_PW" ]] && error "Redis 密码不能为空"
-
-    info "--- 对象存储 ---"
-    echo "  1. AWS S3  2. Cloudflare R2  3. 其他 S3 兼容"
-    read -rp "选择 [默认: 1]: " S3_CHOICE
-    local S3_PROVIDER="aws" S3_ENDPOINT="" S3_REGION=""
-    case "${S3_CHOICE:-1}" in
-        2) S3_PROVIDER="cloudflare"
-           read -rp "R2 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint"
-           read -rp "区域 [默认: auto]: " S3_REGION; S3_REGION="${S3_REGION:-auto}" ;;
-        3) S3_PROVIDER="other"
-           read -rp "自定义 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint"
-           read -rp "区域 [默认: us-east-1]: " S3_REGION; S3_REGION="${S3_REGION:-us-east-1}" ;;
-        *) read -rp "区域 [默认: us-east-1]: " S3_REGION; S3_REGION="${S3_REGION:-us-east-1}" ;;
-    esac
-    read -rp "存储桶名称: " S3_BUCKET; [[ -z "$S3_BUCKET" ]] && error "桶名不能为空"
-    local S3_KEY="" S3_SECRET=""
-    read_secret "S3 Access Key ID: " S3_KEY; [[ -z "$S3_KEY" ]] && error "S3 Key 不能为空"
-    read_secret "S3 Secret Access Key: " S3_SECRET; [[ -z "$S3_SECRET" ]] && error "S3 Secret 不能为空"
-    read -rp "CDN 域名（留空跳过）: " S3_CDN_DOMAIN; S3_CDN_DOMAIN="${S3_CDN_DOMAIN:-}"
+    [[ -n "$REDIS_PW" ]] || error "Redis 密码不能为空"
 
     info "--- 私有镜像仓库 ---"
-    read -rp "Registry 地址（如 10.10.0.1:5000）: " REGISTRY_HOST
-    [[ -z "$REGISTRY_HOST" ]] && error "Registry 地址不能为空"
+    read -rp "Registry 地址（如 10.10.0.1:5000）: " REGISTRY_HOST || true
+    [[ -n "$REGISTRY_HOST" ]] || error "Registry 地址不能为空"
 
     info "--- Cloudflare（可选）---"
-    read -rp "CF Zone ID（留空跳过）: " CF_ZONE_ID; CF_ZONE_ID="${CF_ZONE_ID:-}"
+    read -rp "CF Zone ID（留空跳过）: " CF_ZONE_ID || true; CF_ZONE_ID="${CF_ZONE_ID:-}"
     local CF_TOKEN=""
     [[ -n "$CF_ZONE_ID" ]] && read_secret "CF API Token: " CF_TOKEN
+
+    read -rp "WordPress 监听端口 [默认: 80]: " WP_PORT || true
+    WP_PORT="${WP_PORT:-80}"
+    [[ "$WP_PORT" =~ ^[0-9]+$ ]] && (( WP_PORT >= 1 && WP_PORT <= 65535 )) || { WP_PORT=80; warn "无效端口，使用默认 80"; }
 
     local WG_IP
     WG_IP=$(get_wg_ip)
     log "WireGuard IP: ${WG_IP}"
 
-    # 网络探测
     info "检查关键服务连通性..."
     check_network "${DB_HOST}:3306" "${REDIS_HOST}:6379" || true
-    # 检查 80 端口占用
-    check_port "$WG_IP" "80"
+    check_port "$WG_IP" "$WP_PORT"
 
     mkdir -p "$DIR"/{data/uploads,data/cache,conf,logs}
 
-    cat > "$DIR/.env" <<EOF
-WORDPRESS_DB_PASSWORD=${DB_PW}
-WORDPRESS_DB_NAME=${DB_NAME}
-WORDPRESS_DB_USER=${DB_USER}
-DB_HOST=${DB_HOST}
-REDIS_HOST=${REDIS_HOST}
-REDIS_PW=${REDIS_PW}
-AWS_ACCESS_KEY_ID=${S3_KEY}
-AWS_SECRET_ACCESS_KEY=${S3_SECRET}
-S3_BUCKET=${S3_BUCKET}
-S3_REGION=${S3_REGION}
-S3_PROVIDER=${S3_PROVIDER}
-S3_ENDPOINT=${S3_ENDPOINT}
-S3_CDN_DOMAIN=${S3_CDN_DOMAIN}
-WG_IP=${WG_IP}
-WP_SITEURL_FALLBACK=${WP_URL}
-REGISTRY_HOST=${REGISTRY_HOST}
-IMAGE_TAG=latest
-NODE_ROLE=master
-CF_ZONE_ID=${CF_ZONE_ID}
-CF_TOKEN=${CF_TOKEN}
-EOF
+    {
+        printf 'WORDPRESS_DB_PASSWORD=%s\n' "${DB_PW}"
+        printf 'WORDPRESS_DB_NAME=%s\n'     "${DB_NAME}"
+        printf 'WORDPRESS_DB_USER=%s\n'     "${DB_USER}"
+        printf 'DB_HOST=%s\n'               "${DB_HOST}"
+        printf 'REDIS_HOST=%s\n'            "${REDIS_HOST}"
+        printf 'REDIS_PW=%s\n'              "${REDIS_PW}"
+        printf 'WG_IP=%s\n'                 "${WG_IP}"
+        printf 'WP_PORT=%s\n'               "${WP_PORT}"
+        printf 'WP_SITEURL_FALLBACK=%s\n'   "${WP_URL}"
+        printf 'REGISTRY_HOST=%s\n'         "${REGISTRY_HOST}"
+        printf 'IMAGE_TAG=latest\n'
+        printf 'NODE_ROLE=master\n'
+        printf 'CF_ZONE_ID=%s\n'            "${CF_ZONE_ID}"
+        printf 'CF_TOKEN=%s\n'              "${CF_TOKEN}"
+    } > "$DIR/.env"
     chmod 600 "$DIR/.env"
 
     _write_nginx_main_conf    "$DIR/conf/nginx.conf"
-    _write_nginx_wp_conf      "$DIR/conf/nginx-wp.conf" "$WG_IP"
+    _write_nginx_wp_conf      "$DIR/conf/nginx-wp.conf" "$WG_IP" "$WP_PORT"
     _write_php_uploads_ini    "$DIR/conf/php-uploads.ini"
     _write_opcache_ini        "$DIR/conf/opcache.ini"
     _write_php_fpm_www_conf   "$DIR/conf/php-fpm-www.conf"
     _write_supervisord_conf   "$DIR/conf/supervisord.conf"
-    _write_s3_config_php      "$DIR/conf/s3-config.php"
     _write_wp_config_extra    "$DIR/conf/wp-config-extra.php" "master"
     _write_init_dockerfile    "$DIR"
     _write_entrypoint_script  "$DIR/entrypoint.sh"
@@ -935,29 +881,39 @@ EOF
 }
 
 # ════════════════════════════════════════════════════════
-# 主节点打包推送（修复临时目录清理，使用 EXIT trap）
+# 主节点打包推送
 # ════════════════════════════════════════════════════════
 cmd_push() {
     header "打包推送镜像到私有仓库"
-    read -rp "主节点目录 [默认: ${DEFAULT_DIR}]: " DIR
+    read -rp "主节点目录 [默认: ${DEFAULT_DIR}]: " DIR || true
     DIR="${DIR:-$DEFAULT_DIR}"
     [[ -f "$DIR/.env" ]] || error "未找到 .env：${DIR}"
 
     local REGISTRY_HOST WG_IP
     REGISTRY_HOST=$(env_get "$DIR/.env" "REGISTRY_HOST")
     WG_IP=$(env_get "$DIR/.env" "WG_IP")
-    [[ -z "$REGISTRY_HOST" ]] && error ".env 中缺少 REGISTRY_HOST"
-    [[ -z "$WG_IP" ]]         && WG_IP=$(get_wg_ip)
+    [[ -n "$REGISTRY_HOST" ]] || error ".env 中缺少 REGISTRY_HOST"
+    [[ -n "$WG_IP" ]]         || WG_IP=$(get_wg_ip)
 
     local IMAGE_TAG="v$(date +%Y%m%d%H%M)"
     local IMAGE_BASE="${REGISTRY_HOST}/wordpress-site"
 
-    local THEMES_COUNT PLUGINS_COUNT
-    THEMES_COUNT=$(find "$DIR/data/wp-content/themes"  -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
-    PLUGINS_COUNT=$(find "$DIR/data/wp-content/plugins" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)
+    # v4.7: 版本信息从运行容器读取，容器是事实来源
+    local CID
+    CID=$(docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" ps -q wordpress 2>/dev/null || true)
+    [[ -n "$CID" ]] || error "wordpress 容器未运行，请先启动主节点（菜单 8）再推送"
+
     local WP_VER
-    WP_VER=$(grep -oP "(?<=wp_version = ')[^']+" \
-        "$DIR/data/wp-includes/version.php" 2>/dev/null) || WP_VER="未知"
+    WP_VER=$(docker exec "$CID" \
+        grep -oP "(?<=wp_version = ')[^']+" /var/www/html/wp-includes/version.php 2>/dev/null) \
+        || WP_VER="未知"
+    local THEMES_COUNT PLUGINS_COUNT
+    THEMES_COUNT=$(docker exec "$CID" \
+        sh -c 'find /var/www/html/wp-content/themes -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l' \
+        2>/dev/null || echo "?")
+    PLUGINS_COUNT=$(docker exec "$CID" \
+        sh -c 'find /var/www/html/wp-content/plugins -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l' \
+        2>/dev/null || echo "?")
 
     echo ""
     echo "  WordPress 版本: ${WP_VER}"
@@ -965,44 +921,50 @@ cmd_push() {
     echo "  插件数量:       ${PLUGINS_COUNT} 个"
     echo "  镜像 tag:       ${IMAGE_TAG}"
     echo ""
-    read -rp "确认打包推送？[y/N]: " CONFIRM
+    read -rp "确认打包推送？[y/N]: " CONFIRM || true
     [[ "${CONFIRM,,}" == "y" ]] || { info "已取消"; return; }
 
     local BUILD_DIR
     BUILD_DIR=$(mktemp -d /tmp/wp-build-XXXXXX)
-    # 使用 EXIT trap 确保异常退出也清理
-    trap 'rm -rf "$BUILD_DIR"' EXIT
 
-    info "同步 WordPress 核心..."
-    mkdir -p "$BUILD_DIR/wp-core"
-    rsync -a --delete \
-        --exclude='wp-content/' \
-        --exclude='wp-config.php' \
-        --exclude='wp-config-sample.php' \
-        "$DIR/data/" "$BUILD_DIR/wp-core/"
-    rm -f "$BUILD_DIR/wp-core/wp-config.php" \
-          "$BUILD_DIR/wp-core/wp-config-sample.php"
+    local _PUSH_CLEANUP_DONE=false
+    _push_cleanup() {
+        [[ "$_PUSH_CLEANUP_DONE" == "true" ]] && return
+        _PUSH_CLEANUP_DONE=true
+        rm -rf "$BUILD_DIR"
+    }
+    trap '_push_cleanup' RETURN ERR
 
-    info "同步主题和插件..."
-    mkdir -p "$BUILD_DIR/wp-content/themes" "$BUILD_DIR/wp-content/plugins"
-    rsync -a --delete --exclude='uploads/' --exclude='cache/' \
-        "$DIR/data/wp-content/themes/"  "$BUILD_DIR/wp-content/themes/"
-    rsync -a --delete --exclude='uploads/' --exclude='cache/' \
-        "$DIR/data/wp-content/plugins/" "$BUILD_DIR/wp-content/plugins/"
+    # v4.7: 从运行容器 docker cp 导出，不依赖宿主机目录结构
+    info "从容器导出 WordPress 核心文件..."
+    mkdir -p "$BUILD_DIR/wp-core" "$BUILD_DIR/wp-content/themes" "$BUILD_DIR/wp-content/plugins"
 
-    info "生成配置文件到独立 build context..."
+    docker cp "${CID}:/var/www/html/." "$BUILD_DIR/wp-core/"
+    # 剥离 wp-content（单独处理）、wp-config.php（不能进镜像）
+    rm -rf "$BUILD_DIR/wp-core/wp-content" \
+           "$BUILD_DIR/wp-core/wp-config.php" \
+           "$BUILD_DIR/wp-core/wp-config-sample.php"
+
+    info "导出主题和插件..."
+    docker cp "${CID}:/var/www/html/wp-content/themes/."  "$BUILD_DIR/wp-content/themes/"
+    docker cp "${CID}:/var/www/html/wp-content/plugins/." "$BUILD_DIR/wp-content/plugins/"
+    # docker cp 不支持 --exclude，手动清理运行时目录
+    rm -rf "$BUILD_DIR/wp-content/uploads" \
+           "$BUILD_DIR/wp-content/cache"
+
+    info "生成配置文件..."
     mkdir -p "$BUILD_DIR/conf"
-    _write_nginx_main_conf  "$BUILD_DIR/conf/nginx.conf"
-    _write_nginx_wp_conf    "$BUILD_DIR/conf/nginx-wp.conf" ""   # 保留 __WG_IP__ 占位符
-    _write_php_uploads_ini  "$BUILD_DIR/conf/php-uploads.ini"
-    _write_opcache_ini      "$BUILD_DIR/conf/opcache.ini"
-    _write_php_fpm_www_conf "$BUILD_DIR/conf/php-fpm-www.conf"
-    _write_supervisord_conf "$BUILD_DIR/conf/supervisord.conf"
+    _write_nginx_main_conf   "$BUILD_DIR/conf/nginx.conf"
+    _write_nginx_wp_conf     "$BUILD_DIR/conf/nginx-wp.conf" "" ""
+    _write_php_uploads_ini   "$BUILD_DIR/conf/php-uploads.ini"
+    _write_opcache_ini       "$BUILD_DIR/conf/opcache.ini"
+    _write_php_fpm_www_conf  "$BUILD_DIR/conf/php-fpm-www.conf"
+    _write_supervisord_conf  "$BUILD_DIR/conf/supervisord.conf"
     _write_entrypoint_script "$BUILD_DIR/entrypoint.sh"
-    _write_master_dockerfile "$BUILD_DIR"   # 内部会生成 .dockerignore
+    _write_master_dockerfile "$BUILD_DIR"
 
     info "构建镜像: ${IMAGE_BASE}:${IMAGE_TAG} ..."
-    docker build --no-cache \
+    docker build --pull --no-cache \
         -t "${IMAGE_BASE}:${IMAGE_TAG}" \
         -t "${IMAGE_BASE}:latest" \
         "$BUILD_DIR" \
@@ -1013,10 +975,9 @@ cmd_push() {
         REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
         REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
     else
-        read -rp "仓库用户名: " REG_USER
+        read -rp "仓库用户名: " REG_USER || true
         read_secret "仓库密码: " REG_PASS
     fi
-    # 使用 here-string 避免密码在 ps 中暴露
     docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" \
     || error "仓库登录失败"
 
@@ -1035,7 +996,6 @@ cmd_push() {
         | grep -v 'latest' | sort -r | tail -n +6 \
         | awk '{print $2}' | xargs -r docker rmi 2>/dev/null || true
 
-    # 清理 EXIT trap 由函数返回时自动触发
     log "推送完成！"
     echo -e "  镜像: \e[32m${IMAGE_BASE}:${IMAGE_TAG}\e[0m"
     echo -e "  WP 版本: \e[36m${WP_VER}\e[0m"
@@ -1043,112 +1003,94 @@ cmd_push() {
 }
 
 # ════════════════════════════════════════════════════════
-# 工作节点拉取部署 / 更新（增加 wp-config 生成）
+# 工作节点拉取部署 / 更新
 # ════════════════════════════════════════════════════════
 cmd_pull_deploy() {
     header "工作节点拉取部署 / 更新"
-    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR
+    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR || true
     DIR="${DIR:-$DEFAULT_DIR}"
 
     local IS_FIRST=false
+    local DB_HOST="" DB_NAME="" DB_USER="" DB_PW="" REDIS_HOST="" REDIS_PW=""
+    local WP_URL="" WP_PORT="80"
+    local REGISTRY_HOST="" CF_ZONE_ID="" CF_TOKEN="" WG_IP=""
+
     if [[ ! -f "$DIR/.env" ]]; then
         IS_FIRST=true
         info "未检测到 .env，进入首次部署配置..."
 
         info "--- 数据库 ---"
-        read -rp "MariaDB WireGuard IP: " DB_HOST
-        [[ -z "$DB_HOST" ]] && error "数据库 IP 不能为空"
+        read -rp "MariaDB WireGuard IP: " DB_HOST || true
+        [[ -n "$DB_HOST" ]] || error "数据库 IP 不能为空"
         DB_HOST="${DB_HOST%%:*}"
-        read -rp "数据库名 [默认: wordpress]: " DB_NAME; DB_NAME="${DB_NAME:-wordpress}"
-        read -rp "数据库用户名 [默认: wpuser]: " DB_USER; DB_USER="${DB_USER:-wpuser}"
-        local DB_PW=""
-        read_secret "数据库密码: " DB_PW; [[ -z "$DB_PW" ]] && error "数据库密码不能为空"
+        read -rp "数据库名 [默认: wordpress]: " DB_NAME || true; DB_NAME="${DB_NAME:-wordpress}"
+        read -rp "数据库用户名 [默认: wpuser]: " DB_USER || true; DB_USER="${DB_USER:-wpuser}"
+        read_secret "数据库密码: " DB_PW; [[ -n "$DB_PW" ]] || error "数据库密码不能为空"
 
         info "--- Redis ---"
-        read -rp "Redis WireGuard IP [默认: ${DB_HOST}]: " REDIS_HOST
+        read -rp "Redis WireGuard IP [默认: ${DB_HOST}]: " REDIS_HOST || true
         REDIS_HOST="${REDIS_HOST:-$DB_HOST}"; REDIS_HOST="${REDIS_HOST%%:*}"
-        local REDIS_PW=""
-        read_secret "Redis 密码: " REDIS_PW; [[ -z "$REDIS_PW" ]] && error "Redis 密码不能为空"
-
-        info "--- 对象存储 ---"
-        echo "  1. AWS S3   2. Cloudflare R2   3. 其他 S3 兼容"
-        read -rp "选择 [默认: 1]: " S3_CHOICE
-        local S3_PROVIDER="aws" S3_ENDPOINT="" S3_REGION=""
-        case "${S3_CHOICE:-1}" in
-            2) S3_PROVIDER="cloudflare"
-               read -rp "R2 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint"
-               read -rp "区域 [默认: auto]: " S3_REGION; S3_REGION="${S3_REGION:-auto}" ;;
-            3) S3_PROVIDER="other"
-               read -rp "自定义 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint"
-               read -rp "区域 [默认: us-east-1]: " S3_REGION; S3_REGION="${S3_REGION:-us-east-1}" ;;
-            *) read -rp "区域 [默认: us-east-1]: " S3_REGION; S3_REGION="${S3_REGION:-us-east-1}" ;;
-        esac
-        read -rp "存储桶名称: " S3_BUCKET; [[ -z "$S3_BUCKET" ]] && error "桶名不能为空"
-        local S3_KEY="" S3_SECRET=""
-        read_secret "S3 Access Key ID: " S3_KEY; [[ -z "$S3_KEY" ]] && error "S3 Key 不能为空"
-        read_secret "S3 Secret Access Key: " S3_SECRET; [[ -z "$S3_SECRET" ]] && error "S3 Secret 不能为空"
-        read -rp "CDN 域名（留空跳过）: " S3_CDN_DOMAIN; S3_CDN_DOMAIN="${S3_CDN_DOMAIN:-}"
+        read_secret "Redis 密码: " REDIS_PW; [[ -n "$REDIS_PW" ]] || error "Redis 密码不能为空"
 
         info "--- 站点 ---"
-        read -rp "站点 URL（如 https://example.com）: " WP_URL
-        [[ -z "$WP_URL" ]] && error "URL 不能为空"
+        read -rp "站点 URL（如 https://example.com）: " WP_URL || true
+        [[ -n "$WP_URL" ]] || error "URL 不能为空"
 
         info "--- 私有镜像仓库 ---"
-        read -rp "Registry 地址（如 10.10.0.1:5000）: " REGISTRY_HOST
-        [[ -z "$REGISTRY_HOST" ]] && error "Registry 地址不能为空"
+        read -rp "Registry 地址（如 10.10.0.1:5000）: " REGISTRY_HOST || true
+        [[ -n "$REGISTRY_HOST" ]] || error "Registry 地址不能为空"
 
         info "--- Cloudflare（可选）---"
-        read -rp "CF Zone ID（留空跳过）: " CF_ZONE_ID; CF_ZONE_ID="${CF_ZONE_ID:-}"
-        local CF_TOKEN=""
+        read -rp "CF Zone ID（留空跳过）: " CF_ZONE_ID || true; CF_ZONE_ID="${CF_ZONE_ID:-}"
         [[ -n "$CF_ZONE_ID" ]] && read_secret "CF API Token: " CF_TOKEN
 
-        local WG_IP
+        read -rp "WordPress 监听端口 [默认: 80]: " WP_PORT || true
+        WP_PORT="${WP_PORT:-80}"
+        [[ "$WP_PORT" =~ ^[0-9]+$ ]] && (( WP_PORT >= 1 && WP_PORT <= 65535 )) || { WP_PORT=80; warn "无效端口，使用默认 80"; }
         WG_IP=$(get_wg_ip)
-        check_port "$WG_IP" "80"
+        check_port "$WG_IP" "$WP_PORT"
         check_network "${DB_HOST}:3306" "${REDIS_HOST}:6379" || true
 
-        mkdir -p "$DIR"/{data/uploads,conf,logs}
+        mkdir -p "$DIR"/{data/uploads,data/cache,conf,logs}
 
-        cat > "$DIR/.env" <<EOF
-WORDPRESS_DB_PASSWORD=${DB_PW}
-WORDPRESS_DB_NAME=${DB_NAME}
-WORDPRESS_DB_USER=${DB_USER}
-DB_HOST=${DB_HOST}
-REDIS_HOST=${REDIS_HOST}
-REDIS_PW=${REDIS_PW}
-AWS_ACCESS_KEY_ID=${S3_KEY}
-AWS_SECRET_ACCESS_KEY=${S3_SECRET}
-S3_BUCKET=${S3_BUCKET}
-S3_REGION=${S3_REGION}
-S3_PROVIDER=${S3_PROVIDER}
-S3_ENDPOINT=${S3_ENDPOINT}
-S3_CDN_DOMAIN=${S3_CDN_DOMAIN}
-WG_IP=${WG_IP}
-WP_SITEURL_FALLBACK=${WP_URL}
-REGISTRY_HOST=${REGISTRY_HOST}
-IMAGE_TAG=latest
-NODE_ROLE=worker
-CF_ZONE_ID=${CF_ZONE_ID}
-CF_TOKEN=${CF_TOKEN}
-EOF
+        {
+            printf 'WORDPRESS_DB_PASSWORD=%s\n' "${DB_PW}"
+            printf 'WORDPRESS_DB_NAME=%s\n'     "${DB_NAME}"
+            printf 'WORDPRESS_DB_USER=%s\n'     "${DB_USER}"
+            printf 'DB_HOST=%s\n'               "${DB_HOST}"
+            printf 'REDIS_HOST=%s\n'            "${REDIS_HOST}"
+            printf 'REDIS_PW=%s\n'              "${REDIS_PW}"
+            printf 'WG_IP=%s\n'                 "${WG_IP}"
+            printf 'WP_PORT=%s\n'               "${WP_PORT}"
+            printf 'WP_SITEURL_FALLBACK=%s\n'   "${WP_URL}"
+            printf 'REGISTRY_HOST=%s\n'         "${REGISTRY_HOST}"
+            printf 'IMAGE_TAG=latest\n'
+            printf 'NODE_ROLE=worker\n'
+            printf 'CF_ZONE_ID=%s\n'            "${CF_ZONE_ID}"
+            printf 'CF_TOKEN=%s\n'              "${CF_TOKEN}"
+        } > "$DIR/.env"
         chmod 600 "$DIR/.env"
-        _write_s3_config_php   "$DIR/conf/s3-config.php"
         _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "worker"
         _write_worker_compose  "$DIR"
         _register_node "$WG_IP"
     fi
 
-    local REGISTRY_HOST IMAGE_TAG
     REGISTRY_HOST=$(env_get "$DIR/.env" "REGISTRY_HOST")
+    local IMAGE_TAG
     IMAGE_TAG=$(env_get "$DIR/.env" "IMAGE_TAG"); IMAGE_TAG="${IMAGE_TAG:-latest}"
-    [[ -z "$REGISTRY_HOST" ]] && error ".env 中缺少 REGISTRY_HOST"
+    [[ -n "$REGISTRY_HOST" ]] || error ".env 中缺少 REGISTRY_HOST"
+
+    DB_HOST="${DB_HOST:-$(env_get "$DIR/.env" "DB_HOST")}"
+    DB_NAME="${DB_NAME:-$(env_get "$DIR/.env" "WORDPRESS_DB_NAME")}"
+    DB_USER="${DB_USER:-$(env_get "$DIR/.env" "WORDPRESS_DB_USER")}"
+    DB_PW="${DB_PW:-$(env_get "$DIR/.env" "WORDPRESS_DB_PASSWORD")}"
 
     local REG_USER REG_PASS
     if [[ -f "$REGISTRY_DIR/.env" ]]; then
         REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
         REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
     else
-        read -rp "仓库用户名: " REG_USER
+        read -rp "仓库用户名: " REG_USER || true
         read_secret "仓库密码: " REG_PASS
     fi
     docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" \
@@ -1158,29 +1100,65 @@ EOF
     info "拉取镜像: ${IMAGE_FULL} ..."
     docker pull "$IMAGE_FULL" || error "镜像拉取失败"
 
-    # 工作节点自动生成 wp-config.php（仅首次）
     if [[ ! -f "$DIR/conf/wp-config.php" ]]; then
-        info "生成工作节点 wp-config.php ..."
-        docker run --rm --network host \
-            -v "$DIR/conf:/conf" \
-            -e WORDPRESS_DB_HOST="${DB_HOST}:3306" \
-            -e WORDPRESS_DB_NAME="${DB_NAME}" \
-            -e WORDPRESS_DB_USER="${DB_USER}" \
-            -e WORDPRESS_DB_PASSWORD="${DB_PW}" \
-            "$IMAGE_FULL" wp config create \
-                --dbname="$DB_NAME" --dbuser="$DB_USER" \
-                --dbpass="$DB_PW" --dbhost="$DB_HOST" \
-                --dbcharset=utf8mb4 \
-                --path=/var/www/html \
-                --extra-php='define("WP_MEMORY_LIMIT","512M");' \
-                --skip-check 2>/dev/null || true
-        # 确保文件存在，否则尝试直接创建
-        if [[ ! -f "$DIR/conf/wp-config.php" ]]; then
-            warn "自动生成 wp-config.php 失败，请手动创建或稍后重试"
-        else
-            echo "require_once('/etc/wordpress/wp-config-extra.php');" >> "$DIR/conf/wp-config.php"
-            log "wp-config.php 已生成"
+        info "预启动容器以生成 wp-config.php ..."
+        if [[ ! -f "$DIR/docker-compose.yml" ]]; then
+            _write_worker_compose "$DIR"
         fi
+        dc "$DIR" up -d 2>/dev/null || true
+
+        local RETRIES=20
+        while ! dc "$DIR" exec -T wordpress sh -c 'command -v wp' &>/dev/null; do
+            sleep 3; RETRIES=$((RETRIES - 1))
+            [[ $RETRIES -le 0 ]] && { warn "容器未就绪，跳过 wp-config.php 生成"; break; }
+        done
+
+        if dc "$DIR" exec -T wordpress sh -c 'command -v wp' &>/dev/null; then
+            # v4.7: 用 CID 变量而非命令替换嵌套，避免 docker cp 找不到容器
+            local CID
+            CID=$(docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" ps -q wordpress)
+            dc "$DIR" exec -T wordpress wp --allow-root config create \
+                --dbname="$DB_NAME" --dbuser="$DB_USER" \
+                --dbpass="$DB_PW"   --dbhost="$DB_HOST" \
+                --dbcharset=utf8mb4 --path=/var/www/html \
+                --skip-check 2>/dev/null \
+            && dc "$DIR" exec -T wordpress sh -c \
+                "sed -i \"/require_once.*wp-settings/i require_once('\/etc\/wordpress\/wp-config-extra.php');\" /var/www/html/wp-config.php" \
+            && dc "$DIR" exec -T wordpress cp /var/www/html/wp-config.php /tmp/wp-config-out.php \
+            && docker cp "${CID}:/tmp/wp-config-out.php" "$DIR/conf/wp-config.php" \
+            && log "wp-config.php 已生成并导出至 conf/" \
+            || warn "wp-config.php 生成失败，请手动创建或稍后重试（菜单 11）"
+        fi
+    fi
+
+    # v4.8: 宿主机预替换 nginx-wp.conf 占位符，容器内 entrypoint 不再做 sed
+    # 工作节点 nginx-wp.conf 来自镜像内（COPY），首次部署时需从镜像导出再替换后挂载
+    local _WG_IP_VAL _WP_PORT_VAL
+    _WG_IP_VAL=$(env_get "$DIR/.env" "WG_IP")
+    _WP_PORT_VAL=$(env_get "$DIR/.env" "WP_PORT"); _WP_PORT_VAL="${_WP_PORT_VAL:-80}"
+
+    if [[ ! -f "$DIR/conf/nginx-wp.conf" ]]; then
+        info "从镜像导出 nginx-wp.conf ..."
+        local _TMP_CID
+        _TMP_CID=$(docker create "${REGISTRY_HOST}/wordpress-site:${IMAGE_TAG}" sh 2>/dev/null)
+        if [[ -n "$_TMP_CID" ]]; then
+            docker cp "${_TMP_CID}:/etc/nginx/http.d/default.conf" "$DIR/conf/nginx-wp.conf" 2>/dev/null || true
+            docker rm -f "$_TMP_CID" &>/dev/null || true
+        fi
+    fi
+
+    if [[ -f "$DIR/conf/nginx-wp.conf" ]]; then
+        info "预替换 nginx-wp.conf 占位符 → ${_WG_IP_VAL}:${_WP_PORT_VAL}"
+        sed -i \
+            -e "s/__WG_IP__/${_WG_IP_VAL}/g" \
+            -e "s/__WP_PORT__/${_WP_PORT_VAL}/g" \
+            "$DIR/conf/nginx-wp.conf"
+        # 确保 worker compose 挂载了该文件
+        if ! grep -q "nginx-wp.conf" "$DIR/docker-compose.yml" 2>/dev/null; then
+            warn "docker-compose.yml 未挂载 nginx-wp.conf，请检查 _write_worker_compose 输出"
+        fi
+    else
+        warn "未能获取 nginx-wp.conf，nginx 将使用镜像内默认配置（含占位符）"
     fi
 
     info "启动 / 更新容器..."
@@ -1200,28 +1178,30 @@ EOF
     _flush_all_caches "$DIR"
 
     log "节点部署/更新完成！"
-    local WG_IP; WG_IP=$(env_get "$DIR/.env" "WG_IP")
+    local WG_IP_SHOW; WG_IP_SHOW=$(env_get "$DIR/.env" "WG_IP")
     echo -e "  镜像版本: \e[32m${IMAGE_TAG}\e[0m"
-    echo -e "  内网访问: \e[33mhttp://${WG_IP}\e[0m"
+    echo -e "  内网访问: \e[33mhttp://${WG_IP_SHOW}\e[0m"
 }
 
 # ════════════════════════════════════════════════════════
-# 镜像回滚（使用 jq 解析 tags）
+# 镜像回滚
 # ════════════════════════════════════════════════════════
 cmd_rollback() {
     header "镜像回滚"
-    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR || true
+    DIR="${DIR:-$DEFAULT_DIR}"
     [[ -f "$DIR/.env" ]] || error "未找到 .env：${DIR}"
 
     local REGISTRY_HOST; REGISTRY_HOST=$(env_get "$DIR/.env" "REGISTRY_HOST")
-    [[ -z "$REGISTRY_HOST" ]] && error ".env 中缺少 REGISTRY_HOST"
+    [[ -n "$REGISTRY_HOST" ]] || error ".env 中缺少 REGISTRY_HOST"
 
     local REG_USER REG_PASS
     if [[ -f "$REGISTRY_DIR/.env" ]]; then
         REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
         REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
     else
-        read -rp "仓库用户名: " REG_USER; read_secret "仓库密码: " REG_PASS
+        read -rp "仓库用户名: " REG_USER || true
+        read_secret "仓库密码: " REG_PASS
     fi
 
     local TAGS_JSON
@@ -1231,7 +1211,7 @@ cmd_rollback() {
         warn "无法从仓库获取标签列表"; return
     fi
     local TAGS
-    TAGS=$(echo "$TAGS_JSON" | jq -r '.tags[]' | grep -v '^latest$' | sort -r)
+    TAGS=$(echo "$TAGS_JSON" | jq -r '.tags[]' | grep -v '^latest$' | sort -r || true)
     [[ -z "$TAGS" ]] && { warn "仓库中无可用版本"; return; }
 
     echo ""; echo "可用版本："
@@ -1240,13 +1220,13 @@ cmd_rollback() {
         echo "  ${i}. ${TAG}"; TAG_ARR+=("$TAG"); i=$((i+1))
     done <<< "$TAGS"
 
-    read -rp "选择版本编号: " TAG_IDX
+    read -rp "选择版本编号: " TAG_IDX || true
     [[ "$TAG_IDX" =~ ^[0-9]+$ ]] || error "无效编号"
     local SELECTED_TAG="${TAG_ARR[$((TAG_IDX-1))]}"
-    [[ -z "$SELECTED_TAG" ]] && error "无效选择"
+    [[ -n "$SELECTED_TAG" ]] || error "无效选择"
 
     warn "将回滚到版本: ${SELECTED_TAG}"
-    read -rp "确认？[y/N]: " CONFIRM
+    read -rp "确认？[y/N]: " CONFIRM || true
     [[ "${CONFIRM,,}" == "y" ]] || { info "已取消"; return; }
 
     sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${SELECTED_TAG}|" "$DIR/.env"
@@ -1259,9 +1239,12 @@ cmd_rollback() {
     log "回滚到 ${SELECTED_TAG} 完成！"
 }
 
-# 其他运维命令（维持不变）...
+# ════════════════════════════════════════════════════════
+# 运维命令
+# ════════════════════════════════════════════════════════
 cmd_status() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true
+    DIR="${DIR:-$DEFAULT_DIR}"
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     dc "$DIR" ps; echo ""
     local WP_VER
@@ -1274,10 +1257,11 @@ cmd_status() {
 }
 
 cmd_logs() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true
+    DIR="${DIR:-$DEFAULT_DIR}"
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     echo "  1. 容器总日志  2. Nginx 访问日志  3. Nginx 错误日志"
-    read -rp "选择 [默认: 1]: " LOG_CHOICE
+    read -rp "选择 [默认: 1]: " LOG_CHOICE || true
     case "${LOG_CHOICE:-1}" in
         2) dc "$DIR" exec -T wordpress tail -f /var/log/nginx/access.log ;;
         3) dc "$DIR" exec -T wordpress tail -f /var/log/nginx/error.log ;;
@@ -1285,15 +1269,16 @@ cmd_logs() {
     esac
 }
 
-cmd_stop()    { read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" stop    && log "已停止。"; }
-cmd_start()   { read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" up -d   && log "已启动。"; }
-cmd_restart() { read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" restart && log "已重启。"; }
+cmd_stop()    { read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true; DIR="${DIR:-$DEFAULT_DIR}"; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" stop    && log "已停止。"; }
+cmd_start()   { read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true; DIR="${DIR:-$DEFAULT_DIR}"; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" up -d   && log "已启动。"; }
+cmd_restart() { read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true; DIR="${DIR:-$DEFAULT_DIR}"; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" restart && log "已重启。"; }
 
 cmd_destroy() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true
+    DIR="${DIR:-$DEFAULT_DIR}"
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     warn "将停止容器并删除全部数据（不可恢复）。"
-    read -rp "输入 'yes' 确认: " CONFIRM
+    read -rp "输入 'yes' 确认: " CONFIRM || true
     [[ "$CONFIRM" != "yes" ]] && { info "已取消"; return; }
     local WG_IP; WG_IP=$(env_get "$DIR/.env" "WG_IP")
     if [[ -n "$WG_IP" && -f "$NODES_FILE" ]]; then
@@ -1305,7 +1290,8 @@ cmd_destroy() {
 }
 
 cmd_retry_plugins() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true
+    DIR="${DIR:-$DEFAULT_DIR}"
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     dc "$DIR" ps --services --filter status=running | grep -q "wordpress" \
         || { warn "wordpress 容器未运行，请先启动。"; return; }
@@ -1313,7 +1299,8 @@ cmd_retry_plugins() {
 }
 
 cmd_flush() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true
+    DIR="${DIR:-$DEFAULT_DIR}"
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     _flush_all_caches "$DIR"
 }
@@ -1321,12 +1308,15 @@ cmd_flush() {
 cmd_nodes() {
     header "节点列表管理"
     echo "  1. 列出所有节点  2. 添加节点  3. 删除节点"
-    read -rp "选择: " NODE_CHOICE
+    read -rp "选择: " NODE_CHOICE || true
     case "$NODE_CHOICE" in
         1) [[ -s "$NODES_FILE" ]] && nl -ba "$NODES_FILE" || warn "节点列表为空：${NODES_FILE}" ;;
-        2) read -rp "节点 WireGuard IP: " NEW_IP; [[ -z "$NEW_IP" ]] && error "IP 不能为空"; _register_node "$NEW_IP" ;;
+        2) read -rp "节点 WireGuard IP: " NEW_IP || true
+           [[ -n "$NEW_IP" ]] || error "IP 不能为空"
+           [[ "$NEW_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || error "无效 IP 格式：${NEW_IP}"
+           _register_node "$NEW_IP" ;;
         3) [[ -f "$NODES_FILE" ]] || { warn "节点列表不存在。"; return; }
-           nl -ba "$NODES_FILE"; read -rp "输入要删除的行号: " LINE_NUM
+           nl -ba "$NODES_FILE"; read -rp "输入要删除的行号: " LINE_NUM || true
            [[ "$LINE_NUM" =~ ^[0-9]+$ ]] || error "无效行号"
            sed -i "${LINE_NUM}d" "$NODES_FILE"; log "已删除第 ${LINE_NUM} 行。" ;;
         *) warn "无效输入" ;;
@@ -1337,7 +1327,7 @@ interactive_menu() {
     while true; do
         echo ""
         _c "1;35" "========================================"
-        _c "1;35" "  WordPress 多节点分发管理 v4.3"
+        _c "1;35" "  WordPress 多节点分发管理 v4.8"
         _c "1;35" "  单容器全打包版（nginx+php+wordpress）"
         _c "1;35" "========================================"
         echo -e "  \e[36m── 仓库管理 ──────────────────────────\e[0m"
@@ -1360,7 +1350,7 @@ interactive_menu() {
         echo -e "  \e[31m14.\e[0m 删除节点（不可恢复）"
         echo -e "  \e[36m 0.\e[0m 退出"
         echo "----------------------------------------"
-        read -rp "选择: " CHOICE
+        read -rp "选择: " CHOICE || true
         case "$CHOICE" in
             1)  cmd_registry ;;
             2)  cmd_master_init ;;
@@ -1379,12 +1369,11 @@ interactive_menu() {
             0)  info "再见！"; exit 0 ;;
             *)  warn "无效输入" ;;
         esac
-        read -rp "按回车继续..."
+        read -rp "按回车继续..." || true
         clear
     done
 }
 
-# ── 入口 ────────────────────────────────────────────
 check_deps
 clear
 interactive_menu
