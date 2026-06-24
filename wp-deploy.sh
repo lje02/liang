@@ -202,7 +202,7 @@ CONF
 }
 
 _write_nginx_wp_conf() {
-    local DEST="$1" WG_IP="$2"
+    local DEST="$1" WG_IP="$2" WP_PORT="${3:-80}"
     local TEMPLATE
     TEMPLATE=$(cat <<'TEMPLATE'
 map $http_x_forwarded_proto $fastcgi_https {
@@ -211,7 +211,7 @@ map $http_x_forwarded_proto $fastcgi_https {
 }
 
 server {
-    listen __WG_IP__:80 default_server;
+    listen __WG_IP__:__WP_PORT__ default_server;
     root /var/www/html;
     index index.php index.html;
     client_max_body_size 2048M;
@@ -252,7 +252,8 @@ server {
 }
 TEMPLATE
 )
-    printf "%s" "${TEMPLATE//__WG_IP__/${WG_IP:-__WG_IP__}}" > "$DEST"
+    TEMPLATE="${TEMPLATE//__WG_IP__/${WG_IP:-__WG_IP__}}"
+    printf "%s" "${TEMPLATE//__WP_PORT__/${WP_PORT}}" > "$DEST"
 }
 
 _write_entrypoint_script() {
@@ -264,10 +265,12 @@ set -e
 if [ -n "${WG_IP}" ]; then
     FILE="/etc/nginx/http.d/default.conf"
     if grep -q '__WG_IP__' "$FILE" 2>/dev/null; then
-        sed "s/__WG_IP__/${WG_IP}/g" "$FILE" > /tmp/default.conf.tmp
+        sed -e "s/__WG_IP__/${WG_IP}/g" \
+            -e "s/__WP_PORT__/${WP_PORT:-80}/g" \
+            "$FILE" > /tmp/default.conf.tmp
         cat /tmp/default.conf.tmp > "$FILE"
         rm -f /tmp/default.conf.tmp
-        echo "Nginx listen IP set to ${WG_IP}"
+        echo "Nginx listen set to ${WG_IP}:${WP_PORT:-80}"
     else
         echo "WG_IP already configured, skipping"
     fi
@@ -513,6 +516,7 @@ services:
     network_mode: host
     environment:
       WG_IP:                  ${WG_IP}
+      WP_PORT:                ${WP_PORT:-80}
       WORDPRESS_DB_HOST:      ${DB_HOST}:3306
       WORDPRESS_DB_NAME:      ${WORDPRESS_DB_NAME}
       WORDPRESS_DB_USER:      ${WORDPRESS_DB_USER}
@@ -553,6 +557,7 @@ services:
     network_mode: host
     environment:
       WG_IP:                  ${WG_IP}
+      WP_PORT:                ${WP_PORT:-80}
       WORDPRESS_DB_HOST:      ${DB_HOST}:3306
       WORDPRESS_DB_NAME:      ${WORDPRESS_DB_NAME}
       WORDPRESS_DB_USER:      ${WORDPRESS_DB_USER}
@@ -905,13 +910,17 @@ cmd_master_init() {
     local CF_TOKEN=""
     [[ -n "$CF_ZONE_ID" ]] && read_secret "CF API Token: " CF_TOKEN
 
+    read -rp "WordPress 监听端口 [默认: 80]: " WP_PORT || true
+    WP_PORT="${WP_PORT:-80}"
+    [[ "$WP_PORT" =~ ^[0-9]+$ ]] && (( WP_PORT >= 1 && WP_PORT <= 65535 )) || { WP_PORT=80; warn "无效端口，使用默认 80"; }
+
     local WG_IP
     WG_IP=$(get_wg_ip)
     log "WireGuard IP: ${WG_IP}"
 
     info "检查关键服务连通性..."
     check_network "${DB_HOST}:3306" "${REDIS_HOST}:6379" || true
-    check_port "$WG_IP" "80"
+    check_port "$WG_IP" "$WP_PORT"
 
     mkdir -p "$DIR"/{data/uploads,data/cache,conf,logs}
 
@@ -931,6 +940,7 @@ cmd_master_init() {
         printf 'S3_ENDPOINT=%s\n'           "${S3_ENDPOINT}"
         printf 'S3_CDN_DOMAIN=%s\n'         "${S3_CDN_DOMAIN}"
         printf 'WG_IP=%s\n'                 "${WG_IP}"
+        printf 'WP_PORT=%s\n'               "${WP_PORT}"
         printf 'WP_SITEURL_FALLBACK=%s\n'   "${WP_URL}"
         printf 'REGISTRY_HOST=%s\n'         "${REGISTRY_HOST}"
         printf 'IMAGE_TAG=latest\n'
@@ -941,7 +951,7 @@ cmd_master_init() {
     chmod 600 "$DIR/.env"
 
     _write_nginx_main_conf    "$DIR/conf/nginx.conf"
-    _write_nginx_wp_conf      "$DIR/conf/nginx-wp.conf" "$WG_IP"
+    _write_nginx_wp_conf      "$DIR/conf/nginx-wp.conf" "$WG_IP" "$WP_PORT"
     _write_php_uploads_ini    "$DIR/conf/php-uploads.ini"
     _write_opcache_ini        "$DIR/conf/opcache.ini"
     _write_php_fpm_www_conf   "$DIR/conf/php-fpm-www.conf"
@@ -1034,7 +1044,7 @@ cmd_push() {
     info "生成配置文件..."
     mkdir -p "$BUILD_DIR/conf"
     _write_nginx_main_conf   "$BUILD_DIR/conf/nginx.conf"
-    _write_nginx_wp_conf     "$BUILD_DIR/conf/nginx-wp.conf" ""
+    _write_nginx_wp_conf     "$BUILD_DIR/conf/nginx-wp.conf" "" ""
     _write_php_uploads_ini   "$BUILD_DIR/conf/php-uploads.ini"
     _write_opcache_ini       "$BUILD_DIR/conf/opcache.ini"
     _write_php_fpm_www_conf  "$BUILD_DIR/conf/php-fpm-www.conf"
@@ -1142,8 +1152,11 @@ cmd_pull_deploy() {
         read -rp "CF Zone ID（留空跳过）: " CF_ZONE_ID; CF_ZONE_ID="${CF_ZONE_ID:-}" || true
         [[ -n "$CF_ZONE_ID" ]] && read_secret "CF API Token: " CF_TOKEN
 
+        read -rp "WordPress 监听端口 [默认: 80]: " WP_PORT || true
+        WP_PORT="${WP_PORT:-80}"
+        [[ "$WP_PORT" =~ ^[0-9]+$ ]] && (( WP_PORT >= 1 && WP_PORT <= 65535 )) || { WP_PORT=80; warn "无效端口，使用默认 80"; }
         WG_IP=$(get_wg_ip)
-        check_port "$WG_IP" "80"
+        check_port "$WG_IP" "$WP_PORT"
         check_network "${DB_HOST}:3306" "${REDIS_HOST}:6379" || true
 
         mkdir -p "$DIR"/{data/uploads,conf,logs}
@@ -1164,6 +1177,7 @@ cmd_pull_deploy() {
             printf 'S3_ENDPOINT=%s\n'           "${S3_ENDPOINT}"
             printf 'S3_CDN_DOMAIN=%s\n'         "${S3_CDN_DOMAIN}"
             printf 'WG_IP=%s\n'                 "${WG_IP}"
+            printf 'WP_PORT=%s\n'               "${WP_PORT}"
             printf 'WP_SITEURL_FALLBACK=%s\n'   "${WP_URL}"
             printf 'REGISTRY_HOST=%s\n'         "${REGISTRY_HOST}"
             printf 'IMAGE_TAG=latest\n'
