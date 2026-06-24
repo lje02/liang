@@ -241,8 +241,6 @@ TEMPLATE
     printf "%s" "${TEMPLATE//__WP_PORT__/${WP_PORT}}" > "$DEST"
 }
 
-# v4.7: 去掉 grep 判断，每次启动都无条件替换占位符
-# 原来判断 __WG_IP__ 是否存在再替换，导致容器重启或换节点后 IP 不更新
 _write_entrypoint_script() {
     local DEST="$1"
     cat > "$DEST" <<'ENTRYPOINT'
@@ -251,10 +249,13 @@ set -e
 
 FILE="/etc/nginx/http.d/default.conf"
 if [ -n "${WG_IP}" ]; then
-    sed -i \
+    TMP=$(mktemp)
+    sed \
         -e "s/__WG_IP__/${WG_IP}/g" \
         -e "s/__WP_PORT__/${WP_PORT:-80}/g" \
-        "$FILE"
+        "$FILE" > "$TMP"
+    cp "$TMP" "$FILE"
+    rm -f "$TMP"
     echo "Nginx listen set to ${WG_IP}:${WP_PORT:-80}"
 else
     echo "WARNING: WG_IP not set, using placeholder" >&2
