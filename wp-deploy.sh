@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
-# v4.4  审计修复版
+# v4.5  审计修复版
 #   修复: 工作节点 wp-config.php docker run 挂载路径错误（CRITICAL）
 #   修复: cmd_pull_deploy IS_FIRST=false 时变量未定义（HIGH）
 #   修复: check_network /dev/tcp 命令注入（HIGH）
@@ -10,6 +10,15 @@
 #   修复: htpasswd docker run 失败清空文件（MEDIUM）
 #   修复: NGINX_CACHE_DIR 路径校验（MEDIUM）
 #   改进: registry 监听 WG_IP 而非 0.0.0.0
+# v4.5  本次修复
+#   修复: read_secret 在 set -e 下回车返回非零导致静默退出（CRITICAL）
+#   修复: .env heredoc 密码含特殊字符被 shell 展开损坏（HIGH）
+#   修复: check_port 用 ss grep 可能漏检，改用 ss -tlnp + awk 精确匹配（HIGH）
+#   修复: cmd_registry 缺少仓库就绪等待（MEDIUM）
+#   修复: daemon.json jq 解析失败静默跳过（MEDIUM）
+#   修复: REG_PORT 未校验范围 1-65535（MEDIUM）
+#   修复: cmd_nodes 手动添加节点 IP 无格式校验（MEDIUM）
+#   修复: htpasswd 临时文件无 trap 防泄漏（LOW）
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
@@ -50,7 +59,8 @@ check_deps() {
 
 check_port() {
     local IP="$1" PORT="$2"
-    if ss -tlnp | grep -qF "${IP}:${PORT} "; then
+    # 用 awk 精确解析本地地址列，兼容不同 ss 版本及 IPv4/IPv6 输出格式
+    if ss -tlnp | awk '{print $4}'             | grep -qE "(^|^::ffff:)(${IP//./\.}|\*|0\.0\.0\.0):${PORT}$"; then
         error "端口 ${IP}:${PORT} 已被占用，请先停止对应服务"
     fi
 }
@@ -92,7 +102,8 @@ dc() {
 
 read_secret() {
     local PROMPT="$1" VAR_NAME="$2" VALUE=""
-    IFS= read -rp "$PROMPT" VALUE
+    # || true 防止 set -e 在 read 返回非零（如空输入/EOF）时静默退出
+    IFS= read -rp "$PROMPT" VALUE || true
     VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
     VALUE="${VALUE%"${VALUE##*[![:space:]]}"}"
     printf -v "$VAR_NAME" '%s' "$VALUE"
@@ -105,6 +116,10 @@ env_get() {
 
 _register_node() {
     local IP="$1"
+    # 校验 IPv4 格式
+    if [[ ! "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        error "_register_node: 无效 IP 格式：${IP}"
+    fi
     touch "$NODES_FILE"
     if ! grep -qxF "$IP" "$NODES_FILE"; then
         [[ -s "$NODES_FILE" && "$(tail -c1 "$NODES_FILE")" != "" ]] && echo "" >> "$NODES_FILE"
@@ -719,6 +734,7 @@ cmd_registry() {
     read -rp "仓库监听端口 [默认: 5000]: " REG_PORT
     REG_PORT="${REG_PORT:-5000}"
     [[ "$REG_PORT" =~ ^[0-9]+$ ]] || error "无效端口"
+    (( REG_PORT >= 1 && REG_PORT <= 65535 )) || error "端口范围必须在 1-65535 之间"
     check_port "$WG_IP" "$REG_PORT"
 
     read -rp "仓库认证用户名 [默认: wpregistry]: " REG_USER
@@ -734,6 +750,8 @@ cmd_registry() {
 
     # ── 修复: htpasswd 写入临时文件，成功后再移入，防止失败清空 ──
     local HTPASSWD_TMP; HTPASSWD_TMP=$(mktemp)
+    # 确保临时文件在任意退出路径下都被清理
+    trap 'rm -f "$HTPASSWD_TMP"' RETURN ERR
     local HTPASSWD_OK=false
     if command -v htpasswd &>/dev/null; then
         htpasswd -Bbn "$REG_USER" "$REG_PASS" > "$HTPASSWD_TMP" && HTPASSWD_OK=true
@@ -779,20 +797,37 @@ EOF
     chmod 600 "$REGISTRY_DIR/.env"
     docker compose -f "$REGISTRY_DIR/docker-compose.yml" up -d || error "仓库启动失败"
 
+    # 等待 registry HTTP 服务就绪
+    info "等待仓库服务就绪..."
+    local _RETRIES=20
+    until curl -sf -u "${REG_USER}:${REG_PASS}" \
+            "http://${WG_IP}:${REG_PORT}/v2/" &>/dev/null; do
+        sleep 2; _RETRIES=$(( _RETRIES - 1 ))
+        [[ $_RETRIES -le 0 ]] && error "仓库服务未能在预期时间内就绪，请检查容器日志"
+    done
+
     local DAEMON_JSON="/etc/docker/daemon.json"
     local REGISTRY_ADDR="${WG_IP}:${REG_PORT}"
     if [[ -f "$DAEMON_JSON" ]]; then
-        if ! jq -e --arg addr "$REGISTRY_ADDR" '.["insecure-registries"]? | index($addr)' "$DAEMON_JSON" &>/dev/null; then
+        local _JQ_RC=0
+        local _JQ_OUT
+        _JQ_OUT=$(jq -e --arg addr "$REGISTRY_ADDR" \
+            '.["insecure-registries"]? | index($addr)' "$DAEMON_JSON" 2>&1) || _JQ_RC=$?
+        if [[ $_JQ_RC -eq 0 ]]; then
+            : # 地址已存在，无需操作
+        elif echo "$_JQ_OUT" | grep -qE "^null$|^false$"; then
             warn "请手动在 ${DAEMON_JSON} 中添加："
             warn "  \"insecure-registries\": [\"${REGISTRY_ADDR}\"]"
             warn "然后执行: systemctl restart docker"
+        else
+            warn "daemon.json 解析失败，请手动确认后添加 insecure-registries: ${REGISTRY_ADDR}"
+            warn "解析错误: ${_JQ_OUT}"
         fi
     else
-        cat > "$DAEMON_JSON" <<JSON
-{
-  "insecure-registries": ["${REGISTRY_ADDR}"]
+        printf '{
+  "insecure-registries": ["%s"]
 }
-JSON
+' "${REGISTRY_ADDR}" > "$DAEMON_JSON"
         systemctl restart docker && log "Docker daemon 已更新并重启"
     fi
 
@@ -884,28 +919,29 @@ cmd_master_init() {
 
     mkdir -p "$DIR"/{data/uploads,data/cache,conf,logs}
 
-    cat > "$DIR/.env" <<EOF
-WORDPRESS_DB_PASSWORD=${DB_PW}
-WORDPRESS_DB_NAME=${DB_NAME}
-WORDPRESS_DB_USER=${DB_USER}
-DB_HOST=${DB_HOST}
-REDIS_HOST=${REDIS_HOST}
-REDIS_PW=${REDIS_PW}
-AWS_ACCESS_KEY_ID=${S3_KEY}
-AWS_SECRET_ACCESS_KEY=${S3_SECRET}
-S3_BUCKET=${S3_BUCKET}
-S3_REGION=${S3_REGION}
-S3_PROVIDER=${S3_PROVIDER}
-S3_ENDPOINT=${S3_ENDPOINT}
-S3_CDN_DOMAIN=${S3_CDN_DOMAIN}
-WG_IP=${WG_IP}
-WP_SITEURL_FALLBACK=${WP_URL}
-REGISTRY_HOST=${REGISTRY_HOST}
-IMAGE_TAG=latest
-NODE_ROLE=master
-CF_ZONE_ID=${CF_ZONE_ID}
-CF_TOKEN=${CF_TOKEN}
-EOF
+    # 用 printf 逐行写入，防止密码/密钥含特殊字符被 shell 展开
+    {
+        printf 'WORDPRESS_DB_PASSWORD=%s\n' "${DB_PW}"
+        printf 'WORDPRESS_DB_NAME=%s\n'     "${DB_NAME}"
+        printf 'WORDPRESS_DB_USER=%s\n'     "${DB_USER}"
+        printf 'DB_HOST=%s\n'               "${DB_HOST}"
+        printf 'REDIS_HOST=%s\n'            "${REDIS_HOST}"
+        printf 'REDIS_PW=%s\n'              "${REDIS_PW}"
+        printf 'AWS_ACCESS_KEY_ID=%s\n'     "${S3_KEY}"
+        printf 'AWS_SECRET_ACCESS_KEY=%s\n' "${S3_SECRET}"
+        printf 'S3_BUCKET=%s\n'             "${S3_BUCKET}"
+        printf 'S3_REGION=%s\n'             "${S3_REGION}"
+        printf 'S3_PROVIDER=%s\n'           "${S3_PROVIDER}"
+        printf 'S3_ENDPOINT=%s\n'           "${S3_ENDPOINT}"
+        printf 'S3_CDN_DOMAIN=%s\n'         "${S3_CDN_DOMAIN}"
+        printf 'WG_IP=%s\n'                 "${WG_IP}"
+        printf 'WP_SITEURL_FALLBACK=%s\n'   "${WP_URL}"
+        printf 'REGISTRY_HOST=%s\n'         "${REGISTRY_HOST}"
+        printf 'IMAGE_TAG=latest\n'
+        printf 'NODE_ROLE=master\n'
+        printf 'CF_ZONE_ID=%s\n'            "${CF_ZONE_ID}"
+        printf 'CF_TOKEN=%s\n'              "${CF_TOKEN}"
+    } > "$DIR/.env"
     chmod 600 "$DIR/.env"
 
     _write_nginx_main_conf    "$DIR/conf/nginx.conf"
@@ -1116,28 +1152,29 @@ cmd_pull_deploy() {
 
         mkdir -p "$DIR"/{data/uploads,conf,logs}
 
-        cat > "$DIR/.env" <<EOF
-WORDPRESS_DB_PASSWORD=${DB_PW}
-WORDPRESS_DB_NAME=${DB_NAME}
-WORDPRESS_DB_USER=${DB_USER}
-DB_HOST=${DB_HOST}
-REDIS_HOST=${REDIS_HOST}
-REDIS_PW=${REDIS_PW}
-AWS_ACCESS_KEY_ID=${S3_KEY}
-AWS_SECRET_ACCESS_KEY=${S3_SECRET}
-S3_BUCKET=${S3_BUCKET}
-S3_REGION=${S3_REGION}
-S3_PROVIDER=${S3_PROVIDER}
-S3_ENDPOINT=${S3_ENDPOINT}
-S3_CDN_DOMAIN=${S3_CDN_DOMAIN}
-WG_IP=${WG_IP}
-WP_SITEURL_FALLBACK=${WP_URL}
-REGISTRY_HOST=${REGISTRY_HOST}
-IMAGE_TAG=latest
-NODE_ROLE=worker
-CF_ZONE_ID=${CF_ZONE_ID}
-CF_TOKEN=${CF_TOKEN}
-EOF
+        # 用 printf 逐行写入，防止密码/密钥含特殊字符被 shell 展开
+        {
+            printf 'WORDPRESS_DB_PASSWORD=%s\n' "${DB_PW}"
+            printf 'WORDPRESS_DB_NAME=%s\n'     "${DB_NAME}"
+            printf 'WORDPRESS_DB_USER=%s\n'     "${DB_USER}"
+            printf 'DB_HOST=%s\n'               "${DB_HOST}"
+            printf 'REDIS_HOST=%s\n'            "${REDIS_HOST}"
+            printf 'REDIS_PW=%s\n'              "${REDIS_PW}"
+            printf 'AWS_ACCESS_KEY_ID=%s\n'     "${S3_KEY}"
+            printf 'AWS_SECRET_ACCESS_KEY=%s\n' "${S3_SECRET}"
+            printf 'S3_BUCKET=%s\n'             "${S3_BUCKET}"
+            printf 'S3_REGION=%s\n'             "${S3_REGION}"
+            printf 'S3_PROVIDER=%s\n'           "${S3_PROVIDER}"
+            printf 'S3_ENDPOINT=%s\n'           "${S3_ENDPOINT}"
+            printf 'S3_CDN_DOMAIN=%s\n'         "${S3_CDN_DOMAIN}"
+            printf 'WG_IP=%s\n'                 "${WG_IP}"
+            printf 'WP_SITEURL_FALLBACK=%s\n'   "${WP_URL}"
+            printf 'REGISTRY_HOST=%s\n'         "${REGISTRY_HOST}"
+            printf 'IMAGE_TAG=latest\n'
+            printf 'NODE_ROLE=worker\n'
+            printf 'CF_ZONE_ID=%s\n'            "${CF_ZONE_ID}"
+            printf 'CF_TOKEN=%s\n'              "${CF_TOKEN}"
+        } > "$DIR/.env"
         chmod 600 "$DIR/.env"
         _write_s3_config_php   "$DIR/conf/s3-config.php"
         _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "worker"
@@ -1350,7 +1387,10 @@ cmd_nodes() {
     read -rp "选择: " NODE_CHOICE
     case "$NODE_CHOICE" in
         1) [[ -s "$NODES_FILE" ]] && nl -ba "$NODES_FILE" || warn "节点列表为空：${NODES_FILE}" ;;
-        2) read -rp "节点 WireGuard IP: " NEW_IP; [[ -z "$NEW_IP" ]] && error "IP 不能为空"; _register_node "$NEW_IP" ;;
+        2) read -rp "节点 WireGuard IP: " NEW_IP
+           [[ -z "$NEW_IP" ]] && error "IP 不能为空"
+           [[ "$NEW_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || error "无效 IP 格式：${NEW_IP}"
+           _register_node "$NEW_IP" ;;
         3) [[ -f "$NODES_FILE" ]] || { warn "节点列表不存在。"; return; }
            nl -ba "$NODES_FILE"; read -rp "输入要删除的行号: " LINE_NUM
            [[ "$LINE_NUM" =~ ^[0-9]+$ ]] || error "无效行号"
