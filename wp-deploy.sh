@@ -345,8 +345,7 @@ _write_wp_config_extra() {
 <?php
 define('AUTOMATIC_UPDATER_DISABLED', true);
 define('WP_AUTO_UPDATE_CORE',        false);
-add_filter('auto_update_plugin', '__return_false');
-add_filter('auto_update_theme',  '__return_false');
+// add_filter 在 wp-config 阶段不可用，自动更新由上方 define 常量控制
 PHP_HEAD
     [[ "$NODE_ROLE" == "worker" ]] && printf "define('DISALLOW_FILE_MODS', true);\n" >> "$DEST"
     cat >> "$DEST" <<'PHP_BODY'
