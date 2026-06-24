@@ -1,13 +1,6 @@
 
-快捷键 vp
-
-# 下载
-curl -fsSL https://raw.githubusercontent.com/lje02/liang/main/infra-mariadb.sh -o infra-mariadb.sh
-chmod +x infra-mariadb.sh
-
-
-curl -fsSL https://raw.githubusercontent.com/lje02/liang/main/infra-redis.sh   -o infra-redis.sh
-chmod +x infra-redis.sh
+# 
+curl -fsSL https://raw.githubusercontent.com/lje02/liang/main/infra-shared.sh -o /usr/local/bin/infra-shared.sh && chmod +x /usr/local/bin/infra-shared.sh && /usr/local/bin/infra-shared.sh
 
 
 
