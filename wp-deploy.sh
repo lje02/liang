@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
-# v4.7  本次修复
-#   修复: cmd_push 从宿主机 data/ 同步改为从运行容器 docker cp 导出（CRITICAL）
-#   修复: entrypoint.sh 去掉 grep 判断，每次启动都重新替换占位符（HIGH）
-#   修复: _write_worker_compose 补充 data/cache 挂载（MEDIUM）
-#   修复: cmd_pull_deploy docker cp 改用 CID 变量（MEDIUM）
-#   修复: check_port 正则简化为 :PORT$ 覆盖所有监听格式（MEDIUM）
-#   修复: [[ -z ]] && error 全部改为 [[ -n ]] || error 避免 set -e 误触发（LOW）
+# v4.8  本次修复
+#   修复: entrypoint.sh 彻底去掉 sed，只启动 supervisord（CRITICAL）
+#         Alpine bind-mount 下 sed -i / cp 均因 rename 跨设备失败导致容器无限重启
+#         解决方案：宿主机生成 nginx-wp.conf 时直接写入真实 IP/PORT，容器无需再替换
+#   修复: _write_init_compose nginx-wp.conf 挂载加 :ro（LOW）
+#   修复: cmd_pull_deploy 启动前预替换 nginx-wp.conf 占位符（工作节点场景）（HIGH）
+#   继承 v4.7 全部修复
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
@@ -241,26 +241,17 @@ TEMPLATE
     printf "%s" "${TEMPLATE//__WP_PORT__/${WP_PORT}}" > "$DEST"
 }
 
+# v4.8: entrypoint 不再做任何 sed 替换。
+# 原因：Alpine 容器内 bind-mount 文件执行 sed -i 或 cp 均会因 rename(2) 跨设备失败
+# ("Resource busy" / "File exists") 导致容器无限重启。
+# 解决方案：nginx-wp.conf 在宿主机生成时就写入真实 IP/PORT（主节点），
+# 或在容器启动前由宿主机脚本预替换（工作节点），容器内无需再修改。
 _write_entrypoint_script() {
     local DEST="$1"
     cat > "$DEST" <<'ENTRYPOINT'
 #!/bin/sh
 set -e
-
-FILE="/etc/nginx/http.d/default.conf"
-if [ -n "${WG_IP}" ]; then
-    TMP=$(mktemp)
-    sed \
-        -e "s/__WG_IP__/${WG_IP}/g" \
-        -e "s/__WP_PORT__/${WP_PORT:-80}/g" \
-        "$FILE" > "$TMP"
-    cp "$TMP" "$FILE"
-    rm -f "$TMP"
-    echo "Nginx listen set to ${WG_IP}:${WP_PORT:-80}"
-else
-    echo "WARNING: WG_IP not set, using placeholder" >&2
-fi
-
+echo "Starting supervisord..."
 exec /usr/bin/supervisord -c /etc/supervisord.conf
 ENTRYPOINT
     chmod +x "$DEST"
@@ -559,7 +550,7 @@ services:
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./data/cache:/var/www/html/wp-content/cache
       - ./conf/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./conf/nginx-wp.conf:/etc/nginx/http.d/default.conf
+      - ./conf/nginx-wp.conf:/etc/nginx/http.d/default.conf:ro
       - ./conf/php-uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
       - ./conf/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
       - ./conf/php-fpm-www.conf:/usr/local/etc/php-fpm.d/www.conf:ro
@@ -599,6 +590,7 @@ services:
     volumes:
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./data/cache:/var/www/html/wp-content/cache
+      - ./conf/nginx-wp.conf:/etc/nginx/http.d/default.conf:ro
       - ./conf/wp-config.php:/var/www/html/wp-config.php:ro
       - ./conf/s3-config.php:/etc/wordpress/s3-config.php:ro
       - ./conf/wp-config-extra.php:/etc/wordpress/wp-config-extra.php:ro
@@ -1277,6 +1269,36 @@ cmd_pull_deploy() {
         fi
     fi
 
+    # v4.8: 宿主机预替换 nginx-wp.conf 占位符，容器内 entrypoint 不再做 sed
+    # 工作节点 nginx-wp.conf 来自镜像内（COPY），首次部署时需从镜像导出再替换后挂载
+    local _WG_IP_VAL _WP_PORT_VAL
+    _WG_IP_VAL=$(env_get "$DIR/.env" "WG_IP")
+    _WP_PORT_VAL=$(env_get "$DIR/.env" "WP_PORT"); _WP_PORT_VAL="${_WP_PORT_VAL:-80}"
+
+    if [[ ! -f "$DIR/conf/nginx-wp.conf" ]]; then
+        info "从镜像导出 nginx-wp.conf ..."
+        local _TMP_CID
+        _TMP_CID=$(docker create "${REGISTRY_HOST}/wordpress-site:${IMAGE_TAG}" sh 2>/dev/null)
+        if [[ -n "$_TMP_CID" ]]; then
+            docker cp "${_TMP_CID}:/etc/nginx/http.d/default.conf" "$DIR/conf/nginx-wp.conf" 2>/dev/null || true
+            docker rm -f "$_TMP_CID" &>/dev/null || true
+        fi
+    fi
+
+    if [[ -f "$DIR/conf/nginx-wp.conf" ]]; then
+        info "预替换 nginx-wp.conf 占位符 → ${_WG_IP_VAL}:${_WP_PORT_VAL}"
+        sed -i \
+            -e "s/__WG_IP__/${_WG_IP_VAL}/g" \
+            -e "s/__WP_PORT__/${_WP_PORT_VAL}/g" \
+            "$DIR/conf/nginx-wp.conf"
+        # 确保 worker compose 挂载了该文件
+        if ! grep -q "nginx-wp.conf" "$DIR/docker-compose.yml" 2>/dev/null; then
+            warn "docker-compose.yml 未挂载 nginx-wp.conf，请检查 _write_worker_compose 输出"
+        fi
+    else
+        warn "未能获取 nginx-wp.conf，nginx 将使用镜像内默认配置（含占位符）"
+    fi
+
     info "启动 / 更新容器..."
     if [[ "$IS_FIRST" == "true" ]]; then
         dc "$DIR" up -d              || error "容器启动失败"
@@ -1443,7 +1465,7 @@ interactive_menu() {
     while true; do
         echo ""
         _c "1;35" "========================================"
-        _c "1;35" "  WordPress 多节点分发管理 v4.7"
+        _c "1;35" "  WordPress 多节点分发管理 v4.8"
         _c "1;35" "  单容器全打包版（nginx+php+wordpress）"
         _c "1;35" "========================================"
         echo -e "  \e[36m── 仓库管理 ──────────────────────────\e[0m"
