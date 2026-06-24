@@ -654,11 +654,8 @@ _setup_plugins() {
 
         "${WP[@]}" config create \
             --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PW" \
-            --dbhost="$DB_HOST" --dbcharset=utf8mb4 \
-            --extra-php <<'PHP' || { warn "wp-config.php 创建失败，请检查数据库连接。"; return 1; }
-define('WP_MEMORY_LIMIT', '512M');
-define('WP_MAX_MEMORY_LIMIT', '1024M');
-PHP
+            --dbhost="$DB_HOST" --dbcharset=utf8mb4 --skip-check \
+            || { warn "wp-config.php 创建失败，请检查数据库连接。"; return 1; }
         dc "$DIR" exec -T wordpress sh -c \
             "echo \"require_once('/etc/wordpress/wp-config-extra.php');\" >> /var/www/html/wp-config.php" || true
         log "wp-config.php 已自动生成。"
@@ -1231,7 +1228,6 @@ cmd_pull_deploy() {
                 --dbname="$DB_NAME" --dbuser="$DB_USER" \
                 --dbpass="$DB_PW"   --dbhost="$DB_HOST" \
                 --dbcharset=utf8mb4 --path=/var/www/html \
-                --extra-php='define("WP_MEMORY_LIMIT","512M");' \
                 --skip-check 2>/dev/null \
             && dc "$DIR" exec -T wordpress sh -c \
                 "echo \"require_once('/etc/wordpress/wp-config-extra.php');\" >> /var/www/html/wp-config.php" \
