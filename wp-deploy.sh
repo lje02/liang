@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
-# v4.9
-#   变更: 移除所有 S3/对象存储相关代码（BREAKING）
-#         S3 插件在 WordPress 后台配置完成后随镜像打包分发，脚本不再介入
-#   继承 v4.8 全部修复
+# v5.0
+#   变更:
+#     [fix] nginx-wp.conf 始终写占位符，主/工作节点统一 sed 替换
+#     [fix] 语言包安装移至 _setup_plugins 末尾（菜单 11 也生效）
+#     [fix] 主题/插件语言包一并安装
+#     [new] Salts 本地生成、写入 .env，打包时注入 wp-config-extra.php
+#           确保多节点 cookie 互认
+#     [new] WP_DEBUG 显式关闭
+#     [new] 禁用内置 WP-Cron，主节点初始化后打印 crontab 提示
+#     [new] nginx 层 /health 健康检查端点
+#     继承 v4.9 全部修复
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
@@ -43,7 +50,6 @@ check_deps() {
     docker info &>/dev/null || error "Docker daemon 未运行或当前用户无权限"
 }
 
-# v4.7: 简化正则，覆盖 IPv4/IPv6/*:PORT 等所有 ss 输出格式
 check_port() {
     local IP="$1" PORT="$2"
     if ss -tlnp | awk '{print $4}' | grep -qE ":${PORT}$"; then
@@ -97,6 +103,12 @@ env_get() {
     grep "^${KEY}=" "$FILE" 2>/dev/null | cut -d= -f2- | head -1
 }
 
+# 本地生成 64 字符随机字符串，不依赖外网
+_gen_salt() {
+    LC_ALL=C tr -dc 'A-Za-z0-9!@#$%^&*()-_=+[]{}|;:,.<>?' \
+        < /dev/urandom 2>/dev/null | head -c 64; true
+}
+
 _register_node() {
     local IP="$1"
     if [[ ! "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -114,7 +126,7 @@ _register_node() {
 # 配置文件生成函数
 # ════════════════════════════════════════════════════════
 
-_write_supervisord_conf()  { cat > "$1" <<'CONF'
+_write_supervisord_conf() { cat > "$1" <<'CONF'
 [supervisord]
 nodaemon=true
 user=root
@@ -183,10 +195,12 @@ http {
 CONF
 }
 
+# v5.0: 始终写占位符 __WG_IP__ / __WP_PORT__
+# 调用方在宿主机用 sed 替换后再挂载或写入目标路径
+# 新增 /health 端点供网关探活
 _write_nginx_wp_conf() {
-    local DEST="$1" WG_IP="$2" WP_PORT="${3:-80}"
-    local TEMPLATE
-    TEMPLATE=$(cat <<'TEMPLATE'
+    local DEST="$1"
+    cat > "$DEST" <<'CONF'
 map $http_x_forwarded_proto $fastcgi_https {
     default "";
     https   "on";
@@ -197,6 +211,13 @@ server {
     root /var/www/html;
     index index.php index.html;
     client_max_body_size 2048M;
+
+    # 健康检查端点：纯 nginx 层响应，不经过 PHP-FPM
+    location = /health {
+        access_log off;
+        return 200 "ok";
+        add_header Content-Type text/plain;
+    }
 
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|webp|avif)$ {
         expires max;
@@ -232,17 +253,20 @@ server {
         deny all;
     }
 }
-TEMPLATE
-)
-    TEMPLATE="${TEMPLATE//__WG_IP__/${WG_IP:-__WG_IP__}}"
-    printf "%s" "${TEMPLATE//__WP_PORT__/${WP_PORT}}" > "$DEST"
+CONF
 }
 
-# v4.8: entrypoint 不再做任何 sed 替换。
-# 原因：Alpine 容器内 bind-mount 文件执行 sed -i 或 cp 均会因 rename(2) 跨设备失败
-# ("Resource busy" / "File exists") 导致容器无限重启。
-# 解决方案：nginx-wp.conf 在宿主机生成时就写入真实 IP/PORT（主节点），
-# 或在容器启动前由宿主机脚本预替换（工作节点），容器内无需再修改。
+# v5.0: 占位符替换，在宿主机对已生成的 nginx-wp.conf 执行
+# 用法: _sed_nginx_wp_conf <file> <wg_ip> <wp_port>
+_sed_nginx_wp_conf() {
+    local FILE="$1" WG_IP="$2" WP_PORT="$3"
+    sed -i \
+        -e "s/__WG_IP__/${WG_IP}/g" \
+        -e "s/__WP_PORT__/${WP_PORT}/g" \
+        "$FILE"
+}
+
+# v4.8: entrypoint 不再做任何 sed 替换（Alpine bind-mount rename(2) 跨设备问题）
 _write_entrypoint_script() {
     local DEST="$1"
     cat > "$DEST" <<'ENTRYPOINT'
@@ -296,17 +320,61 @@ security.limit_extensions = .php
 CONF
 }
 
-
+# v5.0:
+#   - 接收 salts 参数，写入 define()，确保多节点 cookie 互认
+#   - 显式关闭 WP_DEBUG
+#   - 禁用内置 WP-Cron（DISABLE_WP_CRON），由宿主机 cron 定时触发
+# 参数: $1=DEST $2=NODE_ROLE $3...$10=8个 salt 值（按 WP salt 顺序）
 _write_wp_config_extra() {
-    local DEST="$1" NODE_ROLE="${2:-worker}"
-    cat > "$DEST" <<'PHP_HEAD'
-<?php
-define('AUTOMATIC_UPDATER_DISABLED', true);
-define('WP_AUTO_UPDATE_CORE',        false);
-PHP_HEAD
-    [[ "$NODE_ROLE" == "worker" ]] && printf "define('DISALLOW_FILE_MODS', true);\n" >> "$DEST"
-    cat >> "$DEST" <<'PHP_BODY'
+    local DEST="$1"
+    local NODE_ROLE="${2:-worker}"
+    local AUTH_KEY="${3:-}"
+    local SECURE_AUTH_KEY="${4:-}"
+    local LOGGED_IN_KEY="${5:-}"
+    local NONCE_KEY="${6:-}"
+    local AUTH_SALT="${7:-}"
+    local SECURE_AUTH_SALT="${8:-}"
+    local LOGGED_IN_SALT="${9:-}"
+    local NONCE_SALT="${10:-}"
 
+    # 如果没有传入 salts（如老的调用路径），生成临时值并告警
+    if [[ -z "$AUTH_KEY" ]]; then
+        warn "_write_wp_config_extra: 未传入 salts，将生成随机值（各节点可能不一致）"
+        AUTH_KEY=$(_gen_salt); SECURE_AUTH_KEY=$(_gen_salt)
+        LOGGED_IN_KEY=$(_gen_salt); NONCE_KEY=$(_gen_salt)
+        AUTH_SALT=$(_gen_salt); SECURE_AUTH_SALT=$(_gen_salt)
+        LOGGED_IN_SALT=$(_gen_salt); NONCE_SALT=$(_gen_salt)
+    fi
+
+    # 写文件（不用 heredoc 以避免 salt 特殊字符需要转义）
+    {
+        printf '<?php\n'
+        printf '// === 自动生成，勿手动编辑 ===\n\n'
+
+        printf '// 安全认证密钥（多节点统一，确保 cookie 互认）\n'
+        printf "define('AUTH_KEY',         '%s');\n" "${AUTH_KEY//\'/\\\'}"
+        printf "define('SECURE_AUTH_KEY',  '%s');\n" "${SECURE_AUTH_KEY//\'/\\\'}"
+        printf "define('LOGGED_IN_KEY',    '%s');\n" "${LOGGED_IN_KEY//\'/\\\'}"
+        printf "define('NONCE_KEY',        '%s');\n" "${NONCE_KEY//\'/\\\'}"
+        printf "define('AUTH_SALT',        '%s');\n" "${AUTH_SALT//\'/\\\'}"
+        printf "define('SECURE_AUTH_SALT', '%s');\n" "${SECURE_AUTH_SALT//\'/\\\'}"
+        printf "define('LOGGED_IN_SALT',   '%s');\n" "${LOGGED_IN_SALT//\'/\\\'}"
+        printf "define('NONCE_SALT',       '%s');\n\n" "${NONCE_SALT//\'/\\\'}"
+
+        printf '// 更新与调试\n'
+        printf "define('AUTOMATIC_UPDATER_DISABLED', true);\n"
+        printf "define('WP_AUTO_UPDATE_CORE',        false);\n"
+        printf "define('WP_DEBUG',                   false);\n\n"
+
+        printf '// WP-Cron: 禁用内置触发，由宿主机 cron 调用 wp-cli\n'
+        printf "define('DISABLE_WP_CRON',    true);\n"
+        printf "define('ALTERNATE_WP_CRON',  false);\n\n"
+
+        if [[ "$NODE_ROLE" == "worker" ]]; then
+            printf "define('DISALLOW_FILE_MODS', true);\n\n"
+        fi
+
+        cat <<'PHP_BODY'
 function _wp_is_trusted_proxy(string $ip): bool {
     return (bool) preg_match(
         '/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/',
@@ -350,14 +418,13 @@ if (!defined('WP_REDIS_HOST')) {
 define('WP_MEMORY_LIMIT',     '512M');
 define('WP_MAX_MEMORY_LIMIT', '1024M');
 
-// v4.6: 加 !headers_sent() 防止 Warning
 if (extension_loaded('redis') && php_sapi_name() !== 'cli' && !headers_sent()) {
     ini_set('session.save_handler', 'redis');
     ini_set('session.save_path',
         'tcp://' . $_redis_host . ':6379?auth=' . urlencode($_redis_pw));
 }
-
 PHP_BODY
+    } > "$DEST"
 }
 
 _write_master_dockerfile() {
@@ -503,7 +570,6 @@ services:
 YAML
 }
 
-# v4.7: 补充 data/cache 挂载，与主节点 compose 对齐
 _write_worker_compose() {
     local DIR="$1"
     cat > "$DIR/docker-compose.yml" <<'YAML'
@@ -590,8 +656,17 @@ _setup_plugins() {
 
     info "等待 WordPress 容器就绪..."
     local RETRIES=30
-    local -a WP=(dc "$DIR" exec -T wordpress wp --allow-root)
-    while ! "${WP[@]}" cli version &>/dev/null; do
+    local -a WP_CMD
+    # 直接展开为完整命令数组，避免 function-in-array 的未定义行为
+    if docker compose version &>/dev/null 2>&1; then
+        WP_CMD=(docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env"
+                exec -T wordpress wp --allow-root)
+    else
+        WP_CMD=(docker-compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env"
+                exec -T wordpress wp --allow-root)
+    fi
+
+    while ! "${WP_CMD[@]}" cli version &>/dev/null; do
         sleep 3
         RETRIES=$((RETRIES - 1))
         [[ $RETRIES -le 0 ]] && { warn "容器未就绪，中止插件配置。"; return 1; }
@@ -605,7 +680,7 @@ _setup_plugins() {
         DB_PW=$(env_get "$DIR/.env" "WORDPRESS_DB_PASSWORD")
         DB_HOST=$(env_get "$DIR/.env" "DB_HOST")
 
-        "${WP[@]}" config create \
+        "${WP_CMD[@]}" config create \
             --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PW" \
             --dbhost="$DB_HOST" --dbcharset=utf8mb4 --skip-check \
             || { warn "wp-config.php 创建失败，请检查数据库连接。"; return 1; }
@@ -615,9 +690,9 @@ _setup_plugins() {
     fi
 
     if [[ "$IS_AUTO_INSTALL" == "true" ]]; then
-        if ! "${WP[@]}" core is-installed &>/dev/null; then
+        if ! "${WP_CMD[@]}" core is-installed &>/dev/null; then
             info "安装 WordPress 核心..."
-            "${WP[@]}" core install \
+            "${WP_CMD[@]}" core install \
                 --url="$URL" --title="$TITLE" \
                 --admin_user="$ADMIN" --admin_password="$PASS" \
                 --admin_email="$EMAIL" --locale="$LOCALE" --skip-email \
@@ -625,29 +700,35 @@ _setup_plugins() {
             log "WordPress 安装成功！"
             echo -e "  站点: \e[32m${URL}\e[0m"
             echo -e "  账号: \e[32m${ADMIN}\e[0m / 密码: \e[32m${PASS}\e[0m"
-
-            if [[ "$LOCALE" != "en_US" && -n "$LOCALE" ]]; then
-                info "安装语言包: ${LOCALE}..."
-                "${WP[@]}" language core install "$LOCALE" 2>/dev/null || true
-                "${WP[@]}" option update WPLANG "$LOCALE" || true
-                local ADMIN_ID
-                ADMIN_ID=$("${WP[@]}" user get "$ADMIN" --field=ID 2>/dev/null || echo "1")
-                "${WP[@]}" user meta update "$ADMIN_ID" locale "$LOCALE" 2>/dev/null || true
-                log "界面语言已设为 ${LOCALE}"
-            fi
         else
             log "数据库已有数据，跳过安装。"
         fi
+    fi
+
+    # v5.0: 语言包安装移至此处，IS_AUTO_INSTALL 分支外
+    # 菜单 11 重试时也会执行
+    if [[ -n "$LOCALE" && "$LOCALE" != "en_US" ]]; then
+        info "安装语言包: ${LOCALE}..."
+        "${WP_CMD[@]}" language core install   "$LOCALE" 2>/dev/null || true
+        "${WP_CMD[@]}" language theme  install --all "$LOCALE" 2>/dev/null || true
+        "${WP_CMD[@]}" language plugin install --all "$LOCALE" 2>/dev/null || true
+        "${WP_CMD[@]}" option update WPLANG "$LOCALE" || true
+        if [[ -n "$ADMIN" ]]; then
+            local ADMIN_ID
+            ADMIN_ID=$("${WP_CMD[@]}" user get "$ADMIN" --field=ID 2>/dev/null || echo "1")
+            "${WP_CMD[@]}" user meta update "$ADMIN_ID" locale "$LOCALE" 2>/dev/null || true
+        fi
+        log "界面语言已设为 ${LOCALE}"
     fi
 
     info "修复文件权限..."
     dc "$DIR" exec -T wordpress chown -R www-data:www-data /var/www/html/wp-content || true
 
     info "配置 Redis 插件..."
-    if "${WP[@]}" plugin is-installed redis-cache &>/dev/null; then
-        "${WP[@]}" plugin activate redis-cache || warn "Redis 插件激活失败"
+    if "${WP_CMD[@]}" plugin is-installed redis-cache &>/dev/null; then
+        "${WP_CMD[@]}" plugin activate redis-cache || warn "Redis 插件激活失败"
     else
-        "${WP[@]}" plugin install redis-cache --activate || warn "Redis 插件安装失败"
+        "${WP_CMD[@]}" plugin install redis-cache --activate || warn "Redis 插件安装失败"
     fi
 
     info "探测 Redis 连通性..."
@@ -655,7 +736,7 @@ _setup_plugins() {
     REDIS_HOST_VAL=$(env_get "$DIR/.env" "REDIS_HOST")
     local PROBE="\$c=@fsockopen('${REDIS_HOST_VAL}',6379,\$e,\$s,5);if(\$c){fclose(\$c);exit(0);}exit(1);"
     if dc "$DIR" exec -T wordpress php -r "$PROBE" 2>/dev/null; then
-        "${WP[@]}" redis enable && log "Redis 对象缓存已启用！" || warn "redis enable 失败"
+        "${WP_CMD[@]}" redis enable && log "Redis 对象缓存已启用！" || warn "redis enable 失败"
     else
         warn "无法连接 Redis (${REDIS_HOST_VAL}:6379)，跳过启用"
     fi
@@ -833,6 +914,19 @@ cmd_master_init() {
     check_network "${DB_HOST}:3306" "${REDIS_HOST}:6379" || true
     check_port "$WG_IP" "$WP_PORT"
 
+    # v5.0: 生成统一 Salts，写入 .env 供后续 cmd_push 打包使用
+    info "生成 WordPress Salts..."
+    local S_AUTH_KEY S_SECURE_AUTH_KEY S_LOGGED_IN_KEY S_NONCE_KEY
+    local S_AUTH_SALT S_SECURE_AUTH_SALT S_LOGGED_IN_SALT S_NONCE_SALT
+    S_AUTH_KEY=$(_gen_salt)
+    S_SECURE_AUTH_KEY=$(_gen_salt)
+    S_LOGGED_IN_KEY=$(_gen_salt)
+    S_NONCE_KEY=$(_gen_salt)
+    S_AUTH_SALT=$(_gen_salt)
+    S_SECURE_AUTH_SALT=$(_gen_salt)
+    S_LOGGED_IN_SALT=$(_gen_salt)
+    S_NONCE_SALT=$(_gen_salt)
+
     mkdir -p "$DIR"/{data/uploads,data/cache,conf,logs}
 
     {
@@ -850,16 +944,27 @@ cmd_master_init() {
         printf 'NODE_ROLE=master\n'
         printf 'CF_ZONE_ID=%s\n'            "${CF_ZONE_ID}"
         printf 'CF_TOKEN=%s\n'              "${CF_TOKEN}"
+        printf 'WP_AUTH_KEY=%s\n'           "${S_AUTH_KEY}"
+        printf 'WP_SECURE_AUTH_KEY=%s\n'    "${S_SECURE_AUTH_KEY}"
+        printf 'WP_LOGGED_IN_KEY=%s\n'      "${S_LOGGED_IN_KEY}"
+        printf 'WP_NONCE_KEY=%s\n'          "${S_NONCE_KEY}"
+        printf 'WP_AUTH_SALT=%s\n'          "${S_AUTH_SALT}"
+        printf 'WP_SECURE_AUTH_SALT=%s\n'   "${S_SECURE_AUTH_SALT}"
+        printf 'WP_LOGGED_IN_SALT=%s\n'     "${S_LOGGED_IN_SALT}"
+        printf 'WP_NONCE_SALT=%s\n'         "${S_NONCE_SALT}"
     } > "$DIR/.env"
     chmod 600 "$DIR/.env"
 
     _write_nginx_main_conf    "$DIR/conf/nginx.conf"
-    _write_nginx_wp_conf      "$DIR/conf/nginx-wp.conf" "$WG_IP" "$WP_PORT"
+    _write_nginx_wp_conf      "$DIR/conf/nginx-wp.conf"
+    _sed_nginx_wp_conf        "$DIR/conf/nginx-wp.conf" "$WG_IP" "$WP_PORT"
     _write_php_uploads_ini    "$DIR/conf/php-uploads.ini"
     _write_opcache_ini        "$DIR/conf/opcache.ini"
     _write_php_fpm_www_conf   "$DIR/conf/php-fpm-www.conf"
     _write_supervisord_conf   "$DIR/conf/supervisord.conf"
-    _write_wp_config_extra    "$DIR/conf/wp-config-extra.php" "master"
+    _write_wp_config_extra    "$DIR/conf/wp-config-extra.php" "master" \
+        "$S_AUTH_KEY" "$S_SECURE_AUTH_KEY" "$S_LOGGED_IN_KEY" "$S_NONCE_KEY" \
+        "$S_AUTH_SALT" "$S_SECURE_AUTH_SALT" "$S_LOGGED_IN_SALT" "$S_NONCE_SALT"
     _write_init_dockerfile    "$DIR"
     _write_entrypoint_script  "$DIR/entrypoint.sh"
     _write_init_compose       "$DIR"
@@ -877,6 +982,12 @@ cmd_master_init() {
     echo -e "  内网访问: \e[33mhttp://${WG_IP}\e[0m"
     echo -e "  站点:     \e[33m${WP_URL}\e[0m"
     echo -e "  账号:     \e[32m${WP_ADMIN}\e[0m / \e[32m${WP_PASS}\e[0m"
+    echo ""
+    _c "1;33" ">>> WP-Cron 定时任务提示 <<<"
+    echo -e "  内置 WP-Cron 已禁用，请在\e[33m某一台节点宿主机\e[0m添加以下 crontab："
+    echo -e "  \e[36m*/5 * * * * docker exec \$(docker ps -qf name=wordpress) wp --allow-root cron event run --due-now --path=/var/www/html >/dev/null 2>&1\e[0m"
+    echo -e "  或使用 crontab -e 添加，建议选主节点执行。"
+    echo ""
     echo -e "  \e[36m在后台完成主题/插件配置后，执行菜单 3（打包推送）分发到工作节点。\e[0m"
 }
 
@@ -898,7 +1009,6 @@ cmd_push() {
     local IMAGE_TAG="v$(date +%Y%m%d%H%M)"
     local IMAGE_BASE="${REGISTRY_HOST}/wordpress-site"
 
-    # v4.7: 版本信息从运行容器读取，容器是事实来源
     local CID
     CID=$(docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" ps -q wordpress 2>/dev/null || true)
     [[ -n "$CID" ]] || error "wordpress 容器未运行，请先启动主节点（菜单 8）再推送"
@@ -935,12 +1045,10 @@ cmd_push() {
     }
     trap '_push_cleanup' RETURN ERR
 
-    # v4.7: 从运行容器 docker cp 导出，不依赖宿主机目录结构
     info "从容器导出 WordPress 核心文件..."
     mkdir -p "$BUILD_DIR/wp-core" "$BUILD_DIR/wp-content/themes" "$BUILD_DIR/wp-content/plugins"
 
     docker cp "${CID}:/var/www/html/." "$BUILD_DIR/wp-core/"
-    # 剥离 wp-content（单独处理）、wp-config.php（不能进镜像）
     rm -rf "$BUILD_DIR/wp-core/wp-content" \
            "$BUILD_DIR/wp-core/wp-config.php" \
            "$BUILD_DIR/wp-core/wp-config-sample.php"
@@ -948,18 +1056,58 @@ cmd_push() {
     info "导出主题和插件..."
     docker cp "${CID}:/var/www/html/wp-content/themes/."  "$BUILD_DIR/wp-content/themes/"
     docker cp "${CID}:/var/www/html/wp-content/plugins/." "$BUILD_DIR/wp-content/plugins/"
-    # docker cp 不支持 --exclude，手动清理运行时目录
     rm -rf "$BUILD_DIR/wp-content/uploads" \
            "$BUILD_DIR/wp-content/cache"
 
-    info "生成配置文件..."
+    # v5.0: 从主节点 .env 读取 salts，打包进镜像内的 wp-config-extra.php
+    # 确保所有工作节点与主节点使用相同 salts，cookie 互认
+    info "读取 Salts 并生成配置文件..."
+    local P_AUTH_KEY P_SECURE_AUTH_KEY P_LOGGED_IN_KEY P_NONCE_KEY
+    local P_AUTH_SALT P_SECURE_AUTH_SALT P_LOGGED_IN_SALT P_NONCE_SALT
+    P_AUTH_KEY=$(env_get          "$DIR/.env" "WP_AUTH_KEY")
+    P_SECURE_AUTH_KEY=$(env_get   "$DIR/.env" "WP_SECURE_AUTH_KEY")
+    P_LOGGED_IN_KEY=$(env_get     "$DIR/.env" "WP_LOGGED_IN_KEY")
+    P_NONCE_KEY=$(env_get         "$DIR/.env" "WP_NONCE_KEY")
+    P_AUTH_SALT=$(env_get         "$DIR/.env" "WP_AUTH_SALT")
+    P_SECURE_AUTH_SALT=$(env_get  "$DIR/.env" "WP_SECURE_AUTH_SALT")
+    P_LOGGED_IN_SALT=$(env_get    "$DIR/.env" "WP_LOGGED_IN_SALT")
+    P_NONCE_SALT=$(env_get        "$DIR/.env" "WP_NONCE_SALT")
+
+    if [[ -z "$P_AUTH_KEY" ]]; then
+        warn ".env 中未找到 Salts（旧版部署？），将生成新 Salts 并写回 .env"
+        P_AUTH_KEY=$(_gen_salt);        P_SECURE_AUTH_KEY=$(_gen_salt)
+        P_LOGGED_IN_KEY=$(_gen_salt);   P_NONCE_KEY=$(_gen_salt)
+        P_AUTH_SALT=$(_gen_salt);       P_SECURE_AUTH_SALT=$(_gen_salt)
+        P_LOGGED_IN_SALT=$(_gen_salt);  P_NONCE_SALT=$(_gen_salt)
+        {
+            printf 'WP_AUTH_KEY=%s\n'          "${P_AUTH_KEY}"
+            printf 'WP_SECURE_AUTH_KEY=%s\n'   "${P_SECURE_AUTH_KEY}"
+            printf 'WP_LOGGED_IN_KEY=%s\n'     "${P_LOGGED_IN_KEY}"
+            printf 'WP_NONCE_KEY=%s\n'         "${P_NONCE_KEY}"
+            printf 'WP_AUTH_SALT=%s\n'         "${P_AUTH_SALT}"
+            printf 'WP_SECURE_AUTH_SALT=%s\n'  "${P_SECURE_AUTH_SALT}"
+            printf 'WP_LOGGED_IN_SALT=%s\n'    "${P_LOGGED_IN_SALT}"
+            printf 'WP_NONCE_SALT=%s\n'        "${P_NONCE_SALT}"
+        } >> "$DIR/.env"
+        # 同步更新主节点本地的 wp-config-extra.php
+        _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master" \
+            "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
+            "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT"
+        warn "主节点容器需重启后 salts 才会生效：菜单 10 → 重启节点"
+    fi
+
     mkdir -p "$BUILD_DIR/conf"
     _write_nginx_main_conf   "$BUILD_DIR/conf/nginx.conf"
-    _write_nginx_wp_conf     "$BUILD_DIR/conf/nginx-wp.conf" "" ""
+    _write_nginx_wp_conf     "$BUILD_DIR/conf/nginx-wp.conf"
+    # 镜像内保留占位符，工作节点 cmd_pull_deploy 拿到后 sed 替换再挂载
     _write_php_uploads_ini   "$BUILD_DIR/conf/php-uploads.ini"
     _write_opcache_ini       "$BUILD_DIR/conf/opcache.ini"
     _write_php_fpm_www_conf  "$BUILD_DIR/conf/php-fpm-www.conf"
     _write_supervisord_conf  "$BUILD_DIR/conf/supervisord.conf"
+    # worker 角色 + 统一 salts
+    _write_wp_config_extra   "$BUILD_DIR/conf/wp-config-extra.php" "worker" \
+        "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
+        "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT"
     _write_entrypoint_script "$BUILD_DIR/entrypoint.sh"
     _write_master_dockerfile "$BUILD_DIR"
 
@@ -1070,7 +1218,8 @@ cmd_pull_deploy() {
             printf 'CF_TOKEN=%s\n'              "${CF_TOKEN}"
         } > "$DIR/.env"
         chmod 600 "$DIR/.env"
-        _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "worker"
+        # worker 的 wp-config-extra.php 来自镜像内（已打包 salts），此处生成占位版备用
+        # 实际挂载的是从镜像导出后覆盖写入的版本（见下方 docker cp 流程）
         _write_worker_compose  "$DIR"
         _register_node "$WG_IP"
     fi
@@ -1100,6 +1249,21 @@ cmd_pull_deploy() {
     info "拉取镜像: ${IMAGE_FULL} ..."
     docker pull "$IMAGE_FULL" || error "镜像拉取失败"
 
+    # v5.0: 从镜像导出 wp-config-extra.php（含 salts）到宿主机 conf/
+    # 这是权威版本，不在宿主机重新生成，确保与打包时一致
+    info "从镜像导出 wp-config-extra.php（含统一 Salts）..."
+    local _TMP_CID
+    _TMP_CID=$(docker create "${IMAGE_FULL}" sh 2>/dev/null || true)
+    if [[ -n "$_TMP_CID" ]]; then
+        docker cp "${_TMP_CID}:/etc/wordpress/wp-config-extra.php" \
+            "$DIR/conf/wp-config-extra.php" 2>/dev/null \
+        && log "  wp-config-extra.php 已导出" \
+        || warn "  wp-config-extra.php 导出失败，将使用已有版本"
+        docker rm -f "$_TMP_CID" &>/dev/null || true
+    else
+        warn "无法创建临时容器，跳过 wp-config-extra.php 导出"
+    fi
+
     if [[ ! -f "$DIR/conf/wp-config.php" ]]; then
         info "预启动容器以生成 wp-config.php ..."
         if [[ ! -f "$DIR/docker-compose.yml" ]]; then
@@ -1114,7 +1278,6 @@ cmd_pull_deploy() {
         done
 
         if dc "$DIR" exec -T wordpress sh -c 'command -v wp' &>/dev/null; then
-            # v4.7: 用 CID 变量而非命令替换嵌套，避免 docker cp 找不到容器
             local CID
             CID=$(docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" ps -q wordpress)
             dc "$DIR" exec -T wordpress wp --allow-root config create \
@@ -1131,29 +1294,25 @@ cmd_pull_deploy() {
         fi
     fi
 
-    # v4.8: 宿主机预替换 nginx-wp.conf 占位符，容器内 entrypoint 不再做 sed
-    # 工作节点 nginx-wp.conf 来自镜像内（COPY），首次部署时需从镜像导出再替换后挂载
+    # v5.0: 统一占位符替换逻辑（主/工作节点一致）
     local _WG_IP_VAL _WP_PORT_VAL
     _WG_IP_VAL=$(env_get "$DIR/.env" "WG_IP")
     _WP_PORT_VAL=$(env_get "$DIR/.env" "WP_PORT"); _WP_PORT_VAL="${_WP_PORT_VAL:-80}"
 
     if [[ ! -f "$DIR/conf/nginx-wp.conf" ]]; then
         info "从镜像导出 nginx-wp.conf ..."
-        local _TMP_CID
-        _TMP_CID=$(docker create "${REGISTRY_HOST}/wordpress-site:${IMAGE_TAG}" sh 2>/dev/null)
-        if [[ -n "$_TMP_CID" ]]; then
-            docker cp "${_TMP_CID}:/etc/nginx/http.d/default.conf" "$DIR/conf/nginx-wp.conf" 2>/dev/null || true
-            docker rm -f "$_TMP_CID" &>/dev/null || true
+        local _TMP_CID2
+        _TMP_CID2=$(docker create "${IMAGE_FULL}" sh 2>/dev/null || true)
+        if [[ -n "$_TMP_CID2" ]]; then
+            docker cp "${_TMP_CID2}:/etc/nginx/http.d/default.conf" \
+                "$DIR/conf/nginx-wp.conf" 2>/dev/null || true
+            docker rm -f "$_TMP_CID2" &>/dev/null || true
         fi
     fi
 
     if [[ -f "$DIR/conf/nginx-wp.conf" ]]; then
-        info "预替换 nginx-wp.conf 占位符 → ${_WG_IP_VAL}:${_WP_PORT_VAL}"
-        sed -i \
-            -e "s/__WG_IP__/${_WG_IP_VAL}/g" \
-            -e "s/__WP_PORT__/${_WP_PORT_VAL}/g" \
-            "$DIR/conf/nginx-wp.conf"
-        # 确保 worker compose 挂载了该文件
+        info "替换 nginx-wp.conf 占位符 → ${_WG_IP_VAL}:${_WP_PORT_VAL}"
+        _sed_nginx_wp_conf "$DIR/conf/nginx-wp.conf" "$_WG_IP_VAL" "$_WP_PORT_VAL"
         if ! grep -q "nginx-wp.conf" "$DIR/docker-compose.yml" 2>/dev/null; then
             warn "docker-compose.yml 未挂载 nginx-wp.conf，请检查 _write_worker_compose 输出"
         fi
@@ -1181,6 +1340,7 @@ cmd_pull_deploy() {
     local WG_IP_SHOW; WG_IP_SHOW=$(env_get "$DIR/.env" "WG_IP")
     echo -e "  镜像版本: \e[32m${IMAGE_TAG}\e[0m"
     echo -e "  内网访问: \e[33mhttp://${WG_IP_SHOW}\e[0m"
+    echo -e "  健康检查: \e[36mhttp://${WG_IP_SHOW}:${_WP_PORT_VAL}/health\e[0m"
 }
 
 # ════════════════════════════════════════════════════════
@@ -1254,6 +1414,10 @@ cmd_status() {
     echo -e "  WordPress 版本: \e[36m${WP_VER}\e[0m"
     echo -e "  当前镜像版本:   \e[32m$(env_get "$DIR/.env" IMAGE_TAG)\e[0m"
     echo -e "  仓库地址:       \e[36m$(env_get "$DIR/.env" REGISTRY_HOST)\e[0m"
+    local _WG _PORT
+    _WG=$(env_get "$DIR/.env" WG_IP)
+    _PORT=$(env_get "$DIR/.env" WP_PORT); _PORT="${_PORT:-80}"
+    echo -e "  健康检查:       \e[36mhttp://${_WG}:${_PORT}/health\e[0m"
 }
 
 cmd_logs() {
@@ -1295,7 +1459,10 @@ cmd_retry_plugins() {
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     dc "$DIR" ps --services --filter status=running | grep -q "wordpress" \
         || { warn "wordpress 容器未运行，请先启动。"; return; }
-    _setup_plugins "$DIR" "false" || warn "插件配置未完全成功。"
+    local _LOCALE
+    _LOCALE=$(env_get "$DIR/.env" "WP_LOCALE" 2>/dev/null || echo "zh_CN")
+    _setup_plugins "$DIR" "false" "" "" "" "" "" "${_LOCALE:-zh_CN}" \
+        || warn "插件配置未完全成功。"
 }
 
 cmd_flush() {
@@ -1327,7 +1494,7 @@ interactive_menu() {
     while true; do
         echo ""
         _c "1;35" "========================================"
-        _c "1;35" "  WordPress 多节点分发管理 v4.8"
+        _c "1;35" "  WordPress 多节点分发管理 v5.0"
         _c "1;35" "  单容器全打包版（nginx+php+wordpress）"
         _c "1;35" "========================================"
         echo -e "  \e[36m── 仓库管理 ──────────────────────────\e[0m"
@@ -1339,12 +1506,12 @@ interactive_menu() {
         echo -e "  \e[32m 4.\e[0m 拉取部署 / 更新（首次 + 后续统一入口）"
         echo -e "  \e[33m 5.\e[0m 镜像回滚"
         echo -e "  \e[36m── 日常运维 ──────────────────────────\e[0m"
-        echo -e "  \e[32m 6.\e[0m 查看状态（含 WP 版本）"
+        echo -e "  \e[32m 6.\e[0m 查看状态（含 WP 版本 + 健康检查地址）"
         echo -e "  \e[32m 7.\e[0m 查看日志"
         echo -e "  \e[32m 8.\e[0m 启动节点"
         echo -e "  \e[32m 9.\e[0m 停止节点"
         echo -e "  \e[32m10.\e[0m 重启节点"
-        echo -e "  \e[33m11.\e[0m 重试插件配置"
+        echo -e "  \e[33m11.\e[0m 重试插件配置 / 补装语言包"
         echo -e "  \e[33m12.\e[0m 手动刷新全层缓存"
         echo -e "  \e[36m13.\e[0m 节点列表管理"
         echo -e "  \e[31m14.\e[0m 删除节点（不可恢复）"
