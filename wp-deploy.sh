@@ -731,18 +731,18 @@ cmd_registry() {
     local WG_IP
     WG_IP=$(get_wg_ip)
 
-    read -rp "仓库监听端口 [默认: 5000]: " REG_PORT
+    read -rp "仓库监听端口 [默认: 5000]: " REG_PORT || true
     REG_PORT="${REG_PORT:-5000}"
     [[ "$REG_PORT" =~ ^[0-9]+$ ]] || error "无效端口"
     (( REG_PORT >= 1 && REG_PORT <= 65535 )) || error "端口范围必须在 1-65535 之间"
     check_port "$WG_IP" "$REG_PORT"
 
-    read -rp "仓库认证用户名 [默认: wpregistry]: " REG_USER
+    read -rp "仓库认证用户名 [默认: wpregistry]: " REG_USER || true
     REG_USER="${REG_USER:-wpregistry}"
     local REG_PASS=""
     read_secret "仓库认证密码 [留空随机生成]: " REG_PASS
     if [[ -z "$REG_PASS" ]]; then
-        REG_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)
+        REG_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 20; true)
         info "已生成随机密码: ${REG_PASS}"
     fi
 
@@ -843,39 +843,39 @@ EOF
 # ════════════════════════════════════════════════════════
 cmd_master_init() {
     header "主节点初始化（全自动建站）"
-    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR
+    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR || true
     DIR="${DIR:-$DEFAULT_DIR}"
 
     info "--- 站点配置 ---"
-    read -rp "站点 URL（如 https://example.com）: " WP_URL
+    read -rp "站点 URL（如 https://example.com）: " WP_URL || true
     [[ -z "$WP_URL" ]] && error "URL 不能为空"
-    read -rp "站点名称 [默认: My WordPress]: " WP_TITLE
+    read -rp "站点名称 [默认: My WordPress]: " WP_TITLE || true
     WP_TITLE="${WP_TITLE:-My WordPress}"
-    read -rp "安装语言 [默认: zh_CN]: " WP_LOCALE
+    read -rp "安装语言 [默认: zh_CN]: " WP_LOCALE || true
     WP_LOCALE="${WP_LOCALE:-zh_CN}"
-    read -rp "管理员用户名 [默认: wpadmin]: " WP_ADMIN
+    read -rp "管理员用户名 [默认: wpadmin]: " WP_ADMIN || true
     WP_ADMIN="${WP_ADMIN:-wpadmin}"
     local WP_PASS=""
     read_secret "管理员密码 [留空随机生成]: " WP_PASS
     if [[ -z "$WP_PASS" ]]; then
-        WP_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()' < /dev/urandom | head -c 16)
+        WP_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()' < /dev/urandom 2>/dev/null | head -c 16; true)
         info "已生成随机密码: ${WP_PASS}"
     fi
-    read -rp "管理员邮箱 [默认: admin@example.com]: " WP_EMAIL
+    read -rp "管理员邮箱 [默认: admin@example.com]: " WP_EMAIL || true
     WP_EMAIL="${WP_EMAIL:-admin@example.com}"
 
     info "--- 数据库 ---"
-    read -rp "MariaDB WireGuard IP: " DB_HOST
+    read -rp "MariaDB WireGuard IP: " DB_HOST || true
     [[ -z "$DB_HOST" ]] && error "数据库 IP 不能为空"
     DB_HOST="${DB_HOST%%:*}"
-    read -rp "数据库名 [默认: wordpress]: " DB_NAME; DB_NAME="${DB_NAME:-wordpress}"
-    read -rp "数据库用户名 [默认: wpuser]: " DB_USER; DB_USER="${DB_USER:-wpuser}"
+    read -rp "数据库名 [默认: wordpress]: " DB_NAME; DB_NAME="${DB_NAME:-wordpress}" || true
+    read -rp "数据库用户名 [默认: wpuser]: " DB_USER; DB_USER="${DB_USER:-wpuser}" || true
     local DB_PW=""
     read_secret "数据库密码: " DB_PW
     [[ -z "$DB_PW" ]] && error "数据库密码不能为空"
 
     info "--- Redis ---"
-    read -rp "Redis WireGuard IP [默认同数据库 ${DB_HOST}]: " REDIS_HOST
+    read -rp "Redis WireGuard IP [默认同数据库 ${DB_HOST}]: " REDIS_HOST || true
     REDIS_HOST="${REDIS_HOST:-$DB_HOST}"; REDIS_HOST="${REDIS_HOST%%:*}"
     local REDIS_PW=""
     read_secret "Redis 密码: " REDIS_PW
@@ -883,29 +883,29 @@ cmd_master_init() {
 
     info "--- 对象存储 ---"
     echo "  1. AWS S3  2. Cloudflare R2  3. 其他 S3 兼容"
-    read -rp "选择 [默认: 1]: " S3_CHOICE
+    read -rp "选择 [默认: 1]: " S3_CHOICE || true
     local S3_PROVIDER="aws" S3_ENDPOINT="" S3_REGION=""
     case "${S3_CHOICE:-1}" in
         2) S3_PROVIDER="cloudflare"
-           read -rp "R2 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint"
-           read -rp "区域 [默认: auto]: " S3_REGION; S3_REGION="${S3_REGION:-auto}" ;;
+           read -rp "R2 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint" || true
+           read -rp "区域 [默认: auto]: " S3_REGION || true; S3_REGION="${S3_REGION:-auto}" ;;
         3) S3_PROVIDER="other"
-           read -rp "自定义 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint"
-           read -rp "区域 [默认: us-east-1]: " S3_REGION; S3_REGION="${S3_REGION:-us-east-1}" ;;
-        *) read -rp "区域 [默认: us-east-1]: " S3_REGION; S3_REGION="${S3_REGION:-us-east-1}" ;;
+           read -rp "自定义 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint" || true
+           read -rp "区域 [默认: us-east-1]: " S3_REGION || true; S3_REGION="${S3_REGION:-us-east-1}" ;;
+        *) read -rp "区域 [默认: us-east-1]: " S3_REGION || true; S3_REGION="${S3_REGION:-us-east-1}" ;;
     esac
-    read -rp "存储桶名称: " S3_BUCKET; [[ -z "$S3_BUCKET" ]] && error "桶名不能为空"
+    read -rp "存储桶名称: " S3_BUCKET; [[ -z "$S3_BUCKET" ]] && error "桶名不能为空" || true
     local S3_KEY="" S3_SECRET=""
     read_secret "S3 Access Key ID: " S3_KEY; [[ -z "$S3_KEY" ]] && error "S3 Key 不能为空"
     read_secret "S3 Secret Access Key: " S3_SECRET; [[ -z "$S3_SECRET" ]] && error "S3 Secret 不能为空"
-    read -rp "CDN 域名（留空跳过）: " S3_CDN_DOMAIN; S3_CDN_DOMAIN="${S3_CDN_DOMAIN:-}"
+    read -rp "CDN 域名（留空跳过）: " S3_CDN_DOMAIN; S3_CDN_DOMAIN="${S3_CDN_DOMAIN:-}" || true
 
     info "--- 私有镜像仓库 ---"
-    read -rp "Registry 地址（如 10.10.0.1:5000）: " REGISTRY_HOST
+    read -rp "Registry 地址（如 10.10.0.1:5000）: " REGISTRY_HOST || true
     [[ -z "$REGISTRY_HOST" ]] && error "Registry 地址不能为空"
 
     info "--- Cloudflare（可选）---"
-    read -rp "CF Zone ID（留空跳过）: " CF_ZONE_ID; CF_ZONE_ID="${CF_ZONE_ID:-}"
+    read -rp "CF Zone ID（留空跳过）: " CF_ZONE_ID; CF_ZONE_ID="${CF_ZONE_ID:-}" || true
     local CF_TOKEN=""
     [[ -n "$CF_ZONE_ID" ]] && read_secret "CF API Token: " CF_TOKEN
 
@@ -977,7 +977,7 @@ cmd_master_init() {
 # ════════════════════════════════════════════════════════
 cmd_push() {
     header "打包推送镜像到私有仓库"
-    read -rp "主节点目录 [默认: ${DEFAULT_DIR}]: " DIR
+    read -rp "主节点目录 [默认: ${DEFAULT_DIR}]: " DIR || true
     DIR="${DIR:-$DEFAULT_DIR}"
     [[ -f "$DIR/.env" ]] || error "未找到 .env：${DIR}"
 
@@ -1003,7 +1003,7 @@ cmd_push() {
     echo "  插件数量:       ${PLUGINS_COUNT} 个"
     echo "  镜像 tag:       ${IMAGE_TAG}"
     echo ""
-    read -rp "确认打包推送？[y/N]: " CONFIRM
+    read -rp "确认打包推送？[y/N]: " CONFIRM || true
     [[ "${CONFIRM,,}" == "y" ]] || { info "已取消"; return; }
 
     local BUILD_DIR
@@ -1055,7 +1055,7 @@ cmd_push() {
         REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
         REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
     else
-        read -rp "仓库用户名: " REG_USER
+        read -rp "仓库用户名: " REG_USER || true
         read_secret "仓库密码: " REG_PASS
     fi
     docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" \
@@ -1089,7 +1089,7 @@ cmd_push() {
 # ════════════════════════════════════════════════════════
 cmd_pull_deploy() {
     header "工作节点拉取部署 / 更新"
-    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR
+    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR || true
     DIR="${DIR:-$DEFAULT_DIR}"
 
     local IS_FIRST=false
@@ -1104,46 +1104,46 @@ cmd_pull_deploy() {
         info "未检测到 .env，进入首次部署配置..."
 
         info "--- 数据库 ---"
-        read -rp "MariaDB WireGuard IP: " DB_HOST
+        read -rp "MariaDB WireGuard IP: " DB_HOST || true
         [[ -z "$DB_HOST" ]] && error "数据库 IP 不能为空"
         DB_HOST="${DB_HOST%%:*}"
-        read -rp "数据库名 [默认: wordpress]: " DB_NAME; DB_NAME="${DB_NAME:-wordpress}"
-        read -rp "数据库用户名 [默认: wpuser]: " DB_USER; DB_USER="${DB_USER:-wpuser}"
+        read -rp "数据库名 [默认: wordpress]: " DB_NAME; DB_NAME="${DB_NAME:-wordpress}" || true
+        read -rp "数据库用户名 [默认: wpuser]: " DB_USER; DB_USER="${DB_USER:-wpuser}" || true
         read_secret "数据库密码: " DB_PW; [[ -z "$DB_PW" ]] && error "数据库密码不能为空"
 
         info "--- Redis ---"
-        read -rp "Redis WireGuard IP [默认: ${DB_HOST}]: " REDIS_HOST
+        read -rp "Redis WireGuard IP [默认: ${DB_HOST}]: " REDIS_HOST || true
         REDIS_HOST="${REDIS_HOST:-$DB_HOST}"; REDIS_HOST="${REDIS_HOST%%:*}"
         read_secret "Redis 密码: " REDIS_PW; [[ -z "$REDIS_PW" ]] && error "Redis 密码不能为空"
 
         info "--- 对象存储 ---"
         echo "  1. AWS S3   2. Cloudflare R2   3. 其他 S3 兼容"
-        read -rp "选择 [默认: 1]: " S3_CHOICE
+        read -rp "选择 [默认: 1]: " S3_CHOICE || true
         S3_PROVIDER="aws"; S3_ENDPOINT=""; S3_REGION=""
         case "${S3_CHOICE:-1}" in
             2) S3_PROVIDER="cloudflare"
-               read -rp "R2 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint"
-               read -rp "区域 [默认: auto]: " S3_REGION; S3_REGION="${S3_REGION:-auto}" ;;
+               read -rp "R2 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint" || true
+               read -rp "区域 [默认: auto]: " S3_REGION || true; S3_REGION="${S3_REGION:-auto}" ;;
             3) S3_PROVIDER="other"
-               read -rp "自定义 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint"
-               read -rp "区域 [默认: us-east-1]: " S3_REGION; S3_REGION="${S3_REGION:-us-east-1}" ;;
-            *) read -rp "区域 [默认: us-east-1]: " S3_REGION; S3_REGION="${S3_REGION:-us-east-1}" ;;
+               read -rp "自定义 Endpoint URL: " S3_ENDPOINT; [[ -z "$S3_ENDPOINT" ]] && error "必须填写 Endpoint" || true
+               read -rp "区域 [默认: us-east-1]: " S3_REGION || true; S3_REGION="${S3_REGION:-us-east-1}" ;;
+            *) read -rp "区域 [默认: us-east-1]: " S3_REGION || true; S3_REGION="${S3_REGION:-us-east-1}" ;;
         esac
-        read -rp "存储桶名称: " S3_BUCKET; [[ -z "$S3_BUCKET" ]] && error "桶名不能为空"
+        read -rp "存储桶名称: " S3_BUCKET; [[ -z "$S3_BUCKET" ]] && error "桶名不能为空" || true
         read_secret "S3 Access Key ID: " S3_KEY; [[ -z "$S3_KEY" ]] && error "S3 Key 不能为空"
         read_secret "S3 Secret Access Key: " S3_SECRET; [[ -z "$S3_SECRET" ]] && error "S3 Secret 不能为空"
-        read -rp "CDN 域名（留空跳过）: " S3_CDN_DOMAIN; S3_CDN_DOMAIN="${S3_CDN_DOMAIN:-}"
+        read -rp "CDN 域名（留空跳过）: " S3_CDN_DOMAIN; S3_CDN_DOMAIN="${S3_CDN_DOMAIN:-}" || true
 
         info "--- 站点 ---"
-        read -rp "站点 URL（如 https://example.com）: " WP_URL
+        read -rp "站点 URL（如 https://example.com）: " WP_URL || true
         [[ -z "$WP_URL" ]] && error "URL 不能为空"
 
         info "--- 私有镜像仓库 ---"
-        read -rp "Registry 地址（如 10.10.0.1:5000）: " REGISTRY_HOST
+        read -rp "Registry 地址（如 10.10.0.1:5000）: " REGISTRY_HOST || true
         [[ -z "$REGISTRY_HOST" ]] && error "Registry 地址不能为空"
 
         info "--- Cloudflare（可选）---"
-        read -rp "CF Zone ID（留空跳过）: " CF_ZONE_ID; CF_ZONE_ID="${CF_ZONE_ID:-}"
+        read -rp "CF Zone ID（留空跳过）: " CF_ZONE_ID; CF_ZONE_ID="${CF_ZONE_ID:-}" || true
         [[ -n "$CF_ZONE_ID" ]] && read_secret "CF API Token: " CF_TOKEN
 
         WG_IP=$(get_wg_ip)
@@ -1199,7 +1199,7 @@ cmd_pull_deploy() {
         REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
         REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
     else
-        read -rp "仓库用户名: " REG_USER
+        read -rp "仓库用户名: " REG_USER || true
         read_secret "仓库密码: " REG_PASS
     fi
     docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" \
@@ -1271,7 +1271,7 @@ cmd_pull_deploy() {
 # ════════════════════════════════════════════════════════
 cmd_rollback() {
     header "镜像回滚"
-    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}" || true
     [[ -f "$DIR/.env" ]] || error "未找到 .env：${DIR}"
 
     local REGISTRY_HOST; REGISTRY_HOST=$(env_get "$DIR/.env" "REGISTRY_HOST")
@@ -1282,7 +1282,7 @@ cmd_rollback() {
         REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
         REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
     else
-        read -rp "仓库用户名: " REG_USER; read_secret "仓库密码: " REG_PASS
+        read -rp "仓库用户名: " REG_USER; read_secret "仓库密码: " REG_PASS || true
     fi
 
     local TAGS_JSON
@@ -1292,7 +1292,7 @@ cmd_rollback() {
         warn "无法从仓库获取标签列表"; return
     fi
     local TAGS
-    TAGS=$(echo "$TAGS_JSON" | jq -r '.tags[]' | grep -v '^latest$' | sort -r)
+    TAGS=$(echo "$TAGS_JSON" | jq -r '.tags[]' | grep -v '^latest$' | sort -r || true)
     [[ -z "$TAGS" ]] && { warn "仓库中无可用版本"; return; }
 
     echo ""; echo "可用版本："
@@ -1301,13 +1301,13 @@ cmd_rollback() {
         echo "  ${i}. ${TAG}"; TAG_ARR+=("$TAG"); i=$((i+1))
     done <<< "$TAGS"
 
-    read -rp "选择版本编号: " TAG_IDX
+    read -rp "选择版本编号: " TAG_IDX || true
     [[ "$TAG_IDX" =~ ^[0-9]+$ ]] || error "无效编号"
     local SELECTED_TAG="${TAG_ARR[$((TAG_IDX-1))]}"
     [[ -z "$SELECTED_TAG" ]] && error "无效选择"
 
     warn "将回滚到版本: ${SELECTED_TAG}"
-    read -rp "确认？[y/N]: " CONFIRM
+    read -rp "确认？[y/N]: " CONFIRM || true
     [[ "${CONFIRM,,}" == "y" ]] || { info "已取消"; return; }
 
     sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${SELECTED_TAG}|" "$DIR/.env"
@@ -1324,7 +1324,7 @@ cmd_rollback() {
 # 运维命令（与 v4.3 一致）
 # ════════════════════════════════════════════════════════
 cmd_status() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}" || true
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     dc "$DIR" ps; echo ""
     local WP_VER
@@ -1337,10 +1337,10 @@ cmd_status() {
 }
 
 cmd_logs() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}" || true
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     echo "  1. 容器总日志  2. Nginx 访问日志  3. Nginx 错误日志"
-    read -rp "选择 [默认: 1]: " LOG_CHOICE
+    read -rp "选择 [默认: 1]: " LOG_CHOICE || true
     case "${LOG_CHOICE:-1}" in
         2) dc "$DIR" exec -T wordpress tail -f /var/log/nginx/access.log ;;
         3) dc "$DIR" exec -T wordpress tail -f /var/log/nginx/error.log ;;
@@ -1353,10 +1353,10 @@ cmd_start()   { read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$D
 cmd_restart() { read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" restart && log "已重启。"; }
 
 cmd_destroy() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}" || true
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     warn "将停止容器并删除全部数据（不可恢复）。"
-    read -rp "输入 'yes' 确认: " CONFIRM
+    read -rp "输入 'yes' 确认: " CONFIRM || true
     [[ "$CONFIRM" != "yes" ]] && { info "已取消"; return; }
     local WG_IP; WG_IP=$(env_get "$DIR/.env" "WG_IP")
     if [[ -n "$WG_IP" && -f "$NODES_FILE" ]]; then
@@ -1368,7 +1368,7 @@ cmd_destroy() {
 }
 
 cmd_retry_plugins() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}" || true
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     dc "$DIR" ps --services --filter status=running | grep -q "wordpress" \
         || { warn "wordpress 容器未运行，请先启动。"; return; }
@@ -1376,7 +1376,7 @@ cmd_retry_plugins() {
 }
 
 cmd_flush() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}"
+    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR; DIR="${DIR:-$DEFAULT_DIR}" || true
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     _flush_all_caches "$DIR"
 }
@@ -1384,7 +1384,7 @@ cmd_flush() {
 cmd_nodes() {
     header "节点列表管理"
     echo "  1. 列出所有节点  2. 添加节点  3. 删除节点"
-    read -rp "选择: " NODE_CHOICE
+    read -rp "选择: " NODE_CHOICE || true
     case "$NODE_CHOICE" in
         1) [[ -s "$NODES_FILE" ]] && nl -ba "$NODES_FILE" || warn "节点列表为空：${NODES_FILE}" ;;
         2) read -rp "节点 WireGuard IP: " NEW_IP
@@ -1426,7 +1426,7 @@ interactive_menu() {
         echo -e "  \e[31m14.\e[0m 删除节点（不可恢复）"
         echo -e "  \e[36m 0.\e[0m 退出"
         echo "----------------------------------------"
-        read -rp "选择: " CHOICE
+        read -rp "选择: " CHOICE || true
         case "$CHOICE" in
             1)  cmd_registry ;;
             2)  cmd_master_init ;;
@@ -1445,7 +1445,7 @@ interactive_menu() {
             0)  info "再见！"; exit 0 ;;
             *)  warn "无效输入" ;;
         esac
-        read -rp "按回车继续..."
+        read -rp "按回车继续..." || true
         clear
     done
 }
