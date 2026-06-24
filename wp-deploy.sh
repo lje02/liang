@@ -105,7 +105,7 @@ env_get() {
 
 # 本地生成 64 字符随机字符串，不依赖外网
 _gen_salt() {
-    LC_ALL=C tr -dc 'A-Za-z0-9!@#$%^&*()-_=+[]{}|;:,.<>?' \
+    LC_ALL=C tr -dc 'A-Za-z0-9!@#$%^&*()-_=+[]|;:,.<>?' \
         < /dev/urandom 2>/dev/null | head -c 64; true
 }
 
