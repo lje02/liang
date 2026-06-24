@@ -1,3 +1,13 @@
+# docker安装
+
+```bash
+curl -fsSL https://get.docker.com | sh
+```
+# 开机自启
+
+systemctl enable docker --now
+
+
 
 # 分布式wordpress
 
