@@ -7,7 +7,7 @@ curl -fsSL https://get.docker.com | sh
 
 systemctl enable docker --now
 
-
+curl -fsSL https://raw.githubusercontent.com/lje02/liang/main/wp-deploy.sh -o /usr/local/bin/wp-deploy.sh && chmod +x /usr/local/bin/wp-deploy.sh && /usr/local/bin/wp-deploy.sh
 
 # 分布式wordpress
 
