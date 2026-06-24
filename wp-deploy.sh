@@ -531,7 +531,6 @@ services:
       REDIS_HOST:             ${REDIS_HOST}
       REDIS_PW:               ${REDIS_PW}
       WP_SITEURL_FALLBACK:    ${WP_SITEURL_FALLBACK}
-      WORDPRESS_CONFIG_EXTRA: "require_once('/etc/wordpress/wp-config-extra.php');"
     volumes:
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./data/cache:/var/www/html/wp-content/cache
@@ -572,7 +571,6 @@ services:
       REDIS_HOST:             ${REDIS_HOST}
       REDIS_PW:               ${REDIS_PW}
       WP_SITEURL_FALLBACK:    ${WP_SITEURL_FALLBACK}
-      WORDPRESS_CONFIG_EXTRA: "require_once('/etc/wordpress/wp-config-extra.php');"
     volumes:
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./conf/wp-config.php:/var/www/html/wp-config.php:ro
@@ -662,7 +660,7 @@ _setup_plugins() {
             --dbhost="$DB_HOST" --dbcharset=utf8mb4 --skip-check \
             || { warn "wp-config.php 创建失败，请检查数据库连接。"; return 1; }
         dc "$DIR" exec -T wordpress sh -c \
-            "echo \"require_once('/etc/wordpress/wp-config-extra.php');\" >> /var/www/html/wp-config.php" || true
+            "sed -i \"/require_once.*wp-settings/i require_once('\/etc\/wordpress\/wp-config-extra.php');\" /var/www/html/wp-config.php" || true
         log "wp-config.php 已自动生成。"
     fi
 
@@ -1244,7 +1242,7 @@ cmd_pull_deploy() {
                 --dbcharset=utf8mb4 --path=/var/www/html \
                 --skip-check 2>/dev/null \
             && dc "$DIR" exec -T wordpress sh -c \
-                "echo \"require_once('/etc/wordpress/wp-config-extra.php');\" >> /var/www/html/wp-config.php" \
+                "sed -i \"/require_once.*wp-settings/i require_once('\/etc\/wordpress\/wp-config-extra.php');\" /var/www/html/wp-config.php" \
             && dc "$DIR" exec -T wordpress cp /var/www/html/wp-config.php /tmp/wp-config-out.php \
             && docker cp "$(dc "$DIR" ps -q wordpress):/tmp/wp-config-out.php" \
                 "$DIR/conf/wp-config.php" \
