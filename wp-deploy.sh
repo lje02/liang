@@ -684,6 +684,7 @@ _setup_plugins() {
             --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PW" \
             --dbhost="$DB_HOST" --dbcharset=utf8mb4 --skip-check \
             || { warn "wp-config.php 创建失败，请检查数据库连接。"; return 1; }
+        dc "$DIR" exec -T wordpress sed -i '/_KEY/d; /_SALT/d' /var/www/html/wp-config.php
         dc "$DIR" exec -T wordpress sh -c \
             "sed -i \"/require_once.*wp-settings/i require_once('\/etc\/wordpress\/wp-config-extra.php');\" /var/www/html/wp-config.php" || true
         log "wp-config.php 已自动生成。"
@@ -1285,6 +1286,7 @@ cmd_pull_deploy() {
                 --dbpass="$DB_PW"   --dbhost="$DB_HOST" \
                 --dbcharset=utf8mb4 --path=/var/www/html \
                 --skip-check 2>/dev/null \
+            && dc "$DIR" exec -T wordpress sed -i '/_KEY/d; /_SALT/d' /var/www/html/wp-config.php \
             && dc "$DIR" exec -T wordpress sh -c \
                 "sed -i \"/require_once.*wp-settings/i require_once('\/etc\/wordpress\/wp-config-extra.php');\" /var/www/html/wp-config.php" \
             && dc "$DIR" exec -T wordpress cp /var/www/html/wp-config.php /tmp/wp-config-out.php \
