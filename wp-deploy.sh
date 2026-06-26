@@ -864,28 +864,6 @@ EOF
         [[ $_RETRIES -le 0 ]] && error "仓库服务未能在预期时间内就绪，请检查容器日志"
     done
 
-    local DAEMON_JSON="/etc/docker/daemon.json"
-    local REGISTRY_ADDR="${WG_IP}:${REG_PORT}"
-    if [[ -f "$DAEMON_JSON" ]]; then
-        local _JQ_RC=0
-        local _JQ_OUT
-        _JQ_OUT=$(jq -e --arg addr "$REGISTRY_ADDR" \
-            '.["insecure-registries"]? | index($addr)' "$DAEMON_JSON" 2>&1) || _JQ_RC=$?
-        if [[ $_JQ_RC -eq 0 ]]; then
-            :
-        elif echo "$_JQ_OUT" | grep -qE "^null$|^false$"; then
-            warn "请手动在 ${DAEMON_JSON} 中添加："
-            warn "  \"insecure-registries\": [\"${REGISTRY_ADDR}\"]"
-            warn "然后执行: systemctl restart docker"
-        else
-            warn "daemon.json 解析失败，请手动确认后添加 insecure-registries: ${REGISTRY_ADDR}"
-            warn "解析错误: ${_JQ_OUT}"
-        fi
-    else
-        printf '{\n  "insecure-registries": ["%s"]\n}\n' "${REGISTRY_ADDR}" > "$DAEMON_JSON"
-        systemctl restart docker && log "Docker daemon 已更新并重启"
-    fi
-
     # 确保本机 Docker 信任该仓库
     _ensure_insecure_registry "${WG_IP}:${REG_PORT}"
     log "私有仓库已部署！"
