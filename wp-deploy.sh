@@ -1151,6 +1151,8 @@ cmd_push() {
         read -rp "仓库用户名: " REG_USER || true
         read_secret "仓库密码: " REG_PASS
     fi
+    # 确保本机 Docker 信任私有仓库（仓库机可能独立部署）
+    _ensure_insecure_registry "$REGISTRY_HOST"
     docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" \
     || error "仓库登录失败"
 
@@ -1418,8 +1420,8 @@ cmd_rollback() {
     [[ "${CONFIRM,,}" == "y" ]] || { info "已取消"; return; }
 
     sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${SELECTED_TAG}|" "$DIR/.env"
+    _ensure_insecure_registry "$REGISTRY_HOST"
     docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" &>/dev/null
-
     info "拉取 ${REGISTRY_HOST}/wordpress-site:${SELECTED_TAG} ..."
     docker pull "${REGISTRY_HOST}/wordpress-site:${SELECTED_TAG}" || error "拉取失败"
     dc "$DIR" up -d --force-recreate || error "容器重启失败"
