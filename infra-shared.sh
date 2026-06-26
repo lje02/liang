@@ -69,12 +69,15 @@ _check_id()  {
 _check_pw() {
     [[ -n "$1" ]]      || error "$2 不能为空"
     [[ "$1" != *"'"* ]] || error "$2 不能含单引号"
+    [[ "$1" != *"\\"* ]] || error "$2 不能含反斜杠"
     [[ ${#1} -ge 8 ]]  || error "$2 至少 8 个字符"
 }
 
 load_env() {
     [[ -f "$1/.env" ]] || error ".env 不存在: $1/.env"
     chmod 600 "$1/.env" 2>/dev/null || true
+    # 允许加载的 key 白名单（防止 .env 被篡改污染关键环境变量）
+    local _ALLOWED_KEYS='WG_IP|MARIADB_ROOT_PASSWORD|MARIADB_DATABASE|MARIADB_USER|MARIADB_PASSWORD|REDIS_PASSWORD|DEPLOY_DB|DEPLOY_REDIS'
     local key val line
     while IFS= read -r line || [[ -n "$line" ]]; do
         # 跳过注释和空行
@@ -84,8 +87,11 @@ load_env() {
         if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
             key="${BASH_REMATCH[1]}"
             val="${BASH_REMATCH[2]}"
-            printf -v "$key" '%s' "$val"
-            export "$key"
+            # 只导出白名单内的 key
+            if [[ "$key" =~ ^($_ALLOWED_KEYS)$ ]]; then
+                printf -v "$key" '%s' "$val"
+                export "$key"
+            fi
         fi
     done < "$1/.env"
 }
@@ -120,7 +126,12 @@ _docker_subnet() {
         s=$(docker network inspect bridge \
             --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)
     fi
-    [[ "$s" =~ ^([0-9]+\.[0-9]+)\. ]] && echo "${BASH_REMATCH[1]}.%" || echo "172.17.%"
+    if [[ "$s" =~ ^([0-9]+\.[0-9]+)\. ]]; then
+        echo "${BASH_REMATCH[1]}.%"
+    else
+        warn "无法检测 Docker 网段，使用默认 172.17.%（如授权失败请手动执行 add-db）" >&2
+        echo "172.17.%"
+    fi
 }
 
 # ── 依赖检查 ─────────────────────────────────────────────────
@@ -180,9 +191,10 @@ INI
 }
 
 _write_redis_conf() {
-    load_env "$1"
-    mkdir -p "$1/redis-conf"
-    cat > "$1/redis-conf/redis.conf" <<CONF
+    # 调用方须在调用前完成 load_env，此处不重复 load
+    local dir="$1"
+    mkdir -p "$dir/redis-conf"
+    cat > "$dir/redis-conf/redis.conf" <<CONF
 bind 0.0.0.0
 port ${REDIS_PORT}
 requirepass ${REDIS_PASSWORD}
@@ -275,8 +287,12 @@ EOF
     if (( do_db )); then
         mkdir -p "$dir/db" "$dir/backup"
         if ! grep -q "^MARIADB_ROOT_PASSWORD=" "$dir/.env" 2>/dev/null; then
+            local _root_pw _wp_pw
+            _root_pw=$(randpw)
+            _wp_pw=$(randpw)
+            [[ -n "$_root_pw" && -n "$_wp_pw" ]] || error "随机密码生成失败，请检查 openssl 或 /dev/urandom"
             printf "MARIADB_ROOT_PASSWORD=%s\nMARIADB_DATABASE=wordpress\nMARIADB_USER=wpuser\nMARIADB_PASSWORD=%s\n" \
-                "$(randpw)" "$(randpw)" >> "$dir/.env"
+                "$_root_pw" "$_wp_pw" >> "$dir/.env"
             log "MariaDB 凭据已生成"
         else
             warn "MariaDB 凭据已存在，跳过生成"
@@ -288,12 +304,17 @@ EOF
     if (( do_redis )); then
         mkdir -p "$dir/redis"
         if ! grep -q "^REDIS_PASSWORD=" "$dir/.env" 2>/dev/null; then
-            echo "REDIS_PASSWORD=$(randpw)" >> "$dir/.env"
+            local _redis_pw
+            _redis_pw=$(randpw)
+            [[ -n "$_redis_pw" ]] || error "随机密码生成失败，请检查 openssl 或 /dev/urandom"
+            echo "REDIS_PASSWORD=${_redis_pw}" >> "$dir/.env"
             log "Redis 凭据已生成"
         else
             warn "Redis 凭据已存在，跳过生成"
         fi
         _env_set "$dir" "DEPLOY_REDIS" "1"
+        # load_env 后再写 redis.conf，确保 REDIS_PASSWORD 已载入
+        load_env "$dir"
         _write_redis_conf "$dir"
     fi
 
@@ -502,7 +523,7 @@ cmd_backup() {
             mv "$tmp" "$out"
             log "✓ ${db} ($(du -sh "$out" | cut -f1))"
         else
-            rm -f "$tmp"; warn "✗ ${db} 失败"; (( failed++ ))
+            rm -f "$tmp"; warn "✗ ${db} 失败"; (( failed++ )) || true
         fi
     done <<< "$dbs"
     (( failed == 0 )) && log "备份完成: ${dest}" || { warn "${failed} 个库失败"; return 1; }
@@ -520,6 +541,8 @@ cmd_restore() {
         warn "无法从文件名推断库名（得到: '${db}'）"
         read -rp "  请手动输入目标库名: " db
         _check_id "$db" "数据库名"
+    else
+        warn "将从文件名推断目标库为: ${db}（如不正确请 Ctrl+C 后手动指定）"
     fi
     warn "将恢复到库: ${db}"; read -rp "确认? [y/N] " c
     [[ "${c,,}" == "y" ]] || { info "已取消"; return; }
@@ -692,7 +715,12 @@ menu_svc() {
         *) warn "无效选项"; _pause; return ;;
     esac
     read -rp "  确认${label}? [y/N] " C; [[ "${C,,}" == "y" ]] || { info "已取消"; _pause; return; }
-    cmd_${op} "$DIR" $svc; _pause
+    if [[ "$op" == "start" ]]; then
+        cmd_start "$DIR" ${svc:+"$svc"}
+    else
+        cmd_stop  "$DIR" ${svc:+"$svc"}
+    fi
+    _pause
 }
 
 menu_logs() {
