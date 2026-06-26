@@ -435,12 +435,13 @@ RUN apk add --no-cache \
         nginx supervisor curl bash \
         libpng libpng-dev libjpeg-turbo libjpeg-turbo-dev \
         libwebp-dev freetype freetype-dev icu-dev libzip-dev zip unzip \
+        imagemagick imagemagick-dev \
     && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
     && docker-php-ext-install -j$(nproc) gd mysqli zip intl exif opcache \
     && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
-    && pecl install redis \
-    && docker-php-ext-enable redis \
-    && apk del .build-deps libpng-dev libjpeg-turbo-dev freetype-dev \
+    && pecl install redis imagick \
+    && docker-php-ext-enable redis imagick \
+    && apk del .build-deps libpng-dev libjpeg-turbo-dev freetype-dev imagemagick-dev \
     && rm -rf /tmp/pear /var/cache/apk/*
 
 RUN curl -4 -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
@@ -499,12 +500,13 @@ RUN apk add --no-cache \
         nginx supervisor curl bash \
         libpng libpng-dev libjpeg-turbo libjpeg-turbo-dev \
         libwebp-dev freetype freetype-dev icu-dev libzip-dev zip unzip \
+        imagemagick imagemagick-dev \
     && docker-php-ext-configure gd --with-freetype --with-jpeg --with-webp \
     && docker-php-ext-install -j$(nproc) gd mysqli zip intl exif opcache \
     && apk add --no-cache --virtual .build-deps $PHPIZE_DEPS \
-    && pecl install redis \
-    && docker-php-ext-enable redis \
-    && apk del .build-deps libpng-dev libjpeg-turbo-dev freetype-dev \
+    && pecl install redis imagick \
+    && docker-php-ext-enable redis imagick \
+    && apk del .build-deps libpng-dev libjpeg-turbo-dev freetype-dev imagemagick-dev \
     && rm -rf /tmp/pear /var/cache/apk/*
 
 RUN curl -4 -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
