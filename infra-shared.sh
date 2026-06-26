@@ -75,15 +75,35 @@ _check_pw() {
 load_env() {
     [[ -f "$1/.env" ]] || error ".env 不存在: $1/.env"
     chmod 600 "$1/.env" 2>/dev/null || true
-    # shellcheck disable=SC1090
-    source "$1/.env" </dev/null
+    local key val line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # 跳过注释和空行
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        # 只接受 KEY=VALUE 格式，key 必须是合法标识符
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            printf -v "$key" '%s' "$val"
+            export "$key"
+        fi
+    done < "$1/.env"
 }
 
 _env_set() {   # DIR KEY VAL
-    if grep -q "^$2=" "$1/.env" 2>/dev/null; then
-        sed -i "s|^$2=.*|$2=$3|" "$1/.env"
+    local envfile="$1/.env" key="$2" val="$3" tmp
+    tmp="${envfile}.tmp.$$"
+    if grep -q "^${key}=" "$envfile" 2>/dev/null; then
+        # 用 awk 替换，val 通过变量传入，完全避免 sed 特殊字符问题
+        awk -v k="$key" -v v="$val" '
+            BEGIN { replaced=0 }
+            /^[[:space:]]*#/ { print; next }
+            $0 ~ "^" k "=" { print k "=" v; replaced=1; next }
+            { print }
+            END { if (!replaced) print k "=" v }
+        ' "$envfile" > "$tmp" && mv "$tmp" "$envfile"
     else
-        echo "$2=$3" >> "$1/.env"
+        printf '%s=%s\n' "$key" "$val" >> "$envfile"
     fi
 }
 
@@ -92,9 +112,14 @@ _svc_exists() {   # DIR SVC
 }
 
 _docker_subnet() {
+    # 优先检查 compose 项目网络（infra_default），fallback 到 bridge
     local s
-    s=$(docker network inspect bridge \
+    s=$(docker network inspect infra_default \
         --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)
+    if [[ -z "$s" ]]; then
+        s=$(docker network inspect bridge \
+            --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)
+    fi
     [[ "$s" =~ ^([0-9]+\.[0-9]+)\. ]] && echo "${BASH_REMATCH[1]}.%" || echo "172.17.%"
 }
 
@@ -126,6 +151,11 @@ db_exec() { local d="$1"; shift
 db_sql() {   # DIR SQL
     compose_run "$1" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
         db mariadb -uroot < <(printf '%s\n' "$2")
+}
+
+db_sql_on() {   # DIR DB SQL  — 直接指定目标库，避免 USE 在 pipe 中失效
+    compose_run "$1" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
+        db mariadb -uroot "$2" < <(printf '%s\n' "$3")
 }
 
 # ════════════════════════════════════════════════════════════
@@ -372,7 +402,7 @@ CREATE USER IF NOT EXISTS '${user}'@'${docker_sub}' IDENTIFIED BY '${pw}';
 ALTER  USER               '${user}'@'${docker_sub}' IDENTIFIED BY '${pw}';
 GRANT ALL PRIVILEGES ON \`${db}\`.* TO '${user}'@'${docker_sub}';
 FLUSH PRIVILEGES;"
-    log "库: ${db}  用户: ${user}  密码: ${pw}  主机: ${WG_IP}:${MARIADB_PORT}"
+    log "库: ${db}  用户: ${user}  密码: ${pw}  主机: ${WG_IP}:${MARIADB_PORT:-3306}"
 }
 
 cmd_del_db() {
@@ -398,13 +428,25 @@ cmd_clear_db() {
     load_env "$dir"
     warn "即将清空库 ${db} 内所有表（库和权限保留），不可逆！"
     read -rp "输入库名确认: " c; [[ "$c" == "$db" ]] || { info "已取消"; return; }
-    local sql
-    sql=$(db_exec "$dir" -sN -e \
-        "SELECT CONCAT('DROP TABLE IF EXISTS \`',table_name,'\`;')
-         FROM information_schema.tables WHERE table_schema='${db}';")
-    [[ -n "$sql" ]] || { info "库 ${db} 无表，无需清空"; return; }
-    db_sql "$dir" "USE \`${db}\`; SET FOREIGN_KEY_CHECKS=0; ${sql} SET FOREIGN_KEY_CHECKS=1;"
-    log "已清空库 ${db}（$(echo "$sql" | wc -l) 张表）"
+
+    local tables
+    tables=$(db_exec "$dir" -sN -e \
+        "SELECT table_name FROM information_schema.tables WHERE table_schema='${db}';")
+    [[ -n "$tables" ]] || { info "库 ${db} 无表，无需清空"; return; }
+
+    local drop_sql="SET FOREIGN_KEY_CHECKS=0;"
+    while IFS= read -r t; do
+        [[ -n "$t" ]] || continue
+        # 过滤非法表名，防止查询结果被注入
+        [[ "$t" =~ ^[A-Za-z0-9_\$]{1,64}$ ]] || { warn "跳过非法表名: '${t}'"; continue; }
+        # 反引号转义：` => ``（MySQL 标识符转义规范）
+        local escaped_t="${t//\`/\`\`}"
+        drop_sql+=" DROP TABLE IF EXISTS \`${escaped_t}\`;"
+    done <<< "$tables"
+    drop_sql+=" SET FOREIGN_KEY_CHECKS=1;"
+
+    db_sql_on "$dir" "$db" "$drop_sql"
+    log "已清空库 ${db}（$(echo "$tables" | wc -l) 张表）"
 }
 
 cmd_list_db() {
