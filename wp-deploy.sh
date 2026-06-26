@@ -863,9 +863,11 @@ EOF
         sleep 2; _RETRIES=$(( _RETRIES - 1 ))
         [[ $_RETRIES -le 0 ]] && error "仓库服务未能在预期时间内就绪，请检查容器日志"
     done
+    done
 
+    local REGISTRY_ADDR="${WG_IP}:${REG_PORT}"   # 补充定义
     # 确保本机 Docker 信任该仓库
-    _ensure_insecure_registry "${WG_IP}:${REG_PORT}"
+    _ensure_insecure_registry "${REGISTRY_ADDR}"
     log "私有仓库已部署！"
     echo -e "  仓库地址: \e[33m${REGISTRY_ADDR}\e[0m"
     echo -e "  用户名:   \e[32m${REG_USER}\e[0m"
