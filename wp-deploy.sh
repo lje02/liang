@@ -122,6 +122,47 @@ _register_node() {
     fi
 }
 
+# 确保 Docker daemon 信任指定仓库（HTTP）
+# 用法: _ensure_insecure_registry <registry_host:port>
+_ensure_insecure_registry() {
+    local REGISTRY_ADDR="$1"
+    local DAEMON_FILE="/etc/docker/daemon.json"
+
+    # 检查 Docker info 是否已经包含该地址
+    if docker info 2>/dev/null | grep -qF "$REGISTRY_ADDR"; then
+        return 0
+    fi
+
+    info "Docker 未信任 ${REGISTRY_ADDR}，正在自动配置..."
+
+    # 备份原文件（如果存在）
+    if [[ -f "$DAEMON_FILE" ]]; then
+        cp "$DAEMON_FILE" "${DAEMON_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    fi
+
+    # 构造或更新 daemon.json
+    if [[ -f "$DAEMON_FILE" ]]; then
+        # 文件已存在，用 jq 追加
+        local tmp_json
+        tmp_json=$(mktemp)
+        jq --arg addr "$REGISTRY_ADDR" \
+            '.["insecure-registries"] = (["insecure-registries"] + [$addr] | unique)' \
+            "$DAEMON_FILE" > "$tmp_json" \
+            && mv "$tmp_json" "$DAEMON_FILE"
+    else
+        # 文件不存在，直接创建
+        printf '{\n  "insecure-registries": ["%s"]\n}\n' "$REGISTRY_ADDR" > "$DAEMON_FILE"
+    fi
+
+    # 重启 Docker
+    if systemctl restart docker &>/dev/null; then
+        log "Docker 已重启，insecure-registries 配置生效。"
+    else
+        warn "Docker 重启失败，请手动执行: systemctl restart docker"
+        return 1
+    fi
+}
+
 # ════════════════════════════════════════════════════════
 # 配置文件生成函数
 # ════════════════════════════════════════════════════════
@@ -845,6 +886,8 @@ EOF
         systemctl restart docker && log "Docker daemon 已更新并重启"
     fi
 
+    # 确保本机 Docker 信任该仓库
+    _ensure_insecure_registry "${WG_IP}:${REG_PORT}"
     log "私有仓库已部署！"
     echo -e "  仓库地址: \e[33m${REGISTRY_ADDR}\e[0m"
     echo -e "  用户名:   \e[32m${REG_USER}\e[0m"
@@ -1244,6 +1287,8 @@ cmd_pull_deploy() {
         read -rp "仓库用户名: " REG_USER || true
         read_secret "仓库密码: " REG_PASS
     fi
+    # 确保本机 Docker 信任私有仓库
+    _ensure_insecure_registry "$REGISTRY_HOST"
     docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" \
     || error "仓库登录失败"
 
