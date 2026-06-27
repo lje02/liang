@@ -1,17 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
-# v6.0
+# v6.1
 #   变更:
-#     [new] 多实例支持：每个实例独立目录/镜像名/nodes.conf
-#           BASE_DIR 下以实例名为子目录，所有 cmd_* 统一通过
-#           _resolve_instance 选择/创建实例
-#     [new] WordPress Multisite 支持（子目录 & 子域名两种模式）
-#           - wp-config-extra.php 自动注入 Multisite 常量
-#           - nginx-wp.conf 子目录模式注入 rewrite 规则
-#           - nginx-wp.conf 子域名模式设置通配符 server_name
-#           - _setup_plugins 调用 wp core multisite-install
-#     继承 v5.0 全部修复
+#     [new] 备份/还原新增 AList 本地挂载目录支持
+#           - cmd_backup: 推送目标加选项 4（AList cp）及"3+4 全推"
+#           - cmd_restore: 来源加选项 4（AList 目录列表选择）
+#           - 可配置 ALIST_DEFAULT_DIR（默认 /mnt/alist/wp-backups/）
+#           - 备份时自动清理挂载目录内 30 天前的旧包
+#     继承 v6.0 全部功能
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
@@ -20,6 +17,7 @@ export LC_ALL=en_US.UTF-8
 BASE_DIR="${BASE_DIR:-/srv}"
 WG_IFACE="${WG_IFACE:-wg0}"
 REGISTRY_DIR="${BASE_DIR}/registry"
+ALIST_DEFAULT_DIR="${ALIST_DEFAULT_DIR:-/mnt/alist/wp-backups/}"
 
 # 当前操作实例（由 _resolve_instance 填充）
 INSTANCE=""
@@ -1799,7 +1797,7 @@ cmd_nodes() {
 }
 
 # ════════════════════════════════════════════════════════
-# 备份（.env + conf/）→ rsync 或 S3
+# 备份（.env + conf/）→ rsync / S3 / AList
 # ════════════════════════════════════════════════════════
 cmd_backup() {
     header "备份实例配置"
@@ -1837,7 +1835,11 @@ cmd_backup() {
     echo "  推送目标："
     echo "  1. rsync → 其他节点（WireGuard 内网）"
     echo "  2. S3 / 兼容对象存储（aws s3 cp）"
-    echo "  3. 两者都推"
+    echo "  3. AList 挂载目录（本地 cp）"
+    echo "  4. rsync + S3"
+    echo "  5. rsync + AList"
+    echo "  6. S3 + AList"
+    echo "  7. 全部推送"
     echo "  0. 仅保留本地，不推送"
     read -rp "选择 [默认: 0]: " _PUSH_CHOICE || true
     _PUSH_CHOICE="${_PUSH_CHOICE:-0}"
@@ -1868,10 +1870,9 @@ cmd_backup() {
         if ! command -v aws &>/dev/null; then
             warn "aws cli 未安装（pip install awscli 或 apt install awscli），跳过"; return 1
         fi
-        local S3_BUCKET S3_PREFIX S3_ENDPOINT
+        local S3_BUCKET S3_ENDPOINT
         read -rp "S3 Bucket（如 s3://my-bucket/backups/）: " S3_BUCKET || true
         [[ -n "$S3_BUCKET" ]] || { warn "Bucket 不能为空，跳过 S3"; return 1; }
-        # 去掉末尾斜杠，统一拼接
         S3_BUCKET="${S3_BUCKET%/}"
         read -rp "自定义 Endpoint（留空则用 AWS 官方）: " S3_ENDPOINT || true
 
@@ -1914,10 +1915,60 @@ cmd_backup() {
         fi
     }
 
+    # ── AList 本地挂载目录 ──
+    _do_alist() {
+        local ALIST_DIR
+        read -rp "AList 挂载目录 [默认: ${ALIST_DEFAULT_DIR}]: " ALIST_DIR || true
+        ALIST_DIR="${ALIST_DIR:-${ALIST_DEFAULT_DIR}}"
+        # 去掉末尾斜杠，统一处理
+        ALIST_DIR="${ALIST_DIR%/}"
+
+        # 检查挂载点是否可用（目录存在且非空挂载）
+        if [[ ! -d "$ALIST_DIR" ]]; then
+            mkdir -p "$ALIST_DIR" 2>/dev/null \
+            || { warn "AList 目录创建失败：${ALIST_DIR}，请确认 AList 已挂载"; return 1; }
+        fi
+
+        # 简单检测：写入测试（FUSE 未挂载时 mkdir 会成功但写入失败）
+        local _TEST_FILE="${ALIST_DIR}/.wp-deploy-write-test"
+        if ! touch "$_TEST_FILE" 2>/dev/null; then
+            warn "AList 目录不可写：${ALIST_DIR}，请确认 AList 已挂载且有写权限"
+            return 1
+        fi
+        rm -f "$_TEST_FILE"
+
+        info "复制到 AList：${ALIST_DIR}/${BACKUP_NAME}.tar.gz ..."
+        if cp "$BACKUP_TAR" "${ALIST_DIR}/${BACKUP_NAME}.tar.gz"; then
+            log "AList 推送完成：${ALIST_DIR}/${BACKUP_NAME}.tar.gz"
+        else
+            warn "AList 复制失败，请检查挂载状态"
+            return 1
+        fi
+
+        # 自动清理 AList 目录内 30 天前的同实例备份
+        local _OLD_COUNT
+        _OLD_COUNT=$(find "$ALIST_DIR" -maxdepth 1 \
+            -name "wp-backup-${INST}-*.tar.gz" -mtime +30 2>/dev/null | wc -l)
+        if [[ "$_OLD_COUNT" -gt 0 ]]; then
+            read -rp "清理 AList 目录内 30 天前的旧备份（共 ${_OLD_COUNT} 个）？[y/N]: " _AL_PRUNE || true
+            if [[ "${_AL_PRUNE,,}" == "y" ]]; then
+                find "$ALIST_DIR" -maxdepth 1 \
+                    -name "wp-backup-${INST}-*.tar.gz" -mtime +30 \
+                    -exec rm -f {} \; 2>/dev/null \
+                && log "AList 旧备份清理完成" \
+                || warn "部分旧备份清理失败，请手动检查"
+            fi
+        fi
+    }
+
     case "$_PUSH_CHOICE" in
         1) _do_rsync ;;
         2) _do_s3 ;;
-        3) _do_rsync; _do_s3 ;;
+        3) _do_alist ;;
+        4) _do_rsync; _do_s3 ;;
+        5) _do_rsync; _do_alist ;;
+        6) _do_s3; _do_alist ;;
+        7) _do_rsync; _do_s3; _do_alist ;;
         0) info "仅保留本地备份：${BACKUP_TAR}" ;;
         *) warn "无效选择，仅保留本地备份" ;;
     esac
@@ -1933,7 +1984,7 @@ cmd_backup() {
 }
 
 # ════════════════════════════════════════════════════════
-# 还原（从本地 tar.gz / rsync 拉取 / S3 下载）
+# 还原（从本地 tar.gz / rsync 拉取 / S3 下载 / AList 挂载目录）
 # ════════════════════════════════════════════════════════
 cmd_restore() {
     header "还原实例配置"
@@ -1950,6 +2001,7 @@ cmd_restore() {
     echo "  1. 本地文件（指定 tar.gz 路径）"
     echo "  2. rsync 从其他节点拉取"
     echo "  3. 从 S3 下载"
+    echo "  4. AList 挂载目录（列表选择）"
     read -rp "选择 [默认: 1]: " _SRC_CHOICE || true
     _SRC_CHOICE="${_SRC_CHOICE:-1}"
 
@@ -2014,6 +2066,41 @@ cmd_restore() {
             aws s3 cp "${_AWS_EXTRA[@]}" "${S3_BUCKET}/${S3_OBJ}" "$RESTORE_TAR" \
             || error "S3 下载失败"
             log "已下载到：${RESTORE_TAR}"
+            ;;
+        4)
+            # ── AList 挂载目录 ──
+            local ALIST_DIR
+            read -rp "AList 挂载目录 [默认: ${ALIST_DEFAULT_DIR}]: " ALIST_DIR || true
+            ALIST_DIR="${ALIST_DIR:-${ALIST_DEFAULT_DIR}}"
+            ALIST_DIR="${ALIST_DIR%/}"
+            [[ -d "$ALIST_DIR" ]] || error "AList 目录不存在：${ALIST_DIR}，请确认已挂载"
+
+            local -a AL_FILES
+            mapfile -t AL_FILES < <(
+                find "$ALIST_DIR" -maxdepth 1 -name "wp-backup-*.tar.gz" \
+                    2>/dev/null | sort -r
+            )
+            [[ ${#AL_FILES[@]} -gt 0 ]] || error "AList 目录中未找到备份文件（前缀 wp-backup-）"
+
+            echo ""
+            info "AList 目录中的备份（${ALIST_DIR}）："
+            local i=1
+            for f in "${AL_FILES[@]}"; do
+                local _SIZE; _SIZE=$(du -sh "$f" 2>/dev/null | cut -f1 || echo "?")
+                printf "  %2d. %-55s %s\n" "$i" "$(basename "$f")" "${_SIZE}"
+                i=$((i+1))
+            done
+            read -rp "选择编号: " _AL_IDX || true
+            [[ "$_AL_IDX" =~ ^[0-9]+$ ]] || error "无效编号"
+            local _AL_SRC="${AL_FILES[$((_AL_IDX-1))]}"
+            [[ -f "$_AL_SRC" ]] || error "无效选择"
+
+            # 复制到 /tmp 再操作，避免 FUSE 读取中断影响后续解压
+            RESTORE_TAR="/tmp/$(basename "$_AL_SRC")"
+            info "从 AList 复制到本地临时目录..."
+            cp "$_AL_SRC" "$RESTORE_TAR" \
+            || error "AList 文件读取失败，请检查挂载状态"
+            log "已复制到：${RESTORE_TAR}"
             ;;
         *)
             error "无效选择"
