@@ -171,16 +171,19 @@ compose_run() { local d="$1"; shift
 }
 
 db_exec() { local d="$1"; shift
-    compose_run "$d" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" db mariadb -uroot "$@"
+    export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
+    compose_run "$d" exec -T -e MYSQL_PWD db mariadb -uroot "$@"
 }
 
 db_sql() {   # DIR SQL
-    compose_run "$1" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
+    export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
+    compose_run "$1" exec -T -e MYSQL_PWD \
         db mariadb -uroot < <(printf '%s\n' "$2")
 }
 
-db_sql_on() {   # DIR DB SQL  — 直接指定目标库，避免 USE 在 pipe 中失效
-    compose_run "$1" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
+db_sql_on() {   # DIR DB SQL  — 直接指定目标库
+    export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
+    compose_run "$1" exec -T -e MYSQL_PWD \
         db mariadb -uroot "$2" < <(printf '%s\n' "$3")
 }
 
@@ -698,23 +701,32 @@ cmd_rsync_pull() {
 # ════════════════════════════════════════════════════════════
 # cmd_backup [DIR] [DEST] [--rsync]
 #   --rsync : 备份完成后自动推送到远端（须已配置 rsync-config）
+
 cmd_backup() {
+    umask 077 # 安全修复：强制新建目录与文件权限为 700/600
     local dir="${1:-$DEFAULT_DIR}" dest="${2:-${1:-$DEFAULT_DIR}/backup}" do_rsync=0
     for _a in "$@"; do [[ "$_a" == "--rsync" ]] && do_rsync=1; done
 
     _svc_exists "$dir" "db" || error "MariaDB 未部署"
-    load_env "$dir"; mkdir -p "$dest"
+    load_env "$dir"
+    
+    mkdir -p "$dest"
+    chmod 700 "$dest" # 安全修复：收紧已有目录权限
+    
     local ts; ts=$(date +%Y%m%d_%H%M%S)
     header "备份 → ${dest}"
     local dbs failed=0
     dbs=$(db_exec "$dir" -sN -e \
         "SELECT schema_name FROM information_schema.schemata
          WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');")
+         
+    export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
+    
     while IFS= read -r db; do
         [[ -n "$db" ]] || continue
         local out="${dest}/${db}_${ts}.sql.gz" tmp="${dest}/${db}_${ts}.sql.gz.tmp"
         info "备份 ${db}..."
-        if compose_run "$dir" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
+        if compose_run "$dir" exec -T -e MYSQL_PWD \
                 db mariadb-dump -uroot --single-transaction --routines --triggers "${db}" \
             | gzip > "$tmp"; then
             mv "$tmp" "$out"
@@ -725,7 +737,6 @@ cmd_backup() {
     done <<< "$dbs"
     (( failed == 0 )) && log "备份完成: ${dest}" || { warn "${failed} 个库失败"; return 1; }
 
-    # ── 可选 rsync 推送 ──────────────────────────────────────
     if (( do_rsync )); then
         header "推送备份到远端"
         _rsync_push "$dir" "${dest%/}/" ""
@@ -733,21 +744,20 @@ cmd_backup() {
 }
 
 cmd_restore() {
+    umask 077 # 安全修复：保障恢复过程中临时目录的安全
     local dir="${1:-$DEFAULT_DIR}" f="${2:?用法: restore [DIR] <.sql|.sql.gz|rsync://user@host[:port]/path/file>}"
     _svc_exists "$dir" "db" || error "MariaDB 未部署"
     load_env "$dir"
 
-    # ── 支持 rsync:// URI：先拉取到临时目录再恢复 ───────────
     local _tmp_dir="" _cleanup=0
     if [[ "$f" == rsync://* ]]; then
         _check_rsync
-        _parse_rsync_uri "$f"   # 设置 RSYNC_URI_{USER,HOST,PORT,PATH}
+        _parse_rsync_uri "$f"
         _tmp_dir=$(mktemp -d)
+        chmod 700 "$_tmp_dir"
         _cleanup=1
         local _fname; _fname=$(basename "$RSYNC_URI_PATH")
-        local _remote_dir; _remote_dir=$(dirname "$RSYNC_URI_PATH")
         local _key_opt=()
-        # 优先使用 URI 中解析出的认证，密钥从 .env 取（或默认）
         [[ -n "${RSYNC_KEY:-}" ]] && _key_opt=(-i "$RSYNC_KEY")
         local _ssh_cmd="ssh -p ${RSYNC_URI_PORT} -o StrictHostKeyChecking=no -o BatchMode=yes"
         [[ ${#_key_opt[@]} -gt 0 ]] && _ssh_cmd+=" -i ${RSYNC_KEY}"
@@ -780,14 +790,18 @@ cmd_restore() {
         [[ $_cleanup -eq 1 ]] && rm -rf "$_tmp_dir"
         return
     fi
+    
     db_exec "$dir" -e "CREATE DATABASE IF NOT EXISTS \`${db}\`
         CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        
+    export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
+    
     if [[ "$f" == *.gz ]]; then
         gzip -dc "$f" | compose_run "$dir" exec -T \
-            -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" db mariadb -uroot "${db}"
+            -e MYSQL_PWD db mariadb -uroot "${db}"
     else
         compose_run "$dir" exec -T \
-            -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" db mariadb -uroot "${db}" < "$f"
+            -e MYSQL_PWD db mariadb -uroot "${db}" < "$f"
     fi
     [[ $_cleanup -eq 1 ]] && rm -rf "$_tmp_dir"
     log "恢复完成: ${db}"
@@ -796,23 +810,28 @@ cmd_restore() {
 # ════════════════════════════════════════════════════════════
 # 运维命令
 # ════════════════════════════════════════════════════════════
+
 cmd_status() {
     local dir="${1:-$DEFAULT_DIR}"; load_env "$dir"
     header "服务状态"; compose_run "$dir" ps
+    
     if _svc_exists "$dir" "db"; then
         header "MariaDB"
-        if compose_run "$dir" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
+        export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
+        if compose_run "$dir" exec -T -e MYSQL_PWD \
                 db mariadb-admin -h 127.0.0.1 --skip-ssl -uroot ping --silent 2>/dev/null; then
             log "✓ 响应正常"
             db_exec "$dir" -e "SHOW STATUS LIKE 'Threads_connected';"
         else warn "✗ 无响应"; fi
     fi
+    
     if _svc_exists "$dir" "redis"; then
         header "Redis"
-        if compose_run "$dir" exec -T redis \
-                redis-cli -h 127.0.0.1 -a "${REDIS_PASSWORD}" ping 2>/dev/null | grep -q PONG; then
+        export REDISCLI_AUTH="${REDIS_PASSWORD}"
+        if compose_run "$dir" exec -T -e REDISCLI_AUTH redis \
+                redis-cli -h 127.0.0.1 ping 2>/dev/null | grep -q PONG; then
             log "✓ 响应正常"
-            compose_run "$dir" exec -T redis redis-cli -h 127.0.0.1 -a "${REDIS_PASSWORD}" \
+            compose_run "$dir" exec -T -e REDISCLI_AUTH redis redis-cli -h 127.0.0.1 \
                 info server 2>/dev/null | grep -E "redis_version|used_memory_human|connected_clients"
         else warn "✗ 无响应"; fi
     fi
