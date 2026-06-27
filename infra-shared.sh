@@ -11,11 +11,15 @@
 #   ./infra-shared.sh clear-db [DIR] <DB>
 #   ./infra-shared.sh list-db [DIR]
 #   ./infra-shared.sh passwd  [DIR] <USER> [NEW_PW]
-#   ./infra-shared.sh backup  [DIR] [DEST]
-#   ./infra-shared.sh restore [DIR] <SQL文件|rsync://user@host[:port]/远端路径/文件>
+#   ./infra-shared.sh backup  [DIR] [DEST] [--rsync] [--alist]
+#   ./infra-shared.sh restore [DIR] <SQL文件|rsync://user@host[:port]/path/file|alist:///path/file>
 #   ./infra-shared.sh rsync-push   [DIR] [LOCAL_DIR]   # 推送备份到远端
 #   ./infra-shared.sh rsync-pull   [DIR] [LOCAL_DEST]  # 拉取远端备份到本地
 #   ./infra-shared.sh rsync-config [DIR]               # 配置/查看远端 rsync 参数
+#   ./infra-shared.sh alist-push   [DIR] [LOCAL_DIR]   # 上传备份到 AList 网盘
+#   ./infra-shared.sh alist-pull   [DIR] [LOCAL_DEST]  # 从 AList 网盘下载备份
+#   ./infra-shared.sh alist-list   [DIR] [REMOTE_PATH] # 列出 AList 网盘备份文件
+#   ./infra-shared.sh alist-config [DIR]               # 配置/测试 AList 连接
 #   ./infra-shared.sh status  [DIR]
 #   ./infra-shared.sh start   [DIR] [db|redis]
 #   ./infra-shared.sh stop    [DIR] [db|redis]
@@ -92,7 +96,7 @@ load_env() {
     [[ -f "$1/.env" ]] || error ".env 不存在: $1/.env"
     chmod 600 "$1/.env" 2>/dev/null || true
     # 允许加载的 key 白名单（防止 .env 被篡改污染关键环境变量）
-    local _ALLOWED_KEYS='WG_IP|MARIADB_ROOT_PASSWORD|MARIADB_DATABASE|MARIADB_USER|MARIADB_PASSWORD|REDIS_PASSWORD|DEPLOY_DB|DEPLOY_REDIS|RSYNC_REMOTE|RSYNC_USER|RSYNC_PORT|RSYNC_KEY|RSYNC_REMOTE_DIR'
+    local _ALLOWED_KEYS='WG_IP|MARIADB_ROOT_PASSWORD|MARIADB_DATABASE|MARIADB_USER|MARIADB_PASSWORD|REDIS_PASSWORD|DEPLOY_DB|DEPLOY_REDIS|RSYNC_REMOTE|RSYNC_USER|RSYNC_PORT|RSYNC_KEY|RSYNC_REMOTE_DIR|ALIST_MODE|ALIST_MOUNT|ALIST_URL|ALIST_TOKEN|ALIST_REMOTE_DIR'
     local key val line
     while IFS= read -r line || [[ -n "$line" ]]; do
         # 跳过注释和空行
@@ -171,19 +175,16 @@ compose_run() { local d="$1"; shift
 }
 
 db_exec() { local d="$1"; shift
-    export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
-    compose_run "$d" exec -T -e MYSQL_PWD db mariadb -uroot "$@"
+    compose_run "$d" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" db mariadb -uroot "$@"
 }
 
 db_sql() {   # DIR SQL
-    export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
-    compose_run "$1" exec -T -e MYSQL_PWD \
+    compose_run "$1" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
         db mariadb -uroot < <(printf '%s\n' "$2")
 }
 
-db_sql_on() {   # DIR DB SQL  — 直接指定目标库
-    export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
-    compose_run "$1" exec -T -e MYSQL_PWD \
+db_sql_on() {   # DIR DB SQL  — 直接指定目标库，避免 USE 在 pipe 中失效
+    compose_run "$1" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
         db mariadb -uroot "$2" < <(printf '%s\n' "$3")
 }
 
@@ -695,38 +696,398 @@ cmd_rsync_pull() {
     log "文件已拉取到: ${local_dest}"
 }
 
+# ════════════════════════════════════════════════════════════
+# AList 网盘工具函数
+# ════════════════════════════════════════════════════════════
+# 支持两种模式（ALIST_MODE）：
+#   mount  — AList 已通过 FUSE/rclone 挂载为本地目录（ALIST_MOUNT），
+#            直接用 cp/rsync 操作，无需网络凭证
+#   webdav — 通过 AList WebDAV 接口上传/下载，需要 ALIST_URL + ALIST_TOKEN，
+#            依赖 curl；不需要 FUSE 挂载权限
+
+_check_alist_deps() {
+    local mode="${ALIST_MODE:-mount}"
+    if [[ "$mode" == "webdav" ]]; then
+        command -v curl >/dev/null 2>&1 || error "webdav 模式需要 curl，请安装: apt-get install -y curl"
+    else
+        command -v rsync >/dev/null 2>&1 || error "mount 模式需要 rsync，请安装: apt-get install -y rsync"
+    fi
+}
+
+# 从 .env 读取 AList 配置并校验
+_load_alist_conf() {
+    local dir="$1"
+    load_env "$dir"
+    ALIST_MODE="${ALIST_MODE:-mount}"
+    ALIST_REMOTE_DIR="${ALIST_REMOTE_DIR:-/backup/infra}"
+    case "$ALIST_MODE" in
+        mount)
+            [[ -n "${ALIST_MOUNT:-}" ]] || error "mount 模式需要配置 ALIST_MOUNT（本地挂载点），请运行 alist-config"
+            ;;
+        webdav)
+            [[ -n "${ALIST_URL:-}"   ]] || error "webdav 模式需要配置 ALIST_URL，请运行 alist-config"
+            [[ -n "${ALIST_TOKEN:-}" ]] || error "webdav 模式需要配置 ALIST_TOKEN，请运行 alist-config"
+            # 去掉末尾斜杠
+            ALIST_URL="${ALIST_URL%/}"
+            ;;
+        *) error "ALIST_MODE 只能为 mount 或 webdav，当前: '${ALIST_MODE}'" ;;
+    esac
+}
+
+# 检测挂载点是否活跃（mount 模式）
+_alist_check_mount() {
+    local mnt="$1"
+    [[ -d "$mnt" ]] || error "AList 挂载目录不存在: ${mnt}"
+    # 尝试列出目录，判断 FUSE 是否正常工作
+    if ! timeout 5 ls "$mnt" >/dev/null 2>&1; then
+        error "AList 挂载点无响应: ${mnt}  请检查 AList 进程和 FUSE 挂载状态"
+    fi
+}
+
+# WebDAV：向 AList 发送请求，返回 HTTP 状态码
+# _alist_curl METHOD PATH [-o FILE | --data-binary @FILE | ...]
+_alist_curl() {
+    local method="$1" path="$2"; shift 2
+    local url="${ALIST_URL}/dav${path}"
+    curl -s -o /dev/null -w "%{http_code}" \
+        -X "$method" \
+        -H "Authorization: Basic $(printf '%s' ":${ALIST_TOKEN}" | base64 -w0)" \
+        "$@" \
+        "$url"
+}
+
+# WebDAV：创建远端目录（MKCOL，忽略 405 已存在）
+_alist_mkdir_webdav() {
+    local path="$1"
+    local code; code=$(_alist_curl MKCOL "$path")
+    [[ "$code" == "201" || "$code" == "405" || "$code" == "301" ]] \
+        || warn "创建目录 ${path} 返回 HTTP ${code}（可能已存在，继续）"
+}
+
+# WebDAV：上传单文件
+# _alist_upload_webdav LOCAL_FILE REMOTE_PATH
+_alist_upload_webdav() {
+    local local_file="$1" remote_path="$2"
+    local fname; fname=$(basename "$local_file")
+    local url="${ALIST_URL}/dav${remote_path%/}/${fname}"
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" \
+        -X PUT \
+        -H "Authorization: Basic $(printf '%s' ":${ALIST_TOKEN}" | base64 -w0)" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@${local_file}" \
+        "$url")
+    [[ "$code" == "200" || "$code" == "201" || "$code" == "204" ]] \
+        || error "上传 ${fname} 失败，HTTP ${code}（URL: ${url}）"
+    log "✓ 上传: ${fname}  HTTP ${code}"
+}
+
+# WebDAV：下载单文件到本地目录
+# _alist_download_webdav REMOTE_FILE_PATH LOCAL_DIR
+_alist_download_webdav() {
+    local remote_path="$1" local_dir="$2"
+    local fname; fname=$(basename "$remote_path")
+    local url="${ALIST_URL}/dav${remote_path}"
+    local out="${local_dir}/${fname}"
+    local code
+    code=$(curl -s -w "%{http_code}" \
+        -X GET \
+        -H "Authorization: Basic $(printf '%s' ":${ALIST_TOKEN}" | base64 -w0)" \
+        -o "$out" \
+        "$url")
+    [[ "$code" == "200" || "$code" == "206" ]] \
+        || { rm -f "$out"; error "下载 ${fname} 失败，HTTP ${code}"; }
+    log "✓ 下载: ${fname}  ($(du -sh "$out" | cut -f1))"
+}
+
+# WebDAV：列出远端目录（PROPFIND），输出文件名列表
+_alist_list_webdav() {
+    local remote_path="${1:-$ALIST_REMOTE_DIR}"
+    local url="${ALIST_URL}/dav${remote_path}"
+    local body
+    body=$(curl -s \
+        -X PROPFIND \
+        -H "Authorization: Basic $(printf '%s' ":${ALIST_TOKEN}" | base64 -w0)" \
+        -H "Depth: 1" \
+        -H "Content-Type: application/xml" \
+        --data '<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:displayname/><D:getcontentlength/><D:getlastmodified/></D:prop></D:propfind>' \
+        "$url" 2>/dev/null) || { warn "无法连接 AList WebDAV: ${url}"; return 1; }
+
+    # 解析 href，过滤掉目录本身，只显示 .sql.gz / .sql 文件
+    echo "$body" \
+        | grep -oP '(?<=<D:href>)[^<]+' \
+        | grep -E '\.(sql|sql\.gz)$' \
+        | sed 's|.*/dav||' \
+        | while read -r p; do printf "  %s\n" "$p"; done
+}
+
+# ── 统一对外接口：上传目录下所有 .sql.gz 文件到 AList ────────
+# _alist_push DIR LOCAL_DIR [REMOTE_SUBDIR]
+_alist_push() {
+    local dir="$1" local_dir="$2" remote_sub="${3:-}"
+    _load_alist_conf "$dir"
+    _check_alist_deps
+    local remote_dir="${ALIST_REMOTE_DIR%/}${remote_sub:+/${remote_sub}}"
+
+    case "$ALIST_MODE" in
+    mount)
+        _alist_check_mount "$ALIST_MOUNT"
+        local dest_dir="${ALIST_MOUNT%/}/${remote_dir#/}"
+        mkdir -p "$dest_dir" 2>/dev/null \
+            || warn "无法在挂载点创建目录（某些只读网盘正常），继续尝试..."
+        header "AList 挂载上传: ${local_dir} → ${dest_dir}"
+        # --no-perms --no-owner：FUSE 文件系统不支持权限操作
+        rsync -av --no-perms --no-owner --no-group \
+              --include='*.sql.gz' --include='*.sql' --exclude='*' \
+              "${local_dir%/}/" "${dest_dir%/}/" \
+            && log "上传完成 → ${dest_dir}" \
+            || error "rsync 到 AList 挂载目录失败"
+        ;;
+    webdav)
+        header "AList WebDAV 上传: ${local_dir} → ${ALIST_URL}/dav${remote_dir}"
+        _alist_mkdir_webdav "$remote_dir"
+        local f failed=0
+        while IFS= read -r -d '' f; do
+            _alist_upload_webdav "$f" "$remote_dir" || (( failed++ )) || true
+        done < <(find "$local_dir" -maxdepth 1 \( -name '*.sql.gz' -o -name '*.sql' \) -print0)
+        (( failed == 0 )) && log "全部上传完成" || { warn "${failed} 个文件上传失败"; return 1; }
+        ;;
+    esac
+}
+
+# ── 统一对外接口：从 AList 下载备份文件到本地目录 ─────────────
+# _alist_pull DIR LOCAL_DEST [REMOTE_SUBDIR]
+_alist_pull() {
+    local dir="$1" local_dest="$2" remote_sub="${3:-}"
+    _load_alist_conf "$dir"
+    _check_alist_deps
+    local remote_dir="${ALIST_REMOTE_DIR%/}${remote_sub:+/${remote_sub}}"
+    mkdir -p "$local_dest"
+
+    case "$ALIST_MODE" in
+    mount)
+        _alist_check_mount "$ALIST_MOUNT"
+        local src_dir="${ALIST_MOUNT%/}/${remote_dir#/}"
+        [[ -d "$src_dir" ]] || error "AList 挂载中找不到目录: ${src_dir}"
+        header "AList 挂载下载: ${src_dir} → ${local_dest}"
+        rsync -av --no-perms --no-owner --no-group \
+              --include='*.sql.gz' --include='*.sql' --exclude='*' \
+              "${src_dir%/}/" "${local_dest%/}/" \
+            && log "下载完成 → ${local_dest}" \
+            || error "rsync 从 AList 挂载目录失败"
+        ;;
+    webdav)
+        header "AList WebDAV 下载: ${ALIST_URL}/dav${remote_dir} → ${local_dest}"
+        # 先列出文件列表，逐个下载
+        local files; files=$(_alist_list_webdav "$remote_dir" 2>/dev/null) \
+            || error "无法列出 AList 远端目录: ${remote_dir}"
+        [[ -n "$files" ]] || { warn "远端目录为空: ${remote_dir}"; return 0; }
+        local f failed=0
+        while IFS= read -r f; do
+            f="${f#"${f%%[![:space:]]*}"}"  # trim leading spaces
+            [[ -n "$f" ]] || continue
+            _alist_download_webdav "$f" "$local_dest" || (( failed++ )) || true
+        done <<< "$files"
+        (( failed == 0 )) && log "全部下载完成 → ${local_dest}" \
+            || { warn "${failed} 个文件下载失败"; return 1; }
+        ;;
+    esac
+}
+
+# ── 列出 AList 远端备份目录内容 ──────────────────────────────
+_alist_list() {
+    local dir="$1" remote_path="${2:-}"
+    _load_alist_conf "$dir"
+    [[ -n "$remote_path" ]] || remote_path="$ALIST_REMOTE_DIR"
+
+    case "$ALIST_MODE" in
+    mount)
+        _alist_check_mount "$ALIST_MOUNT"
+        local src="${ALIST_MOUNT%/}/${remote_path#/}"
+        [[ -d "$src" ]] || { warn "目录不存在: ${src}"; return 0; }
+        ls -lht "$src" 2>/dev/null | grep -E '\.(sql|sql\.gz)$' \
+            || warn "（目录为空或无备份文件）"
+        ;;
+    webdav)
+        _check_alist_deps
+        local files; files=$(_alist_list_webdav "$remote_path")
+        [[ -n "$files" ]] && echo "$files" || warn "（目录为空或无备份文件）"
+        ;;
+    esac
+}
+
+# ── 从 AList 拉取单个文件（alist:///path/file.sql.gz URI）────
+# 下载到临时目录，返回本地路径到 stdout
+_alist_fetch_file() {
+    local dir="$1" remote_file="$2"  # remote_file = AList 内部路径，如 /backup/infra/mydb_20250101.sql.gz
+    _load_alist_conf "$dir"
+    _check_alist_deps
+    local tmp_dir; tmp_dir=$(mktemp -d)
+    local fname; fname=$(basename "$remote_file")
+
+    case "$ALIST_MODE" in
+    mount)
+        _alist_check_mount "$ALIST_MOUNT"
+        local src="${ALIST_MOUNT%/}/${remote_file#/}"
+        [[ -f "$src" ]] || { rm -rf "$tmp_dir"; error "AList 挂载中找不到文件: ${src}"; }
+        cp "$src" "${tmp_dir}/${fname}" \
+            || { rm -rf "$tmp_dir"; error "从 AList 挂载复制文件失败"; }
+        ;;
+    webdav)
+        _alist_download_webdav "$remote_file" "$tmp_dir" \
+            || { rm -rf "$tmp_dir"; error "从 AList WebDAV 下载文件失败"; }
+        ;;
+    esac
+    echo "${tmp_dir}/${fname}"
+}
+
+# ════════════════════════════════════════════════════════════
+# AList 子命令
+# ════════════════════════════════════════════════════════════
+
+# alist-config [DIR] — 交互式配置 AList 参数
+cmd_alist_config() {
+    local dir="${1:-$DEFAULT_DIR}"
+    [[ -f "$dir/.env" ]] || error ".env 不存在，请先部署: ${dir}/.env"
+    load_env "$dir"
+
+    header "当前 AList 配置"
+    printf "  ALIST_MODE       = %s\n" "${ALIST_MODE:-mount}"
+    printf "  ALIST_MOUNT      = %s\n" "${ALIST_MOUNT:-（未设置，mount 模式需要）}"
+    printf "  ALIST_URL        = %s\n" "${ALIST_URL:-（未设置，webdav 模式需要）}"
+    printf "  ALIST_TOKEN      = %s\n" "${ALIST_TOKEN:+***已设置***}${ALIST_TOKEN:-（未设置，webdav 模式需要）}"
+    printf "  ALIST_REMOTE_DIR = %s\n" "${ALIST_REMOTE_DIR:-/backup/infra}"
+    echo
+
+    read -rp "  是否修改配置？[y/N] " yn
+    [[ "${yn,,}" == "y" ]] || return 0
+
+    echo
+    echo "  AList 支持两种接入模式："
+    echo "  [1] mount  — AList 已挂载为本地 FUSE 目录（推荐，速度快）"
+    echo "  [2] webdav — 通过 AList WebDAV HTTP 接口传输（无需挂载）"
+    read -rp "  选择模式 [1=mount/2=webdav，当前: ${ALIST_MODE:-mount}]: " sel
+    case "$sel" in
+        1) _env_set "$dir" "ALIST_MODE" "mount"  ;;
+        2) _env_set "$dir" "ALIST_MODE" "webdav" ;;
+        "") : ;;  # 保持不变
+        *) warn "无效选择，保持原值" ;;
+    esac
+    load_env "$dir"  # 重新加载获取刚写入的 MODE
+
+    local val
+    if [[ "${ALIST_MODE:-mount}" == "mount" ]]; then
+        read -rp "  本地挂载点路径 [${ALIST_MOUNT:-/mnt/alist}]: " val
+        if [[ -n "$val" ]]; then
+            _env_set "$dir" "ALIST_MOUNT" "$val"
+        elif [[ -z "${ALIST_MOUNT:-}" ]]; then
+            _env_set "$dir" "ALIST_MOUNT" "/mnt/alist"
+        fi
+    else
+        read -rp "  AList 服务地址（含端口，如 http://127.0.0.1:5244）[${ALIST_URL:-}]: " val
+        [[ -n "$val" ]] && _env_set "$dir" "ALIST_URL" "${val%/}"
+
+        echo "  AList Token 获取方式："
+        echo "  方式一（推荐）：AList 管理页 → 用户 → 生成 Token"
+        echo "  方式二：AList 管理员密码（WebDAV Basic Auth 使用 guest:password 或 admin:password）"
+        read -rsp "  AList Token / 密码（输入不回显）: " val; echo
+        [[ -n "$val" ]] && _env_set "$dir" "ALIST_TOKEN" "$val"
+    fi
+
+    read -rp "  AList 内备份目录（AList 路径，如 /onedrive/backup/infra）[${ALIST_REMOTE_DIR:-/backup/infra}]: " val
+    if [[ -n "$val" ]]; then
+        _env_set "$dir" "ALIST_REMOTE_DIR" "$val"
+    elif [[ -z "${ALIST_REMOTE_DIR:-}" ]]; then
+        _env_set "$dir" "ALIST_REMOTE_DIR" "/backup/infra"
+    fi
+
+    log "AList 配置已保存到 ${dir}/.env"
+    load_env "$dir"
+
+    # 测试连通性
+    read -rp "  是否立即测试连通性？[y/N] " yn
+    if [[ "${yn,,}" == "y" ]]; then
+        _load_alist_conf "$dir"
+        case "$ALIST_MODE" in
+        mount)
+            if timeout 5 ls "$ALIST_MOUNT" >/dev/null 2>&1; then
+                log "✓ 挂载点响应正常: ${ALIST_MOUNT}"
+                ls -lh "$ALIST_MOUNT" 2>/dev/null | head -5 || true
+            else
+                warn "✗ 挂载点无响应: ${ALIST_MOUNT}，请检查 AList 和 FUSE 挂载状态"
+            fi
+            ;;
+        webdav)
+            _check_alist_deps
+            local code
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X PROPFIND \
+                -H "Authorization: Basic $(printf '%s' ":${ALIST_TOKEN}" | base64 -w0)" \
+                -H "Depth: 0" \
+                --connect-timeout 8 \
+                "${ALIST_URL}/dav/")
+            if [[ "$code" == "207" || "$code" == "200" ]]; then
+                log "✓ AList WebDAV 连接正常（HTTP ${code}）"
+            else
+                warn "✗ AList WebDAV 连接失败（HTTP ${code}）  URL: ${ALIST_URL}/dav/"
+                warn "  请确认 AList 已启动、URL 正确、Token 有效"
+            fi
+            ;;
+        esac
+    fi
+}
+
+# alist-push [DIR] [LOCAL_DIR]
+cmd_alist_push() {
+    local dir="${1:-$DEFAULT_DIR}" local_dir="${2:-${1:-$DEFAULT_DIR}/backup}"
+    [[ -d "$local_dir" ]] || error "本地目录不存在: ${local_dir}"
+    header "上传备份到 AList 网盘"
+    _alist_push "$dir" "$local_dir"
+}
+
+# alist-pull [DIR] [LOCAL_DEST]
+cmd_alist_pull() {
+    local dir="${1:-$DEFAULT_DIR}" local_dest="${2:-${1:-$DEFAULT_DIR}/backup/alist}"
+    header "从 AList 网盘下载备份 → ${local_dest}"
+    _alist_pull "$dir" "$local_dest"
+    log "文件已下载到: ${local_dest}"
+}
+
+# alist-list [DIR] [REMOTE_PATH]
+cmd_alist_list() {
+    local dir="${1:-$DEFAULT_DIR}" remote_path="${2:-}"
+    load_env "$dir"
+    header "AList 网盘备份文件列表"
+    _alist_list "$dir" "$remote_path"
+}
+
 
 # ════════════════════════════════════════════════════════════
 # 备份 / 恢复
 # ════════════════════════════════════════════════════════════
-# cmd_backup [DIR] [DEST] [--rsync]
-#   --rsync : 备份完成后自动推送到远端（须已配置 rsync-config）
-
+# cmd_backup [DIR] [DEST] [--rsync] [--alist]
+#   --rsync : 备份完成后自动推送到 rsync 远端（须已配置 rsync-config）
+#   --alist : 备份完成后自动上传到 AList 网盘（须已配置 alist-config）
 cmd_backup() {
-    umask 077 # 安全修复：强制新建目录与文件权限为 700/600
-    local dir="${1:-$DEFAULT_DIR}" dest="${2:-${1:-$DEFAULT_DIR}/backup}" do_rsync=0
-    for _a in "$@"; do [[ "$_a" == "--rsync" ]] && do_rsync=1; done
+    local dir="${1:-$DEFAULT_DIR}" dest="${2:-${1:-$DEFAULT_DIR}/backup}" do_rsync=0 do_alist=0
+    for _a in "$@"; do
+        [[ "$_a" == "--rsync" ]] && do_rsync=1
+        [[ "$_a" == "--alist" ]] && do_alist=1
+    done
 
     _svc_exists "$dir" "db" || error "MariaDB 未部署"
-    load_env "$dir"
-    
-    mkdir -p "$dest"
-    chmod 700 "$dest" # 安全修复：收紧已有目录权限
-    
+    load_env "$dir"; mkdir -p "$dest"
     local ts; ts=$(date +%Y%m%d_%H%M%S)
     header "备份 → ${dest}"
     local dbs failed=0
     dbs=$(db_exec "$dir" -sN -e \
         "SELECT schema_name FROM information_schema.schemata
          WHERE schema_name NOT IN ('mysql','information_schema','performance_schema','sys');")
-         
-    export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
-    
     while IFS= read -r db; do
         [[ -n "$db" ]] || continue
         local out="${dest}/${db}_${ts}.sql.gz" tmp="${dest}/${db}_${ts}.sql.gz.tmp"
         info "备份 ${db}..."
-        if compose_run "$dir" exec -T -e MYSQL_PWD \
+        if compose_run "$dir" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
                 db mariadb-dump -uroot --single-transaction --routines --triggers "${db}" \
             | gzip > "$tmp"; then
             mv "$tmp" "$out"
@@ -737,24 +1098,30 @@ cmd_backup() {
     done <<< "$dbs"
     (( failed == 0 )) && log "备份完成: ${dest}" || { warn "${failed} 个库失败"; return 1; }
 
+    # ── 可选 rsync 推送 ──────────────────────────────────────
     if (( do_rsync )); then
-        header "推送备份到远端"
+        header "推送备份到 rsync 远端"
         _rsync_push "$dir" "${dest%/}/" ""
+    fi
+
+    # ── 可选 AList 上传 ───────────────────────────────────────
+    if (( do_alist )); then
+        header "上传备份到 AList 网盘"
+        _alist_push "$dir" "$dest"
     fi
 }
 
 cmd_restore() {
-    umask 077 # 安全修复：保障恢复过程中临时目录的安全
-    local dir="${1:-$DEFAULT_DIR}" f="${2:?用法: restore [DIR] <.sql|.sql.gz|rsync://user@host[:port]/path/file>}"
+    local dir="${1:-$DEFAULT_DIR}" f="${2:?用法: restore [DIR] <.sql|.sql.gz|rsync://user@host[:port]/path/file|alist:///path/file>}"
     _svc_exists "$dir" "db" || error "MariaDB 未部署"
     load_env "$dir"
 
+    # ── 支持 rsync:// URI：先拉取到临时目录再恢复 ───────────
     local _tmp_dir="" _cleanup=0
     if [[ "$f" == rsync://* ]]; then
         _check_rsync
-        _parse_rsync_uri "$f"
+        _parse_rsync_uri "$f"   # 设置 RSYNC_URI_{USER,HOST,PORT,PATH}
         _tmp_dir=$(mktemp -d)
-        chmod 700 "$_tmp_dir"
         _cleanup=1
         local _fname; _fname=$(basename "$RSYNC_URI_PATH")
         local _key_opt=()
@@ -769,6 +1136,19 @@ cmd_restore() {
             || { rm -rf "$_tmp_dir"; error "rsync 拉取失败，请检查远端路径和 SSH 配置"; }
         f="${_tmp_dir}/${_fname}"
         log "已拉取到临时目录: ${f}"
+
+    # ── 支持 alist:///path URI：通过 AList 下载到临时目录 ────
+    elif [[ "$f" == alist://* ]]; then
+        # alist:///path/to/file.sql.gz  →  /path/to/file.sql.gz
+        local _alist_path="${f#alist://}"
+        # 允许 alist:///path 和 alist://path 两种写法
+        [[ "$_alist_path" == //* ]] && _alist_path="${_alist_path#/}"
+        info "从 AList 网盘获取文件: ${_alist_path}"
+        local _fetched; _fetched=$(_alist_fetch_file "$dir" "$_alist_path")
+        _tmp_dir=$(dirname "$_fetched")
+        _cleanup=1
+        f="$_fetched"
+        log "已从 AList 下载到临时目录: ${f}"
     fi
 
     [[ -f "$f" ]] || { [[ $_cleanup -eq 1 ]] && rm -rf "$_tmp_dir"; error "文件不存在: ${f}"; }
@@ -790,18 +1170,14 @@ cmd_restore() {
         [[ $_cleanup -eq 1 ]] && rm -rf "$_tmp_dir"
         return
     fi
-    
     db_exec "$dir" -e "CREATE DATABASE IF NOT EXISTS \`${db}\`
         CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-        
-    export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
-    
     if [[ "$f" == *.gz ]]; then
         gzip -dc "$f" | compose_run "$dir" exec -T \
-            -e MYSQL_PWD db mariadb -uroot "${db}"
+            -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" db mariadb -uroot "${db}"
     else
         compose_run "$dir" exec -T \
-            -e MYSQL_PWD db mariadb -uroot "${db}" < "$f"
+            -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" db mariadb -uroot "${db}" < "$f"
     fi
     [[ $_cleanup -eq 1 ]] && rm -rf "$_tmp_dir"
     log "恢复完成: ${db}"
@@ -810,28 +1186,23 @@ cmd_restore() {
 # ════════════════════════════════════════════════════════════
 # 运维命令
 # ════════════════════════════════════════════════════════════
-
 cmd_status() {
     local dir="${1:-$DEFAULT_DIR}"; load_env "$dir"
     header "服务状态"; compose_run "$dir" ps
-    
     if _svc_exists "$dir" "db"; then
         header "MariaDB"
-        export MYSQL_PWD="${MARIADB_ROOT_PASSWORD}"
-        if compose_run "$dir" exec -T -e MYSQL_PWD \
+        if compose_run "$dir" exec -T -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" \
                 db mariadb-admin -h 127.0.0.1 --skip-ssl -uroot ping --silent 2>/dev/null; then
             log "✓ 响应正常"
             db_exec "$dir" -e "SHOW STATUS LIKE 'Threads_connected';"
         else warn "✗ 无响应"; fi
     fi
-    
     if _svc_exists "$dir" "redis"; then
         header "Redis"
-        export REDISCLI_AUTH="${REDIS_PASSWORD}"
-        if compose_run "$dir" exec -T -e REDISCLI_AUTH redis \
-                redis-cli -h 127.0.0.1 ping 2>/dev/null | grep -q PONG; then
+        if compose_run "$dir" exec -T redis \
+                redis-cli -h 127.0.0.1 -a "${REDIS_PASSWORD}" ping 2>/dev/null | grep -q PONG; then
             log "✓ 响应正常"
-            compose_run "$dir" exec -T -e REDISCLI_AUTH redis redis-cli -h 127.0.0.1 \
+            compose_run "$dir" exec -T redis redis-cli -h 127.0.0.1 -a "${REDIS_PASSWORD}" \
                 info server 2>/dev/null | grep -E "redis_version|used_memory_human|connected_clients"
         else warn "✗ 无响应"; fi
     fi
@@ -1052,23 +1423,36 @@ menu_bk() {
         echo "  1) 备份所有数据库（本地）"
         echo "  2) 恢复单库（本地文件）"
         echo "  ─── 远端 rsync ──────────────────────────────"
-        echo "  3) 备份并推送到远端"
-        echo "  4) 推送现有备份到远端"
-        echo "  5) 从远端拉取备份文件"
-        echo "  6) 从远端文件直接恢复"
+        echo "  3) 备份并推送到 rsync 远端"
+        echo "  4) 推送现有备份到 rsync 远端"
+        echo "  5) 从 rsync 远端拉取备份文件"
+        echo "  6) 从 rsync 远端文件直接恢复"
         echo "  7) 配置 / 测试 rsync 远端"
+        echo "  ─── AList 网盘 ──────────────────────────────"
+        echo "  8) 备份并上传到 AList 网盘"
+        echo "  9) 上传现有备份到 AList 网盘"
+        echo "  a) 从 AList 网盘下载备份"
+        echo "  b) 从 AList 网盘直接恢复"
+        echo "  c) 列出 AList 网盘备份文件"
+        echo "  d) 配置 / 测试 AList 连接"
         echo "  ─────────────────────────────────────────────"
         echo "  0) 返回"
         echo
-        read -rp "  请选择 [0-7]: " CH
+        read -rp "  请选择 [0-9/a-d]: " CH
         case "$CH" in
-            1) menu_bk_backup        ;;
-            2) menu_bk_restore       ;;
-            3) menu_bk_backup_rsync  ;;
-            4) menu_bk_push          ;;
-            5) menu_bk_pull          ;;
-            6) menu_bk_restore_remote;;
-            7) menu_bk_rsync_config  ;;
+            1) menu_bk_backup         ;;
+            2) menu_bk_restore        ;;
+            3) menu_bk_backup_rsync   ;;
+            4) menu_bk_push           ;;
+            5) menu_bk_pull           ;;
+            6) menu_bk_restore_remote ;;
+            7) menu_bk_rsync_config   ;;
+            8) menu_bk_backup_alist   ;;
+            9) menu_bk_alist_push     ;;
+            a|A) menu_bk_alist_pull   ;;
+            b|B) menu_bk_alist_restore;;
+            c|C) menu_bk_alist_list   ;;
+            d|D) menu_bk_alist_config ;;
             0) return ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
@@ -1126,6 +1510,50 @@ menu_bk_rsync_config() {
     _menu_run cmd_rsync_config "$DIR" || true; _pause
 }
 
+# ── AList 菜单函数 ────────────────────────────────────────────
+menu_bk_backup_alist() {
+    _db_menu_head "备份所有数据库并上传到 AList 网盘"
+    _ask "本地临时目录" DEST "${DIR}/backup"; echo
+    _menu_run cmd_backup "$DIR" "$DEST" "--alist" || true; _pause
+}
+
+menu_bk_alist_push() {
+    _db_menu_head "上传现有备份目录到 AList 网盘"
+    _ask "本地备份目录" LOCAL_DIR "${DIR}/backup"; echo
+    _menu_run cmd_alist_push "$DIR" "$LOCAL_DIR" || true; _pause
+}
+
+menu_bk_alist_pull() {
+    _db_menu_head "从 AList 网盘下载备份文件到本地"
+    _ask "本地存放目录" LOCAL_DEST "${DIR}/backup/alist"; echo
+    _menu_run cmd_alist_pull "$DIR" "$LOCAL_DEST" || true; _pause
+}
+
+menu_bk_alist_restore() {
+    _db_menu_head "从 AList 网盘直接恢复数据库"
+    # 先列出网盘上的文件供参考
+    info "正在列出 AList 网盘备份目录..."
+    load_env "$DIR" 2>/dev/null || true
+    ( _alist_list "$DIR" 2>/dev/null ) || warn "无法列出 AList 文件（请先完成 alist-config）"
+    echo
+    echo "  输入格式: alist:///AList内部路径/文件名.sql.gz"
+    echo "  示例:     alist:///onedrive/backup/infra/mydb_20250101_120000.sql.gz"
+    _ask "AList 文件路径（alist:///...）" ALIST_FILE ""
+    [[ -n "$ALIST_FILE" ]] || { warn "不能为空"; _pause; return; }
+    echo; _menu_run cmd_restore "$DIR" "$ALIST_FILE" || true; _pause
+}
+
+menu_bk_alist_list() {
+    _db_menu_head "列出 AList 网盘备份文件"
+    _ask "AList 内部路径（留空用默认）" ALIST_PATH ""; echo
+    _menu_run cmd_alist_list "$DIR" ${ALIST_PATH:+"$ALIST_PATH"} || true; _pause
+}
+
+menu_bk_alist_config() {
+    _db_menu_head "配置 AList 连接"
+    _menu_run cmd_alist_config "$DIR" || true; _pause
+}
+
 # ════════════════════════════════════════════════════════════
 # 入口
 # ════════════════════════════════════════════════════════════
@@ -1146,6 +1574,10 @@ main() {
         rsync-push)   cmd_rsync_push   "$@" ;;
         rsync-pull)   cmd_rsync_pull   "$@" ;;
         rsync-config) cmd_rsync_config "$@" ;;
+        alist-push)   cmd_alist_push   "$@" ;;
+        alist-pull)   cmd_alist_pull   "$@" ;;
+        alist-list)   cmd_alist_list   "$@" ;;
+        alist-config) cmd_alist_config "$@" ;;
         status)    cmd_status   "$@" ;;
         start)     cmd_start    "$@" ;;
         stop)      cmd_stop     "$@" ;;
