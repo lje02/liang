@@ -38,6 +38,18 @@ warn()   { _c "33"   "[!!]  $*"; }
 error()  { _c "31"   "[EE]  $*"; exit 1; }
 header() { echo; _c "1;34" "══ $* ══"; }
 
+# ── 菜单安全调用包装 ─────────────────────────────────────────
+# 在菜单流程中调用命令时，error() 的 exit 1 会终止整个脚本。
+# _menu_run 在 subshell 中执行命令，捕获失败只打印错误，不退出父进程。
+_menu_run() {
+    local _exit_code=0
+    (
+        set -euo pipefail
+        "$@"
+    ) || _exit_code=$?
+    return $_exit_code
+}
+
 # ── 工具函数 ─────────────────────────────────────────────────
 randpw() {
     local p
@@ -680,7 +692,7 @@ menu_deploy() {
     esac
     warn "将部署 ${target} 到 ${DIR}（WG: ${WG_IP}）"
     read -rp "  确认? [y/N] " C; [[ "${C,,}" == "y" ]] || { info "已取消"; _pause; return; }
-    echo; cmd_deploy "$DIR" "$WG_IP" "$target"; _pause
+    echo; _menu_run cmd_deploy "$DIR" "$WG_IP" "$target" || true; _pause
 }
 
 menu_update() {
@@ -695,12 +707,12 @@ menu_update() {
     esac
     warn "将拉取最新镜像并重建 ${target}"
     read -rp "  确认? [y/N] " C; [[ "${C,,}" == "y" ]] || { info "已取消"; _pause; return; }
-    echo; cmd_update "$DIR" "$target"; _pause
+    echo; _menu_run cmd_update "$DIR" "$target" || true; _pause
 }
 
 menu_status() {
     _mhdr; _ask "部署目录" DIR "$DEFAULT_DIR"; echo
-    cmd_status "$DIR"; _pause
+    _menu_run cmd_status "$DIR" || true; _pause
 }
 
 # 通用 start/stop 菜单，op=start|stop
@@ -716,9 +728,9 @@ menu_svc() {
     esac
     read -rp "  确认${label}? [y/N] " C; [[ "${C,,}" == "y" ]] || { info "已取消"; _pause; return; }
     if [[ "$op" == "start" ]]; then
-        cmd_start "$DIR" ${svc:+"$svc"}
+        _menu_run cmd_start "$DIR" ${svc:+"$svc"} || true
     else
-        cmd_stop  "$DIR" ${svc:+"$svc"}
+        _menu_run cmd_stop  "$DIR" ${svc:+"$svc"} || true
     fi
     _pause
 }
@@ -761,34 +773,34 @@ menu_db_add() {
     _ask "数据库名" DB_NAME ""; [[ -n "$DB_NAME" ]] || { warn "不能为空"; _pause; return; }
     _ask "用户名"   DB_USER ""; [[ -n "$DB_USER" ]] || { warn "不能为空"; _pause; return; }
     _ask "密码（留空自动生成）" DB_PW "$(randpw)"; echo
-    cmd_add_db "$DIR" "$DB_NAME" "$DB_USER" "$DB_PW"; _pause
+    _menu_run cmd_add_db "$DIR" "$DB_NAME" "$DB_USER" "$DB_PW" || true; _pause
 }
 
 menu_db_del() {
     _db_menu_head "删除数据库和用户"
-    cmd_list_db "$DIR" 2>/dev/null || true; echo
+    _menu_run cmd_list_db "$DIR" 2>/dev/null || true; echo
     _ask "数据库名" DB_NAME ""; _ask "用户名" DB_USER ""
     [[ -n "$DB_NAME" && -n "$DB_USER" ]] || { warn "不能为空"; _pause; return; }
-    echo; cmd_del_db "$DIR" "$DB_NAME" "$DB_USER"; _pause
+    echo; _menu_run cmd_del_db "$DIR" "$DB_NAME" "$DB_USER" || true; _pause
 }
 
 menu_db_clear() {
     _db_menu_head "清空数据库内容（保留库和权限）"
-    cmd_list_db "$DIR" 2>/dev/null || true; echo
+    _menu_run cmd_list_db "$DIR" 2>/dev/null || true; echo
     _ask "数据库名" DB_NAME ""; [[ -n "$DB_NAME" ]] || { warn "不能为空"; _pause; return; }
-    echo; cmd_clear_db "$DIR" "$DB_NAME"; _pause
+    echo; _menu_run cmd_clear_db "$DIR" "$DB_NAME" || true; _pause
 }
 
 menu_db_list() {
     _db_menu_head "数据库 / 用户列表"; echo
-    cmd_list_db "$DIR"; _pause
+    _menu_run cmd_list_db "$DIR" || true; _pause
 }
 
 menu_db_passwd() {
     _db_menu_head "修改用户密码"
     _ask "用户名" DB_USER ""; [[ -n "$DB_USER" ]] || { warn "不能为空"; _pause; return; }
     _ask "新密码（留空自动生成）" NEW_PW "$(randpw)"; echo
-    cmd_passwd "$DIR" "$DB_USER" "$NEW_PW"; _pause
+    _menu_run cmd_passwd "$DIR" "$DB_USER" "$NEW_PW" || true; _pause
 }
 
 menu_bk() {
@@ -803,14 +815,14 @@ menu_bk() {
 menu_bk_backup() {
     _db_menu_head "备份所有数据库"
     _ask "输出目录" DEST "${DIR}/backup"; echo
-    cmd_backup "$DIR" "$DEST"; _pause
+    _menu_run cmd_backup "$DIR" "$DEST" || true; _pause
 }
 
 menu_bk_restore() {
     _db_menu_head "恢复数据库"
     _ask "SQL 文件（.sql 或 .sql.gz）" SQL_FILE ""
     [[ -n "$SQL_FILE" ]] || { warn "不能为空"; _pause; return; }
-    echo; cmd_restore "$DIR" "$SQL_FILE"; _pause
+    echo; _menu_run cmd_restore "$DIR" "$SQL_FILE" || true; _pause
 }
 
 # ════════════════════════════════════════════════════════════
