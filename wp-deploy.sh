@@ -1694,10 +1694,8 @@ cmd_rollback() {
 
     sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${SELECTED_TAG}|" "$DIR/.env"
     _ensure_insecure_registry "$REGISTRY_HOST"
-    # Fix: docker login 错误输出重定向到 stderr，不再 &>/dev/null 静默吞掉
-    docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin \
-        <<<"$REG_PASS" 2>&1 | grep -v '^$' >&2 \
-    || error "仓库登录失败，请检查用户名/密码或网络"
+    docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" \
+    || error "仓库登录失败"
     info "拉取 ${REGISTRY_HOST}/wordpress-${INST}:${SELECTED_TAG} ..."
     docker pull "${REGISTRY_HOST}/wordpress-${INST}:${SELECTED_TAG}" || error "拉取失败"
     dc "$DIR" up -d --force-recreate || error "容器重启失败"
