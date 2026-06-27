@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
-# v6.1
+# v6.2
 #   变更:
-#     [new] 备份/还原新增 AList 本地挂载目录支持
-#           - cmd_backup: 推送目标加选项 4（AList cp）及"3+4 全推"
-#           - cmd_restore: 来源加选项 4（AList 目录列表选择）
-#           - 可配置 ALIST_DEFAULT_DIR（默认 /mnt/alist/wp-backups/）
-#           - 备份时自动清理挂载目录内 30 天前的旧包
-#     继承 v6.0 全部功能
+#     [fix] cmd_restore: 重启容器前补调 _ensure_insecure_registry
+#           避免还原后镜像拉取因 insecure-registries 未配置而失败
+#     [fix] cmd_rollback: docker login 错误不再 &>/dev/null 静默吞掉
+#           登录失败时明确 error 退出，输出仓库返回的原始错误信息
+#     [fix] AList 旧备份清理：改用文件名中的 YYYYmmddHHMMSS 时间戳判断
+#           不再依赖 -mtime（FUSE 挂载后 mtime 会被重置为当前时间，导致误删）
+#     继承 v6.1 全部功能
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
@@ -1693,7 +1694,10 @@ cmd_rollback() {
 
     sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${SELECTED_TAG}|" "$DIR/.env"
     _ensure_insecure_registry "$REGISTRY_HOST"
-    docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" &>/dev/null
+    # Fix: docker login 错误输出重定向到 stderr，不再 &>/dev/null 静默吞掉
+    docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin \
+        <<<"$REG_PASS" 2>&1 | grep -v '^$' >&2 \
+    || error "仓库登录失败，请检查用户名/密码或网络"
     info "拉取 ${REGISTRY_HOST}/wordpress-${INST}:${SELECTED_TAG} ..."
     docker pull "${REGISTRY_HOST}/wordpress-${INST}:${SELECTED_TAG}" || error "拉取失败"
     dc "$DIR" up -d --force-recreate || error "容器重启失败"
@@ -1946,17 +1950,34 @@ cmd_backup() {
         fi
 
         # 自动清理 AList 目录内 30 天前的同实例备份
-        local _OLD_COUNT
-        _OLD_COUNT=$(find "$ALIST_DIR" -maxdepth 1 \
-            -name "wp-backup-${INST}-*.tar.gz" -mtime +30 2>/dev/null | wc -l)
+        # 用文件名中的时间戳（wp-backup-INST-YYYYmmddHHMMSS.tar.gz）判断，
+        # 不依赖 FUSE mtime（网盘挂载后 mtime 可能被重置为当前时间）
+        local _CUTOFF_TS _OLD_FILES _OLD_COUNT
+        _CUTOFF_TS=$(date -d '30 days ago' +%Y%m%d%H%M%S 2>/dev/null \
+            || date -v-30d +%Y%m%d%H%M%S 2>/dev/null || true)
+        if [[ -n "$_CUTOFF_TS" ]]; then
+            local -a _OLD_FILES=()
+            while IFS= read -r _f; do
+                local _fname; _fname=$(basename "$_f")
+                # 提取 YYYYmmddHHMMSS 部分（文件名格式：wp-backup-INST-TIMESTAMP.tar.gz）
+                local _ts; _ts=$(echo "$_fname" | grep -oP '\d{14}(?=\.tar\.gz$)' || true)
+                [[ -n "$_ts" && "$_ts" < "$_CUTOFF_TS" ]] && _OLD_FILES+=("$_f")
+            done < <(find "$ALIST_DIR" -maxdepth 1 -name "wp-backup-${INST}-*.tar.gz" 2>/dev/null)
+            _OLD_COUNT="${#_OLD_FILES[@]}"
+        else
+            _OLD_COUNT=0
+            warn "无法计算 30 天前时间戳，跳过 AList 旧备份清理"
+        fi
+
         if [[ "$_OLD_COUNT" -gt 0 ]]; then
             read -rp "清理 AList 目录内 30 天前的旧备份（共 ${_OLD_COUNT} 个）？[y/N]: " _AL_PRUNE || true
             if [[ "${_AL_PRUNE,,}" == "y" ]]; then
-                find "$ALIST_DIR" -maxdepth 1 \
-                    -name "wp-backup-${INST}-*.tar.gz" -mtime +30 \
-                    -exec rm -f {} \; 2>/dev/null \
-                && log "AList 旧备份清理完成" \
-                || warn "部分旧备份清理失败，请手动检查"
+                local _DEL_ERR=0
+                for _del in "${_OLD_FILES[@]}"; do
+                    rm -f "$_del" 2>/dev/null && info "  已删除：$(basename "$_del")" || { warn "  删除失败：$(basename "$_del")"; _DEL_ERR=1; }
+                done
+                [[ "$_DEL_ERR" -eq 0 ]] && log "AList 旧备份清理完成" \
+                    || warn "部分旧备份清理失败，请手动检查"
             fi
         fi
     }
@@ -2160,6 +2181,8 @@ cmd_restore() {
     local _REGISTRY_HOST; _REGISTRY_HOST=$(env_get "$DIR/.env" "REGISTRY_HOST")
     if [[ -n "$_REGISTRY_HOST" ]]; then
         local _IMAGE_TAG; _IMAGE_TAG=$(env_get "$DIR/.env" "IMAGE_TAG"); _IMAGE_TAG="${_IMAGE_TAG:-latest}"
+        # 确保本机 Docker 信任该仓库（HTTP insecure-registries），再拉取镜像
+        _ensure_insecure_registry "$_REGISTRY_HOST"
         info "重启容器（镜像: ${_REGISTRY_HOST}/wordpress-${_RESTORED_INST}:${_IMAGE_TAG}）..."
         dc "$DIR" up -d --force-recreate 2>/dev/null \
         && log "容器已重启" \
@@ -2177,7 +2200,7 @@ interactive_menu() {
     while true; do
         echo ""
         _c "1;35" "========================================"
-        _c "1;35" "  WordPress 多节点分发管理 v6.0"
+        _c "1;35" "  WordPress 多节点分发管理 v6.2"
         _c "1;35" "  多实例 | Multisite | 单容器全打包"
         _c "1;35" "========================================"
         echo -e "  \e[36m── 仓库管理 ──────────────────────────\e[0m"
@@ -2197,8 +2220,8 @@ interactive_menu() {
         echo -e "  \e[33m11.\e[0m 重试插件配置 / 补装语言包"
         echo -e "  \e[33m12.\e[0m 手动刷新全层缓存"
         echo -e "  \e[36m13.\e[0m 节点列表管理"
-        echo -e "  \e[32m15.\e[0m 备份配置（.env + conf → rsync / S3）"
-        echo -e "  \e[32m16.\e[0m 还原配置（本地 / rsync / S3）"
+        echo -e "  \e[32m15.\e[0m 备份配置（.env + conf → rsync / S3 / AList）"
+        echo -e "  \e[32m16.\e[0m 还原配置（本地 / rsync / S3 / AList）"
         echo -e "  \e[31m14.\e[0m 删除节点（不可恢复）"
         echo -e "  \e[36m 0.\e[0m 退出"
         echo "----------------------------------------"
