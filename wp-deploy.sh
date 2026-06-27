@@ -1798,6 +1798,294 @@ cmd_nodes() {
     esac
 }
 
+# ════════════════════════════════════════════════════════
+# 备份（.env + conf/）→ rsync 或 S3
+# ════════════════════════════════════════════════════════
+cmd_backup() {
+    header "备份实例配置"
+
+    local DIR INST
+    _resolve_instance DIR INST
+    [[ -f "$DIR/.env" ]] || error "未找到 .env：${DIR}"
+    local _ENV_INST; _ENV_INST=$(env_get "$DIR/.env" "WP_INSTANCE" 2>/dev/null || true)
+    [[ -n "$_ENV_INST" ]] && INST="$_ENV_INST"
+    info "实例: ${INST}"
+
+    # 备份内容：.env + conf/ 目录（含 salts、nginx、php 配置等）
+    local BACKUP_NAME="wp-backup-${INST}-$(date +%Y%m%d%H%M%S)"
+    local BACKUP_TMP; BACKUP_TMP=$(mktemp -d /tmp/${BACKUP_NAME}-XXXXXX)
+
+    local _BACKUP_DONE=false
+    _backup_cleanup() {
+        [[ "$_BACKUP_DONE" == "true" ]] && return
+        _BACKUP_DONE=true
+        rm -rf "$BACKUP_TMP"
+    }
+    trap '_backup_cleanup' RETURN ERR
+
+    info "打包备份文件..."
+    cp "$DIR/.env" "$BACKUP_TMP/.env"
+    cp -r "$DIR/conf" "$BACKUP_TMP/conf"
+    # docker-compose.yml 可重新生成，但备一份无妨
+    [[ -f "$DIR/docker-compose.yml" ]] && cp "$DIR/docker-compose.yml" "$BACKUP_TMP/docker-compose.yml"
+
+    local BACKUP_TAR="/tmp/${BACKUP_NAME}.tar.gz"
+    tar -czf "$BACKUP_TAR" -C "$(dirname "$BACKUP_TMP")" "$(basename "$BACKUP_TMP")"
+    log "本地打包完成：${BACKUP_TAR}（$(du -sh "$BACKUP_TAR" | cut -f1)）"
+
+    echo ""
+    echo "  推送目标："
+    echo "  1. rsync → 其他节点（WireGuard 内网）"
+    echo "  2. S3 / 兼容对象存储（aws s3 cp）"
+    echo "  3. 两者都推"
+    echo "  0. 仅保留本地，不推送"
+    read -rp "选择 [默认: 0]: " _PUSH_CHOICE || true
+    _PUSH_CHOICE="${_PUSH_CHOICE:-0}"
+
+    # ── rsync ──
+    _do_rsync() {
+        if ! command -v rsync &>/dev/null; then
+            warn "rsync 未安装，跳过"; return 1
+        fi
+        local RSYNC_HOST RSYNC_DEST RSYNC_USER
+        read -rp "目标节点 WireGuard IP: " RSYNC_HOST || true
+        [[ -n "$RSYNC_HOST" ]] || { warn "IP 不能为空，跳过 rsync"; return 1; }
+        read -rp "目标目录 [默认: /srv/backups/]: " RSYNC_DEST || true
+        RSYNC_DEST="${RSYNC_DEST:-/srv/backups/}"
+        read -rp "SSH 用户 [默认: root]: " RSYNC_USER || true
+        RSYNC_USER="${RSYNC_USER:-root}"
+
+        info "rsync 推送到 ${RSYNC_USER}@${RSYNC_HOST}:${RSYNC_DEST} ..."
+        rsync -avz --progress -e "ssh -o StrictHostKeyChecking=accept-new" \
+            "$BACKUP_TAR" \
+            "${RSYNC_USER}@${RSYNC_HOST}:${RSYNC_DEST}" \
+        && log "rsync 推送完成" \
+        || warn "rsync 推送失败，请检查 SSH 连通性"
+    }
+
+    # ── S3 ──
+    _do_s3() {
+        if ! command -v aws &>/dev/null; then
+            warn "aws cli 未安装（pip install awscli 或 apt install awscli），跳过"; return 1
+        fi
+        local S3_BUCKET S3_PREFIX S3_ENDPOINT
+        read -rp "S3 Bucket（如 s3://my-bucket/backups/）: " S3_BUCKET || true
+        [[ -n "$S3_BUCKET" ]] || { warn "Bucket 不能为空，跳过 S3"; return 1; }
+        # 去掉末尾斜杠，统一拼接
+        S3_BUCKET="${S3_BUCKET%/}"
+        read -rp "自定义 Endpoint（留空则用 AWS 官方）: " S3_ENDPOINT || true
+
+        local _AWS_EXTRA=()
+        [[ -n "$S3_ENDPOINT" ]] && _AWS_EXTRA+=(--endpoint-url "$S3_ENDPOINT")
+
+        # 支持从 .env 读取 S3 凭证（可选）
+        local _S3_KEY _S3_SECRET
+        _S3_KEY=$(env_get    "$DIR/.env" "S3_ACCESS_KEY" 2>/dev/null || true)
+        _S3_SECRET=$(env_get "$DIR/.env" "S3_SECRET_KEY" 2>/dev/null || true)
+        if [[ -n "$_S3_KEY" && -n "$_S3_SECRET" ]]; then
+            info "使用 .env 中的 S3 凭证"
+            export AWS_ACCESS_KEY_ID="$_S3_KEY"
+            export AWS_SECRET_ACCESS_KEY="$_S3_SECRET"
+        fi
+
+        info "S3 推送：${S3_BUCKET}/${BACKUP_NAME}.tar.gz ..."
+        aws s3 cp "${_AWS_EXTRA[@]}" \
+            "$BACKUP_TAR" \
+            "${S3_BUCKET}/${BACKUP_NAME}.tar.gz" \
+        && log "S3 推送完成：${S3_BUCKET}/${BACKUP_NAME}.tar.gz" \
+        || warn "S3 推送失败，请检查凭证与 Bucket 权限"
+
+        # 自动清理远端 30 天前的备份（同前缀）
+        read -rp "自动清理 S3 上 30 天前的备份？[y/N]: " _S3_PRUNE || true
+        if [[ "${_S3_PRUNE,,}" == "y" ]]; then
+            local CUTOFF; CUTOFF=$(date -d '30 days ago' +%Y-%m-%dT%H:%M:%S 2>/dev/null \
+                || date -v-30d +%Y-%m-%dT%H:%M:%S 2>/dev/null || true)
+            if [[ -n "$CUTOFF" ]]; then
+                info "清理 ${S3_BUCKET}/ 中早于 ${CUTOFF} 的备份..."
+                aws s3 ls "${_AWS_EXTRA[@]}" "${S3_BUCKET}/" \
+                    | awk -v cut="$CUTOFF" '$1 " " $2 < cut && /wp-backup-/ {print $4}' \
+                    | while read -r _OBJ; do
+                        aws s3 rm "${_AWS_EXTRA[@]}" "${S3_BUCKET}/${_OBJ}" && info "  已删除：${_OBJ}" || true
+                    done
+                log "S3 旧备份清理完成"
+            else
+                warn "无法计算 30 天前日期，跳过清理"
+            fi
+        fi
+    }
+
+    case "$_PUSH_CHOICE" in
+        1) _do_rsync ;;
+        2) _do_s3 ;;
+        3) _do_rsync; _do_s3 ;;
+        0) info "仅保留本地备份：${BACKUP_TAR}" ;;
+        *) warn "无效选择，仅保留本地备份" ;;
+    esac
+
+    _BACKUP_DONE=true
+    rm -rf "$BACKUP_TMP"
+
+    echo ""
+    log "备份完成！"
+    echo -e "  本地文件: \e[32m${BACKUP_TAR}\e[0m"
+    echo -e "  包含内容: .env  conf/（salts + nginx + php 配置）  docker-compose.yml"
+    echo -e "  \e[33m提示：数据库与 uploads(S3) 有独立备份，无需在此处理。\e[0m"
+}
+
+# ════════════════════════════════════════════════════════
+# 还原（从本地 tar.gz / rsync 拉取 / S3 下载）
+# ════════════════════════════════════════════════════════
+cmd_restore() {
+    header "还原实例配置"
+
+    local DIR INST
+    _resolve_instance DIR INST
+    local _ENV_INST; _ENV_INST=$(env_get "$DIR/.env" "WP_INSTANCE" 2>/dev/null || true)
+    [[ -n "$_ENV_INST" ]] && INST="$_ENV_INST"
+    info "实例: ${INST}  目录: ${DIR}"
+
+    # ── 第一步：获取备份文件 ──
+    echo ""
+    echo "  备份来源："
+    echo "  1. 本地文件（指定 tar.gz 路径）"
+    echo "  2. rsync 从其他节点拉取"
+    echo "  3. 从 S3 下载"
+    read -rp "选择 [默认: 1]: " _SRC_CHOICE || true
+    _SRC_CHOICE="${_SRC_CHOICE:-1}"
+
+    local RESTORE_TAR=""
+
+    case "$_SRC_CHOICE" in
+        1)
+            read -rp "tar.gz 路径: " RESTORE_TAR || true
+            [[ -f "$RESTORE_TAR" ]] || error "文件不存在：${RESTORE_TAR}"
+            ;;
+        2)
+            if ! command -v rsync &>/dev/null; then error "rsync 未安装"; fi
+            local RS_HOST RS_PATH RS_USER
+            read -rp "来源节点 WireGuard IP: " RS_HOST || true
+            [[ -n "$RS_HOST" ]] || error "IP 不能为空"
+            read -rp "来源路径（如 /srv/backups/wp-backup-xxx.tar.gz）: " RS_PATH || true
+            [[ -n "$RS_PATH" ]] || error "路径不能为空"
+            read -rp "SSH 用户 [默认: root]: " RS_USER || true
+            RS_USER="${RS_USER:-root}"
+            RESTORE_TAR="/tmp/$(basename "$RS_PATH")"
+            info "rsync 拉取中..."
+            rsync -avz -e "ssh -o StrictHostKeyChecking=accept-new" \
+                "${RS_USER}@${RS_HOST}:${RS_PATH}" "$RESTORE_TAR" \
+            || error "rsync 拉取失败"
+            log "已拉取到：${RESTORE_TAR}"
+            ;;
+        3)
+            if ! command -v aws &>/dev/null; then error "aws cli 未安装"; fi
+            local S3_BUCKET S3_ENDPOINT S3_OBJ
+            read -rp "S3 Bucket（如 s3://my-bucket/backups）: " S3_BUCKET || true
+            [[ -n "$S3_BUCKET" ]] || error "Bucket 不能为空"
+            S3_BUCKET="${S3_BUCKET%/}"
+            read -rp "自定义 Endpoint（留空则用 AWS 官方）: " S3_ENDPOINT || true
+            local _AWS_EXTRA=()
+            [[ -n "$S3_ENDPOINT" ]] && _AWS_EXTRA+=(--endpoint-url "$S3_ENDPOINT")
+
+            # 支持从 .env 读凭证
+            local _S3_KEY _S3_SECRET
+            _S3_KEY=$(env_get    "$DIR/.env" "S3_ACCESS_KEY" 2>/dev/null || true)
+            _S3_SECRET=$(env_get "$DIR/.env" "S3_SECRET_KEY" 2>/dev/null || true)
+            if [[ -n "$_S3_KEY" && -n "$_S3_SECRET" ]]; then
+                export AWS_ACCESS_KEY_ID="$_S3_KEY"
+                export AWS_SECRET_ACCESS_KEY="$_S3_SECRET"
+            fi
+
+            echo ""
+            info "列出 ${S3_BUCKET}/ 中的备份..."
+            local -a S3_OBJS
+            mapfile -t S3_OBJS < <(
+                aws s3 ls "${_AWS_EXTRA[@]}" "${S3_BUCKET}/" 2>/dev/null \
+                | awk '/wp-backup-/{print $4}' | sort -r
+            )
+            [[ ${#S3_OBJS[@]} -gt 0 ]] || error "未找到备份文件（前缀 wp-backup-）"
+            local i=1
+            for obj in "${S3_OBJS[@]}"; do echo "  ${i}. ${obj}"; i=$((i+1)); done
+            read -rp "选择编号: " _S3_IDX || true
+            [[ "$_S3_IDX" =~ ^[0-9]+$ ]] || error "无效编号"
+            S3_OBJ="${S3_OBJS[$((_S3_IDX-1))]}"
+            [[ -n "$S3_OBJ" ]] || error "无效选择"
+            RESTORE_TAR="/tmp/${S3_OBJ}"
+            info "下载 ${S3_BUCKET}/${S3_OBJ} ..."
+            aws s3 cp "${_AWS_EXTRA[@]}" "${S3_BUCKET}/${S3_OBJ}" "$RESTORE_TAR" \
+            || error "S3 下载失败"
+            log "已下载到：${RESTORE_TAR}"
+            ;;
+        *)
+            error "无效选择"
+            ;;
+    esac
+
+    # ── 第二步：预检 ──
+    info "检查备份内容..."
+    tar -tzf "$RESTORE_TAR" | grep -q '\.env' || error "备份包中未找到 .env，文件可能损坏"
+    tar -tzf "$RESTORE_TAR" | grep -q 'conf/' || warn "备份包中未找到 conf/ 目录"
+
+    echo ""
+    warn "还原将覆盖以下文件（容器会自动重启）："
+    echo "  ${DIR}/.env"
+    echo "  ${DIR}/conf/"
+    echo "  ${DIR}/docker-compose.yml（如包含）"
+    read -rp "确认还原？[y/N]: " _CONFIRM || true
+    [[ "${_CONFIRM,,}" == "y" ]] || { info "已取消"; return; }
+
+    # ── 第三步：停止容器 ──
+    if [[ -f "$DIR/docker-compose.yml" ]]; then
+        info "停止容器..."
+        dc "$DIR" stop 2>/dev/null || true
+    fi
+
+    # ── 第四步：备份当前配置（防止还原出问题） ──
+    if [[ -f "$DIR/.env" ]]; then
+        local _PRE_BAK="/tmp/wp-pre-restore-${INST}-$(date +%Y%m%d%H%M%S).tar.gz"
+        tar -czf "$_PRE_BAK" -C "$DIR" .env conf docker-compose.yml 2>/dev/null || true
+        info "已将当前配置预备份至：${_PRE_BAK}"
+    fi
+
+    # ── 第五步：解压还原 ──
+    info "解压还原..."
+    local EXTRACT_TMP; EXTRACT_TMP=$(mktemp -d /tmp/wp-restore-XXXXXX)
+    tar -xzf "$RESTORE_TAR" -C "$EXTRACT_TMP"
+
+    # 找到解压后的子目录（备份时用了随机 tmpdir 名）
+    local RESTORE_SRC
+    RESTORE_SRC=$(find "$EXTRACT_TMP" -maxdepth 1 -mindepth 1 -type d | head -1)
+    [[ -n "$RESTORE_SRC" ]] || RESTORE_SRC="$EXTRACT_TMP"
+
+    mkdir -p "$DIR/conf"
+    [[ -f "$RESTORE_SRC/.env" ]]              && cp "$RESTORE_SRC/.env"              "$DIR/.env"              && log "  .env 已还原"
+    [[ -d "$RESTORE_SRC/conf" ]]              && cp -r "$RESTORE_SRC/conf/." "$DIR/conf/"                     && log "  conf/ 已还原"
+    [[ -f "$RESTORE_SRC/docker-compose.yml" ]] && cp "$RESTORE_SRC/docker-compose.yml" "$DIR/docker-compose.yml" && log "  docker-compose.yml 已还原"
+
+    rm -rf "$EXTRACT_TMP"
+
+    # ── 第六步：重建 compose（确保镜像名与实例一致） ──
+    local _RESTORED_INST; _RESTORED_INST=$(env_get "$DIR/.env" "WP_INSTANCE" 2>/dev/null || true)
+    _RESTORED_INST="${_RESTORED_INST:-$INST}"
+    _write_worker_compose "$DIR" "$_RESTORED_INST"
+    log "  docker-compose.yml 已按实例名重建"
+
+    # ── 第七步：重启容器 ──
+    local _REGISTRY_HOST; _REGISTRY_HOST=$(env_get "$DIR/.env" "REGISTRY_HOST")
+    if [[ -n "$_REGISTRY_HOST" ]]; then
+        local _IMAGE_TAG; _IMAGE_TAG=$(env_get "$DIR/.env" "IMAGE_TAG"); _IMAGE_TAG="${_IMAGE_TAG:-latest}"
+        info "重启容器（镜像: ${_REGISTRY_HOST}/wordpress-${_RESTORED_INST}:${_IMAGE_TAG}）..."
+        dc "$DIR" up -d --force-recreate 2>/dev/null \
+        && log "容器已重启" \
+        || warn "容器重启失败，请手动执行菜单 8（启动节点）"
+    else
+        warn "未找到 REGISTRY_HOST，跳过自动重启，请手动执行菜单 8"
+    fi
+
+    echo ""
+    log "还原完成！"
+    echo -e "  \e[33m如 salts 已变更，所有节点登录 cookie 将失效，用户需重新登录（正常现象）。\e[0m"
+}
+
 interactive_menu() {
     while true; do
         echo ""
@@ -1822,6 +2110,8 @@ interactive_menu() {
         echo -e "  \e[33m11.\e[0m 重试插件配置 / 补装语言包"
         echo -e "  \e[33m12.\e[0m 手动刷新全层缓存"
         echo -e "  \e[36m13.\e[0m 节点列表管理"
+        echo -e "  \e[32m15.\e[0m 备份配置（.env + conf → rsync / S3）"
+        echo -e "  \e[32m16.\e[0m 还原配置（本地 / rsync / S3）"
         echo -e "  \e[31m14.\e[0m 删除节点（不可恢复）"
         echo -e "  \e[36m 0.\e[0m 退出"
         echo "----------------------------------------"
@@ -1841,6 +2131,8 @@ interactive_menu() {
             12) cmd_flush ;;
             13) cmd_nodes ;;
             14) cmd_destroy ;;
+            15) cmd_backup ;;
+            16) cmd_restore ;;
             0)  info "再见！"; exit 0 ;;
             *)  warn "无效输入" ;;
         esac
