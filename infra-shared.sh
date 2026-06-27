@@ -12,7 +12,10 @@
 #   ./infra-shared.sh list-db [DIR]
 #   ./infra-shared.sh passwd  [DIR] <USER> [NEW_PW]
 #   ./infra-shared.sh backup  [DIR] [DEST]
-#   ./infra-shared.sh restore [DIR] <SQL文件>
+#   ./infra-shared.sh restore [DIR] <SQL文件|rsync://user@host[:port]/远端路径/文件>
+#   ./infra-shared.sh rsync-push   [DIR] [LOCAL_DIR]   # 推送备份到远端
+#   ./infra-shared.sh rsync-pull   [DIR] [LOCAL_DEST]  # 拉取远端备份到本地
+#   ./infra-shared.sh rsync-config [DIR]               # 配置/查看远端 rsync 参数
 #   ./infra-shared.sh status  [DIR]
 #   ./infra-shared.sh start   [DIR] [db|redis]
 #   ./infra-shared.sh stop    [DIR] [db|redis]
@@ -89,7 +92,7 @@ load_env() {
     [[ -f "$1/.env" ]] || error ".env 不存在: $1/.env"
     chmod 600 "$1/.env" 2>/dev/null || true
     # 允许加载的 key 白名单（防止 .env 被篡改污染关键环境变量）
-    local _ALLOWED_KEYS='WG_IP|MARIADB_ROOT_PASSWORD|MARIADB_DATABASE|MARIADB_USER|MARIADB_PASSWORD|REDIS_PASSWORD|DEPLOY_DB|DEPLOY_REDIS'
+    local _ALLOWED_KEYS='WG_IP|MARIADB_ROOT_PASSWORD|MARIADB_DATABASE|MARIADB_USER|MARIADB_PASSWORD|REDIS_PASSWORD|DEPLOY_DB|DEPLOY_REDIS|RSYNC_REMOTE|RSYNC_USER|RSYNC_PORT|RSYNC_KEY|RSYNC_REMOTE_DIR'
     local key val line
     while IFS= read -r line || [[ -n "$line" ]]; do
         # 跳过注释和空行
@@ -513,10 +516,192 @@ cmd_passwd() {
 }
 
 # ════════════════════════════════════════════════════════════
+# rsync 工具函数
+# ════════════════════════════════════════════════════════════
+
+# 校验 rsync 依赖
+_check_rsync() {
+    command -v rsync >/dev/null 2>&1 || error "未找到 rsync，请先安装: apt-get install -y rsync"
+    command -v ssh   >/dev/null 2>&1 || error "未找到 ssh，请先安装 openssh-client"
+}
+
+# 从 .env 读取 rsync 配置，缺失时报错
+_load_rsync_conf() {
+    local dir="$1"
+    load_env "$dir"
+    [[ -n "${RSYNC_REMOTE:-}"     ]] || error "未配置 RSYNC_REMOTE，请先运行 rsync-config"
+    [[ -n "${RSYNC_USER:-}"       ]] || error "未配置 RSYNC_USER，请先运行 rsync-config"
+    [[ -n "${RSYNC_REMOTE_DIR:-}" ]] || error "未配置 RSYNC_REMOTE_DIR，请先运行 rsync-config"
+    RSYNC_PORT="${RSYNC_PORT:-22}"
+    RSYNC_KEY="${RSYNC_KEY:-}"
+}
+
+# 构建 rsync SSH 选项数组
+_rsync_ssh_opts() {
+    local key="${RSYNC_KEY:-}" port="${RSYNC_PORT:-22}"
+    local ssh_cmd="ssh -p ${port} -o StrictHostKeyChecking=no -o BatchMode=yes"
+    [[ -n "$key" ]] && ssh_cmd+=" -i ${key}"
+    echo "$ssh_cmd"
+}
+
+# 推送本地目录/文件 → 远端目录
+# _rsync_push DIR SRC_PATH [REMOTE_DEST_DIR]
+_rsync_push() {
+    local dir="$1" src="$2" remote_dest="${3:-}"
+    _check_rsync
+    _load_rsync_conf "$dir"
+    [[ -n "$remote_dest" ]] || remote_dest="$RSYNC_REMOTE_DIR"
+    local ssh_cmd; ssh_cmd=$(_rsync_ssh_opts)
+
+    info "rsync 推送: ${src} → ${RSYNC_USER}@${RSYNC_REMOTE}:${remote_dest}"
+    rsync -avz --progress \
+        -e "$ssh_cmd" \
+        "$src" \
+        "${RSYNC_USER}@${RSYNC_REMOTE}:${remote_dest}" \
+        && log "推送完成" \
+        || error "rsync 推送失败（退出码 $?）"
+}
+
+# 从远端目录拉取文件 → 本地目录
+# _rsync_pull DIR REMOTE_SRC LOCAL_DEST
+_rsync_pull() {
+    local dir="$1" remote_src="$2" local_dest="$3"
+    _check_rsync
+    _load_rsync_conf "$dir"
+    local ssh_cmd; ssh_cmd=$(_rsync_ssh_opts)
+    mkdir -p "$local_dest"
+
+    info "rsync 拉取: ${RSYNC_USER}@${RSYNC_REMOTE}:${remote_src} → ${local_dest}"
+    rsync -avz --progress \
+        -e "$ssh_cmd" \
+        "${RSYNC_USER}@${RSYNC_REMOTE}:${remote_src}" \
+        "$local_dest/" \
+        && log "拉取完成" \
+        || error "rsync 拉取失败（退出码 $?）"
+}
+
+# 列出远端目录内容
+_rsync_list() {
+    local dir="$1" remote_path="${2:-}"
+    _check_rsync
+    _load_rsync_conf "$dir"
+    [[ -n "$remote_path" ]] || remote_path="$RSYNC_REMOTE_DIR"
+    local ssh_cmd; ssh_cmd=$(_rsync_ssh_opts)
+    ssh -p "${RSYNC_PORT}" ${RSYNC_KEY:+-i "$RSYNC_KEY"} \
+        -o StrictHostKeyChecking=no -o BatchMode=yes \
+        "${RSYNC_USER}@${RSYNC_REMOTE}" \
+        "ls -lht '${remote_path}' 2>/dev/null || echo '（目录为空或不存在）'"
+}
+
+# 解析 rsync URI: rsync://user@host:port/path/to/file
+# 输出: RSYNC_URI_USER  RSYNC_URI_HOST  RSYNC_URI_PORT  RSYNC_URI_PATH
+_parse_rsync_uri() {
+    local uri="$1"
+    # rsync://user@host:port/path  or  rsync://user@host/path
+    if [[ "$uri" =~ ^rsync://([^@]+)@([^:/]+)(:([0-9]+))?(/.*)?$ ]]; then
+        RSYNC_URI_USER="${BASH_REMATCH[1]}"
+        RSYNC_URI_HOST="${BASH_REMATCH[2]}"
+        RSYNC_URI_PORT="${BASH_REMATCH[4]:-22}"
+        RSYNC_URI_PATH="${BASH_REMATCH[5]:-/}"
+    else
+        error "无法解析 rsync URI: '${uri}'  格式: rsync://user@host[:port]/path/file"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════
+# rsync 子命令
+# ════════════════════════════════════════════════════════════
+
+# rsync-config [DIR] — 交互式设置或显示当前 rsync 配置
+cmd_rsync_config() {
+    local dir="${1:-$DEFAULT_DIR}"
+    [[ -f "$dir/.env" ]] || error ".env 不存在，请先部署: ${dir}/.env"
+    load_env "$dir"
+
+    header "当前 rsync 配置"
+    printf "  RSYNC_REMOTE     = %s\n" "${RSYNC_REMOTE:-（未设置）}"
+    printf "  RSYNC_USER       = %s\n" "${RSYNC_USER:-（未设置）}"
+    printf "  RSYNC_PORT       = %s\n" "${RSYNC_PORT:-22}"
+    printf "  RSYNC_KEY        = %s\n" "${RSYNC_KEY:-（使用默认密钥）}"
+    printf "  RSYNC_REMOTE_DIR = %s\n" "${RSYNC_REMOTE_DIR:-（未设置）}"
+    echo
+
+    read -rp "  是否修改配置？[y/N] " yn
+    [[ "${yn,,}" == "y" ]] || return 0
+
+    local val
+    read -rp "  远端主机 IP/域名 [${RSYNC_REMOTE:-}]: " val
+    [[ -n "$val" ]] && _env_set "$dir" "RSYNC_REMOTE" "$val"
+
+    read -rp "  SSH 用户名 [${RSYNC_USER:-root}]: " val
+    [[ -n "$val" ]] && _env_set "$dir" "RSYNC_USER" "$val" || \
+        { [[ -z "${RSYNC_USER:-}" ]] && _env_set "$dir" "RSYNC_USER" "root"; }
+
+    read -rp "  SSH 端口 [${RSYNC_PORT:-22}]: " val
+    [[ -n "$val" ]] && _env_set "$dir" "RSYNC_PORT" "$val" || \
+        { [[ -z "${RSYNC_PORT:-}" ]] && _env_set "$dir" "RSYNC_PORT" "22"; }
+
+    read -rp "  SSH 私钥路径（留空使用默认）[${RSYNC_KEY:-}]: " val
+    if [[ -n "$val" ]]; then
+        [[ -f "$val" ]] || warn "警告：密钥文件不存在: ${val}"
+        _env_set "$dir" "RSYNC_KEY" "$val"
+    fi
+
+    read -rp "  远端备份目录 [${RSYNC_REMOTE_DIR:-/backup/infra}]: " val
+    if [[ -n "$val" ]]; then
+        _env_set "$dir" "RSYNC_REMOTE_DIR" "$val"
+    else
+        [[ -z "${RSYNC_REMOTE_DIR:-}" ]] && _env_set "$dir" "RSYNC_REMOTE_DIR" "/backup/infra"
+    fi
+
+    log "rsync 配置已保存到 ${dir}/.env"
+
+    # 可选：测试连通性
+    read -rp "  是否立即测试连通性？[y/N] " yn
+    if [[ "${yn,,}" == "y" ]]; then
+        load_env "$dir"
+        _check_rsync
+        local key_opt=(); [[ -n "${RSYNC_KEY:-}" ]] && key_opt=(-i "$RSYNC_KEY")
+        if ssh -p "${RSYNC_PORT:-22}" "${key_opt[@]}" \
+               -o StrictHostKeyChecking=no -o BatchMode=yes \
+               -o ConnectTimeout=10 \
+               "${RSYNC_USER}@${RSYNC_REMOTE}" "echo OK" 2>/dev/null | grep -q OK; then
+            log "✓ SSH 连通正常"
+        else
+            warn "✗ SSH 连接失败，请检查主机/用户/密钥/端口配置"
+        fi
+    fi
+}
+
+# rsync-push [DIR] [LOCAL_DIR]
+cmd_rsync_push() {
+    local dir="${1:-$DEFAULT_DIR}" local_dir="${2:-${1:-$DEFAULT_DIR}/backup}"
+    [[ -d "$local_dir" ]] || error "本地目录不存在: ${local_dir}"
+    load_env "$dir"
+    header "推送备份 → 远端"
+    _rsync_push "$dir" "${local_dir%/}/" ""
+}
+
+# rsync-pull [DIR] [LOCAL_DEST]
+cmd_rsync_pull() {
+    local dir="${1:-$DEFAULT_DIR}" local_dest="${2:-${1:-$DEFAULT_DIR}/backup/remote}"
+    load_env "$dir"
+    header "拉取远端备份 → ${local_dest}"
+    _load_rsync_conf "$dir"
+    _rsync_pull "$dir" "${RSYNC_REMOTE_DIR%/}/" "$local_dest"
+    log "文件已拉取到: ${local_dest}"
+}
+
+
+# ════════════════════════════════════════════════════════════
 # 备份 / 恢复
 # ════════════════════════════════════════════════════════════
+# cmd_backup [DIR] [DEST] [--rsync]
+#   --rsync : 备份完成后自动推送到远端（须已配置 rsync-config）
 cmd_backup() {
-    local dir="${1:-$DEFAULT_DIR}" dest="${2:-${1:-$DEFAULT_DIR}/backup}"
+    local dir="${1:-$DEFAULT_DIR}" dest="${2:-${1:-$DEFAULT_DIR}/backup}" do_rsync=0
+    for _a in "$@"; do [[ "$_a" == "--rsync" ]] && do_rsync=1; done
+
     _svc_exists "$dir" "db" || error "MariaDB 未部署"
     load_env "$dir"; mkdir -p "$dest"
     local ts; ts=$(date +%Y%m%d_%H%M%S)
@@ -539,13 +724,46 @@ cmd_backup() {
         fi
     done <<< "$dbs"
     (( failed == 0 )) && log "备份完成: ${dest}" || { warn "${failed} 个库失败"; return 1; }
+
+    # ── 可选 rsync 推送 ──────────────────────────────────────
+    if (( do_rsync )); then
+        header "推送备份到远端"
+        _rsync_push "$dir" "${dest%/}/" ""
+    fi
 }
 
 cmd_restore() {
-    local dir="${1:-$DEFAULT_DIR}" f="${2:?用法: restore [DIR] <.sql|.sql.gz>}"
+    local dir="${1:-$DEFAULT_DIR}" f="${2:?用法: restore [DIR] <.sql|.sql.gz|rsync://user@host[:port]/path/file>}"
     _svc_exists "$dir" "db" || error "MariaDB 未部署"
-    load_env "$dir"; [[ -f "$f" ]] || error "文件不存在: ${f}"
-    [[ "$f" == *.gz ]] && { gzip -t "$f" || error "gz 文件损坏: ${f}"; }
+    load_env "$dir"
+
+    # ── 支持 rsync:// URI：先拉取到临时目录再恢复 ───────────
+    local _tmp_dir="" _cleanup=0
+    if [[ "$f" == rsync://* ]]; then
+        _check_rsync
+        _parse_rsync_uri "$f"   # 设置 RSYNC_URI_{USER,HOST,PORT,PATH}
+        _tmp_dir=$(mktemp -d)
+        _cleanup=1
+        local _fname; _fname=$(basename "$RSYNC_URI_PATH")
+        local _remote_dir; _remote_dir=$(dirname "$RSYNC_URI_PATH")
+        local _key_opt=()
+        # 优先使用 URI 中解析出的认证，密钥从 .env 取（或默认）
+        [[ -n "${RSYNC_KEY:-}" ]] && _key_opt=(-i "$RSYNC_KEY")
+        local _ssh_cmd="ssh -p ${RSYNC_URI_PORT} -o StrictHostKeyChecking=no -o BatchMode=yes"
+        [[ ${#_key_opt[@]} -gt 0 ]] && _ssh_cmd+=" -i ${RSYNC_KEY}"
+        info "从远端拉取: ${RSYNC_URI_USER}@${RSYNC_URI_HOST}:${RSYNC_URI_PATH}"
+        rsync -avz --progress \
+            -e "$_ssh_cmd" \
+            "${RSYNC_URI_USER}@${RSYNC_URI_HOST}:${RSYNC_URI_PATH}" \
+            "${_tmp_dir}/" \
+            || { rm -rf "$_tmp_dir"; error "rsync 拉取失败，请检查远端路径和 SSH 配置"; }
+        f="${_tmp_dir}/${_fname}"
+        log "已拉取到临时目录: ${f}"
+    fi
+
+    [[ -f "$f" ]] || { [[ $_cleanup -eq 1 ]] && rm -rf "$_tmp_dir"; error "文件不存在: ${f}"; }
+    [[ "$f" == *.gz ]] && { gzip -t "$f" || { [[ $_cleanup -eq 1 ]] && rm -rf "$_tmp_dir"; error "gz 文件损坏: ${f}"; }; }
+
     local base; base=$(basename "$f")
     local db="${base%.sql.gz}"; db="${db%.sql}"
     db="${db%_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]}"
@@ -557,7 +775,11 @@ cmd_restore() {
         warn "将从文件名推断目标库为: ${db}（如不正确请 Ctrl+C 后手动指定）"
     fi
     warn "将恢复到库: ${db}"; read -rp "确认? [y/N] " c
-    [[ "${c,,}" == "y" ]] || { info "已取消"; return; }
+    if [[ "${c,,}" != "y" ]]; then
+        info "已取消"
+        [[ $_cleanup -eq 1 ]] && rm -rf "$_tmp_dir"
+        return
+    fi
     db_exec "$dir" -e "CREATE DATABASE IF NOT EXISTS \`${db}\`
         CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
     if [[ "$f" == *.gz ]]; then
@@ -567,6 +789,7 @@ cmd_restore() {
         compose_run "$dir" exec -T \
             -e MYSQL_PWD="${MARIADB_ROOT_PASSWORD}" db mariadb -uroot "${db}" < "$f"
     fi
+    [[ $_cleanup -eq 1 ]] && rm -rf "$_tmp_dir"
     log "恢复完成: ${db}"
 }
 
@@ -806,23 +1029,82 @@ menu_db_passwd() {
 menu_bk() {
     while true; do
         _mhdr; _c "1;33" "  ▶ 备份 / 恢复"; echo
-        echo "  1) 备份所有数据库  2) 恢复单库  0) 返回"
-        read -rp "  请选择 [0-2]: " CH
-        case "$CH" in 1) menu_bk_backup ;; 2) menu_bk_restore ;; 0) return ;; *) warn "无效"; sleep 1 ;; esac
+        echo "  ─── 本地 ────────────────────────────────────"
+        echo "  1) 备份所有数据库（本地）"
+        echo "  2) 恢复单库（本地文件）"
+        echo "  ─── 远端 rsync ──────────────────────────────"
+        echo "  3) 备份并推送到远端"
+        echo "  4) 推送现有备份到远端"
+        echo "  5) 从远端拉取备份文件"
+        echo "  6) 从远端文件直接恢复"
+        echo "  7) 配置 / 测试 rsync 远端"
+        echo "  ─────────────────────────────────────────────"
+        echo "  0) 返回"
+        echo
+        read -rp "  请选择 [0-7]: " CH
+        case "$CH" in
+            1) menu_bk_backup        ;;
+            2) menu_bk_restore       ;;
+            3) menu_bk_backup_rsync  ;;
+            4) menu_bk_push          ;;
+            5) menu_bk_pull          ;;
+            6) menu_bk_restore_remote;;
+            7) menu_bk_rsync_config  ;;
+            0) return ;;
+            *) warn "无效选项"; sleep 1 ;;
+        esac
     done
 }
 
 menu_bk_backup() {
-    _db_menu_head "备份所有数据库"
+    _db_menu_head "备份所有数据库（本地）"
     _ask "输出目录" DEST "${DIR}/backup"; echo
     _menu_run cmd_backup "$DIR" "$DEST" || true; _pause
 }
 
 menu_bk_restore() {
-    _db_menu_head "恢复数据库"
+    _db_menu_head "恢复数据库（本地文件）"
     _ask "SQL 文件（.sql 或 .sql.gz）" SQL_FILE ""
     [[ -n "$SQL_FILE" ]] || { warn "不能为空"; _pause; return; }
     echo; _menu_run cmd_restore "$DIR" "$SQL_FILE" || true; _pause
+}
+
+menu_bk_backup_rsync() {
+    _db_menu_head "备份所有数据库并推送到远端"
+    _ask "本地输出目录" DEST "${DIR}/backup"; echo
+    _menu_run cmd_backup "$DIR" "$DEST" "--rsync" || true; _pause
+}
+
+menu_bk_push() {
+    _db_menu_head "推送现有备份目录到远端"
+    _ask "本地备份目录" LOCAL_DIR "${DIR}/backup"; echo
+    _menu_run cmd_rsync_push "$DIR" "$LOCAL_DIR" || true; _pause
+}
+
+menu_bk_pull() {
+    _db_menu_head "从远端拉取备份文件到本地"
+    _ask "本地存放目录" LOCAL_DEST "${DIR}/backup/remote"; echo
+    _menu_run cmd_rsync_pull "$DIR" "$LOCAL_DEST" || true; _pause
+}
+
+menu_bk_restore_remote() {
+    _db_menu_head "从远端文件直接恢复"
+    # 先列出远端文件供参考
+    info "正在列出远端备份目录..."
+    load_env "$DIR" 2>/dev/null || true
+    (
+        _load_rsync_conf "$DIR" 2>/dev/null \
+        && _rsync_list "$DIR" 2>/dev/null
+    ) || warn "无法列出远端文件（请确认 rsync 已配置）"
+    echo
+    _ask "远端文件路径（rsync://user@host[:port]/path/file.sql.gz）" REMOTE_FILE ""
+    [[ -n "$REMOTE_FILE" ]] || { warn "不能为空"; _pause; return; }
+    echo; _menu_run cmd_restore "$DIR" "$REMOTE_FILE" || true; _pause
+}
+
+menu_bk_rsync_config() {
+    _db_menu_head "配置 rsync 远端"
+    _menu_run cmd_rsync_config "$DIR" || true; _pause
 }
 
 # ════════════════════════════════════════════════════════════
@@ -840,8 +1122,11 @@ main() {
         clear-db)  cmd_clear_db "$@" ;;
         list-db)   cmd_list_db  "$@" ;;
         passwd)    cmd_passwd   "$@" ;;
-        backup)    cmd_backup   "$@" ;;
-        restore)   cmd_restore  "$@" ;;
+        backup)       cmd_backup       "$@" ;;
+        restore)      cmd_restore      "$@" ;;
+        rsync-push)   cmd_rsync_push   "$@" ;;
+        rsync-pull)   cmd_rsync_pull   "$@" ;;
+        rsync-config) cmd_rsync_config "$@" ;;
         status)    cmd_status   "$@" ;;
         start)     cmd_start    "$@" ;;
         stop)      cmd_stop     "$@" ;;
