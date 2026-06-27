@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
-# v5.0
+# v6.0
 #   变更:
-#     [fix] nginx-wp.conf 始终写占位符，主/工作节点统一 sed 替换
-#     [fix] 语言包安装移至 _setup_plugins 末尾（菜单 11 也生效）
-#     [fix] 主题/插件语言包一并安装
-#     [new] Salts 本地生成、写入 .env，打包时注入 wp-config-extra.php
-#           确保多节点 cookie 互认
-#     [new] WP_DEBUG 显式关闭
-#     [new] 禁用内置 WP-Cron，主节点初始化后打印 crontab 提示
-#     [new] nginx 层 /health 健康检查端点
-#     继承 v4.9 全部修复
+#     [new] 多实例支持：每个实例独立目录/镜像名/nodes.conf
+#           BASE_DIR 下以实例名为子目录，所有 cmd_* 统一通过
+#           _resolve_instance 选择/创建实例
+#     [new] WordPress Multisite 支持（子目录 & 子域名两种模式）
+#           - wp-config-extra.php 自动注入 Multisite 常量
+#           - nginx-wp.conf 子目录模式注入 rewrite 规则
+#           - nginx-wp.conf 子域名模式设置通配符 server_name
+#           - _setup_plugins 调用 wp core multisite-install
+#     继承 v5.0 全部修复
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 BASE_DIR="${BASE_DIR:-/srv}"
-DEFAULT_DIR="${BASE_DIR}/wordpress"
 WG_IFACE="${WG_IFACE:-wg0}"
-NODES_FILE="${BASE_DIR}/nodes.conf"
 REGISTRY_DIR="${BASE_DIR}/registry"
+
+# 当前操作实例（由 _resolve_instance 填充）
+INSTANCE=""
+INSTANCE_DIR=""
+NODES_FILE=""
 
 _c()     { printf "\e[%sm%s\e[0m\n" "$1" "$2"; }
 log()    { _c "32"   "[成功] $*"; }
@@ -109,11 +112,59 @@ _gen_salt() {
         < /dev/urandom 2>/dev/null | head -c 64; true
 }
 
+# ════════════════════════════════════════════════════════
+# 实例管理：选择或创建实例，设置 INSTANCE / INSTANCE_DIR / NODES_FILE
+# ════════════════════════════════════════════════════════
+_resolve_instance() {
+    local -n _dir_ref=$1
+    local -n _inst_ref=$2
+
+    local instances=()
+    if [[ -d "$BASE_DIR" ]]; then
+        while IFS= read -r d; do
+            [[ -f "$d/.env" ]] && instances+=("$(basename "$d")")
+        done < <(find "$BASE_DIR" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort)
+    fi
+
+    if [[ ${#instances[@]} -gt 0 ]]; then
+        echo ""
+        echo "已有实例："
+        local i=1
+        for inst in "${instances[@]}"; do
+            echo "  ${i}. ${inst}"
+            i=$((i+1))
+        done
+        echo "  n. 新建实例"
+        read -rp "选择实例编号或输入新实例名 [默认: 1]: " _sel || true
+        _sel="${_sel:-1}"
+        if [[ "$_sel" == "n" || ! "$_sel" =~ ^[0-9]+$ ]]; then
+            local _new="$_sel"
+            [[ "$_sel" == "n" ]] && { read -rp "新实例名（字母/数字/下划线）: " _new || true; }
+            [[ "$_new" =~ ^[a-zA-Z0-9_-]+$ ]] || error "实例名只允许字母、数字、下划线、连字符"
+            _inst_ref="$_new"
+        else
+            _inst_ref="${instances[$((_sel-1))]}"
+            [[ -n "$_inst_ref" ]] || error "无效选择"
+        fi
+    else
+        read -rp "实例名 [默认: wordpress]: " _inst_ref || true
+        _inst_ref="${_inst_ref:-wordpress}"
+        [[ "$_inst_ref" =~ ^[a-zA-Z0-9_-]+$ ]] || error "实例名只允许字母、数字、下划线、连字符"
+    fi
+
+    _dir_ref="${BASE_DIR}/${_inst_ref}"
+    # 同步更新全局实例变量
+    INSTANCE="$_inst_ref"
+    INSTANCE_DIR="$_dir_ref"
+    NODES_FILE="${_dir_ref}/nodes.conf"
+}
+
 _register_node() {
     local IP="$1"
     if [[ ! "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
         error "_register_node: 无效 IP 格式：${IP}"
     fi
+    [[ -n "$NODES_FILE" ]] || error "_register_node: NODES_FILE 未设置，请先调用 _resolve_instance"
     touch "$NODES_FILE"
     if ! grep -qxF "$IP" "$NODES_FILE"; then
         [[ -s "$NODES_FILE" && "$(tail -c1 "$NODES_FILE")" != "" ]] && echo "" >> "$NODES_FILE"
@@ -146,7 +197,7 @@ _ensure_insecure_registry() {
         local tmp_json
         tmp_json=$(mktemp)
         jq --arg addr "$REGISTRY_ADDR" \
-            '.["insecure-registries"] = (["insecure-registries"] + [$addr] | unique)' \
+            '.["insecure-registries"] = (.["insecure-registries"] + [$addr] | unique)' \
             "$DAEMON_FILE" > "$tmp_json" \
             && mv "$tmp_json" "$DAEMON_FILE"
     else
@@ -236,65 +287,143 @@ http {
 CONF
 }
 
-# v5.0: 始终写占位符 __WG_IP__ / __WP_PORT__
-# 调用方在宿主机用 sed 替换后再挂载或写入目标路径
-# 新增 /health 端点供网关探活
+# v6.0: 支持 Multisite 子目录/子域名模式
+# 参数: $1=DEST  $2=MS_TYPE(single|subdirectory|subdomain)  $3=MS_DOMAIN(子域名根域)
 _write_nginx_wp_conf() {
     local DEST="$1"
-    cat > "$DEST" <<'CONF'
-map $http_x_forwarded_proto $fastcgi_https {
-    default "";
-    https   "on";
-}
+    local MS_TYPE="${2:-single}"
+    local MS_DOMAIN="${3:-}"
 
-server {
-    listen __WG_IP__:__WP_PORT__ default_server;
-    root /var/www/html;
-    index index.php index.html;
-    client_max_body_size 2048M;
+    # 子域名模式：通配符 server_name
+    local SERVER_NAME_DIRECTIVE="server_name _;"
+    if [[ "$MS_TYPE" == "subdomain" && -n "$MS_DOMAIN" ]]; then
+        SERVER_NAME_DIRECTIVE="server_name ${MS_DOMAIN} *.${MS_DOMAIN};"
+    fi
 
-    # 健康检查端点：纯 nginx 层响应，不经过 PHP-FPM
-    location = /health {
-        access_log off;
-        return 200 "ok";
-        add_header Content-Type text/plain;
-    }
+    # 子目录 Multisite 额外 rewrite 规则
+    local MULTISITE_REWRITE_BLOCK=""
+    if [[ "$MS_TYPE" == "subdirectory" ]]; then
+        MULTISITE_REWRITE_BLOCK='
+    # WordPress Multisite 子目录模式 rewrite
+    if (!-e $request_filename) {
+        rewrite /wp-admin$ $scheme://$host$uri/ permanent;
+        rewrite ^(/[^/]+)?(/wp-.*) $2 last;
+        rewrite ^(/[^/]+)?(/.*\.php) $2 last;
+    }'
+    fi
 
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|webp|avif)$ {
-        expires max;
-        log_not_found off;
-        add_header Cache-Control "public, immutable";
-        try_files $uri =404;
-    }
+    # 用 printf 写文件，避免 heredoc 与变量展开的冲突
+    {
+        printf 'map $http_x_forwarded_proto $fastcgi_https {
+'
+        printf '    default "";
+'
+        printf '    https   "on";
+'
+        printf '}
 
-    location / {
-        try_files $uri $uri/ /index.php?$args;
-    }
-
-    location ~ \.php$ {
-        fastcgi_pass              127.0.0.1:9000;
-        fastcgi_index             index.php;
-        include                   fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME  $document_root$fastcgi_script_name;
-        fastcgi_param HTTPS            $fastcgi_https if_not_empty;
-        fastcgi_param HTTP_X_FORWARDED_PROTO $http_x_forwarded_proto;
-        fastcgi_param HTTP_X_FORWARDED_FOR   $http_x_forwarded_for;
-        fastcgi_param HTTP_X_REAL_IP         $http_x_real_ip;
-        fastcgi_read_timeout      600;
-        fastcgi_send_timeout      600;
-        fastcgi_buffer_size       128k;
-        fastcgi_buffers           4 256k;
-    }
-
-    location ~* /(?:wp-config\.php|\.env|\.git|\.htaccess|xmlrpc\.php) {
-        deny all;
-    }
-
-    location ~* /wp-content/uploads/.*\.php$ {
-        deny all;
-    }
-}
-CONF
+'
+        printf 'server {
+'
+        printf '    listen __WG_IP__:__WP_PORT__ default_server;
+'
+        printf '    %s
+' "$SERVER_NAME_DIRECTIVE"
+        printf '    root /var/www/html;
+'
+        printf '    index index.php index.html;
+'
+        printf '    client_max_body_size 2048M;
+'
+        printf '
+'
+        printf '    # 健康检查端点
+'
+        printf '    location = /health {
+'
+        printf '        access_log off;
+'
+        printf '        return 200 "ok";
+'
+        printf '        add_header Content-Type text/plain;
+'
+        printf '    }
+'
+        if [[ -n "$MULTISITE_REWRITE_BLOCK" ]]; then
+            printf '%s
+' "$MULTISITE_REWRITE_BLOCK"
+        fi
+        printf '
+'
+        printf '    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|webp|avif)$ {
+'
+        printf '        expires max;
+'
+        printf '        log_not_found off;
+'
+        printf '        add_header Cache-Control "public, immutable";
+'
+        printf '        try_files $uri =404;
+'
+        printf '    }
+'
+        printf '
+'
+        printf '    location / {
+'
+        printf '        try_files $uri $uri/ /index.php?$args;
+'
+        printf '    }
+'
+        printf '
+'
+        printf '    location ~ \.php$ {
+'
+        printf '        fastcgi_pass              127.0.0.1:9000;
+'
+        printf '        fastcgi_index             index.php;
+'
+        printf '        include                   fastcgi_params;
+'
+        printf '        fastcgi_param SCRIPT_FILENAME  $document_root$fastcgi_script_name;
+'
+        printf '        fastcgi_param HTTPS            $fastcgi_https if_not_empty;
+'
+        printf '        fastcgi_param HTTP_X_FORWARDED_PROTO $http_x_forwarded_proto;
+'
+        printf '        fastcgi_param HTTP_X_FORWARDED_FOR   $http_x_forwarded_for;
+'
+        printf '        fastcgi_param HTTP_X_REAL_IP         $http_x_real_ip;
+'
+        printf '        fastcgi_read_timeout      600;
+'
+        printf '        fastcgi_send_timeout      600;
+'
+        printf '        fastcgi_buffer_size       128k;
+'
+        printf '        fastcgi_buffers           4 256k;
+'
+        printf '    }
+'
+        printf '
+'
+        printf '    location ~* /(?:wp-config\.php|\.env|\.git|\.htaccess|xmlrpc\.php) {
+'
+        printf '        deny all;
+'
+        printf '    }
+'
+        printf '
+'
+        printf '    location ~* /wp-content/uploads/.*\.php$ {
+'
+        printf '        deny all;
+'
+        printf '    }
+'
+        printf '}
+'
+    } > "$DEST"
 }
 
 # v5.0: 占位符替换，在宿主机对已生成的 nginx-wp.conf 执行
@@ -361,11 +490,10 @@ security.limit_extensions = .php
 CONF
 }
 
-# v5.0:
-#   - 接收 salts 参数，写入 define()，确保多节点 cookie 互认
-#   - 显式关闭 WP_DEBUG
-#   - 禁用内置 WP-Cron（DISABLE_WP_CRON），由宿主机 cron 定时触发
-# 参数: $1=DEST $2=NODE_ROLE $3...$10=8个 salt 值（按 WP salt 顺序）
+# v6.0:
+#   - 新增 Multisite 常量注入
+# 参数: $1=DEST $2=NODE_ROLE $3...$10=8个 salt 值
+#       $11=MS_TYPE(single|subdirectory|subdomain)  $12=MS_DOMAIN
 _write_wp_config_extra() {
     local DEST="$1"
     local NODE_ROLE="${2:-worker}"
@@ -377,6 +505,8 @@ _write_wp_config_extra() {
     local SECURE_AUTH_SALT="${8:-}"
     local LOGGED_IN_SALT="${9:-}"
     local NONCE_SALT="${10:-}"
+    local MS_TYPE="${11:-single}"
+    local MS_DOMAIN="${12:-}"
 
     # 如果没有传入 salts（如老的调用路径），生成临时值并告警
     if [[ -z "$AUTH_KEY" ]]; then
@@ -464,6 +594,28 @@ if (extension_loaded('redis') && php_sapi_name() !== 'cli' && !headers_sent()) {
         'tcp://' . $_redis_host . ':6379?auth=' . urlencode($_redis_pw));
 }
 PHP_BODY
+
+        # Multisite 常量
+        if [[ "$MS_TYPE" == "subdirectory" || "$MS_TYPE" == "subdomain" ]]; then
+            printf '\n// WordPress Multisite\n'
+            printf "define('WP_ALLOW_MULTISITE', true);\n"
+            printf "define('MULTISITE',          true);\n"
+            if [[ "$MS_TYPE" == "subdomain" ]]; then
+                printf "define('SUBDOMAIN_INSTALL',  true);\n"
+            else
+                printf "define('SUBDOMAIN_INSTALL',  false);\n"
+            fi
+            if [[ -n "$MS_DOMAIN" ]]; then
+                printf "define('DOMAIN_CURRENT_SITE', '%s');\n" "$MS_DOMAIN"
+            else
+                printf "// DOMAIN_CURRENT_SITE 由运行时 HTTP_HOST 决定\n"
+                printf 'if (!defined("DOMAIN_CURRENT_SITE")) define("DOMAIN_CURRENT_SITE", $_SERVER["HTTP_HOST"] ?? "localhost");
+'
+            fi
+            printf "define('PATH_CURRENT_SITE',    '/');\n"
+            printf "define('SITE_ID_CURRENT_SITE', 1);\n"
+            printf "define('BLOG_ID_CURRENT_SITE', 1);\n"
+        fi
     } > "$DEST"
 }
 
@@ -614,26 +766,34 @@ YAML
 
 _write_worker_compose() {
     local DIR="$1"
-    cat > "$DIR/docker-compose.yml" <<'YAML'
+    local INST="${2:-${INSTANCE}}"   # 接收实例名，fallback 到全局 INSTANCE
+    # 注意：此处不能用 heredoc + 单引号（'YAML'）否则变量无法展开，
+    # 改用 printf / cat 拼接，只让 INST 展开，其余 ${...} 保留为 compose 变量
+    cat > "$DIR/docker-compose.yml" <<YAML
 services:
   wordpress:
-    image: ${REGISTRY_HOST}/wordpress-site:${IMAGE_TAG:-latest}
+    image: \${REGISTRY_HOST}/wordpress-${INST}:\${IMAGE_TAG:-latest}
     restart: unless-stopped
     network_mode: host
     environment:
-      WG_IP:                  ${WG_IP}
-      WP_PORT:                ${WP_PORT:-80}
-      WORDPRESS_DB_HOST:      ${DB_HOST}:3306
-      WORDPRESS_DB_NAME:      ${WORDPRESS_DB_NAME}
-      WORDPRESS_DB_USER:      ${WORDPRESS_DB_USER}
-      WORDPRESS_DB_PASSWORD:  ${WORDPRESS_DB_PASSWORD}
-      REDIS_HOST:             ${REDIS_HOST}
-      REDIS_PW:               ${REDIS_PW}
-      WP_SITEURL_FALLBACK:    ${WP_SITEURL_FALLBACK}
+      WG_IP:                  \${WG_IP}
+      WP_PORT:                \${WP_PORT:-80}
+      WORDPRESS_DB_HOST:      \${DB_HOST}:3306
+      WORDPRESS_DB_NAME:      \${WORDPRESS_DB_NAME}
+      WORDPRESS_DB_USER:      \${WORDPRESS_DB_USER}
+      WORDPRESS_DB_PASSWORD:  \${WORDPRESS_DB_PASSWORD}
+      REDIS_HOST:             \${REDIS_HOST}
+      REDIS_PW:               \${REDIS_PW}
+      WP_SITEURL_FALLBACK:    \${WP_SITEURL_FALLBACK}
     volumes:
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./data/cache:/var/www/html/wp-content/cache
+      - ./conf/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./conf/nginx-wp.conf:/etc/nginx/http.d/default.conf:ro
+      - ./conf/php-uploads.ini:/usr/local/etc/php/conf.d/uploads.ini:ro
+      - ./conf/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
+      - ./conf/php-fpm-www.conf:/usr/local/etc/php-fpm.d/www.conf:ro
+      - ./conf/supervisord.conf:/etc/supervisord.conf:ro
       - ./conf/wp-config.php:/var/www/html/wp-config.php:ro
       - ./conf/wp-config-extra.php:/etc/wordpress/wp-config-extra.php:ro
       - ./logs:/var/log/nginx
@@ -695,6 +855,13 @@ _setup_plugins() {
     local IS_AUTO_INSTALL="${2:-false}"
     local URL="${3:-}" TITLE="${4:-}" ADMIN="${5:-}"
     local PASS="${6:-}" EMAIL="${7:-}" LOCALE="${8:-zh_CN}"
+    # v6.0: Multisite 参数（从 .env 自动读取，此处接收覆盖值）
+    local MS_TYPE="${9:-}"
+    local MS_DOMAIN="${10:-}"
+    # 未传入则从 .env 读取
+    [[ -z "$MS_TYPE" ]] && MS_TYPE=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE" 2>/dev/null || true)
+    [[ -z "$MS_DOMAIN" ]] && MS_DOMAIN=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN" 2>/dev/null || true)
+    MS_TYPE="${MS_TYPE:-single}"
 
     info "等待 WordPress 容器就绪..."
     local RETRIES=30
@@ -743,6 +910,19 @@ _setup_plugins() {
             log "WordPress 安装成功！"
             echo -e "  站点: \e[32m${URL}\e[0m"
             echo -e "  账号: \e[32m${ADMIN}\e[0m / 密码: \e[32m${PASS}\e[0m"
+
+            # v6.0: Multisite 安装
+            if [[ "$MS_TYPE" == "subdirectory" || "$MS_TYPE" == "subdomain" ]]; then
+                info "配置 WordPress Multisite (${MS_TYPE})..."
+                local _MS_FLAGS=""
+                [[ "$MS_TYPE" == "subdomain" ]] && _MS_FLAGS="--subdomains"
+                "${WP_CMD[@]}" core multisite-convert ${_MS_FLAGS} 2>/dev/null \
+                || warn "Multisite 转换失败，请在后台手动完成（工具→网络设置）"
+                log "Multisite 已启用（${MS_TYPE} 模式）"
+                if [[ "$MS_TYPE" == "subdomain" && -n "$MS_DOMAIN" ]]; then
+                    info "  根域名: ${MS_DOMAIN}（确保 DNS 通配符解析已配置）"
+                fi
+            fi
         else
             log "数据库已有数据，跳过安装。"
         fi
@@ -863,7 +1043,6 @@ EOF
         sleep 2; _RETRIES=$(( _RETRIES - 1 ))
         [[ $_RETRIES -le 0 ]] && error "仓库服务未能在预期时间内就绪，请检查容器日志"
     done
-    done
 
     local REGISTRY_ADDR="${WG_IP}:${REG_PORT}"   # 补充定义
     # 确保本机 Docker 信任该仓库
@@ -880,8 +1059,11 @@ EOF
 # ════════════════════════════════════════════════════════
 cmd_master_init() {
     header "主节点初始化（全自动建站）"
-    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR || true
-    DIR="${DIR:-$DEFAULT_DIR}"
+
+    # v6.0: 实例选择
+    local DIR INST
+    _resolve_instance DIR INST
+    info "实例: ${INST}  目录: ${DIR}"
 
     info "--- 站点配置 ---"
     read -rp "站点 URL（如 https://example.com）: " WP_URL || true
@@ -901,11 +1083,30 @@ cmd_master_init() {
     read -rp "管理员邮箱 [默认: admin@example.com]: " WP_EMAIL || true
     WP_EMAIL="${WP_EMAIL:-admin@example.com}"
 
+    # v6.0: Multisite 配置
+    info "--- Multisite（可选）---"
+    local WP_MULTISITE_TYPE="single" WP_MULTISITE_DOMAIN=""
+    read -rp "启用 WordPress Multisite？[y/N]: " _MS_ENABLE || true
+    if [[ "${_MS_ENABLE,,}" == "y" ]]; then
+        echo "  1. 子目录模式（/site1 /site2）"
+        echo "  2. 子域名模式（site1.example.com）"
+        read -rp "选择 [默认: 1]: " _MS_MODE || true
+        if [[ "${_MS_MODE:-1}" == "2" ]]; then
+            WP_MULTISITE_TYPE="subdomain"
+            read -rp "根域名（如 example.com）: " WP_MULTISITE_DOMAIN || true
+            [[ -n "$WP_MULTISITE_DOMAIN" ]] || error "子域名模式必须填写根域名"
+            info "  ⚠ 子域名模式需要 DNS 通配符解析 *.${WP_MULTISITE_DOMAIN} → 服务器IP"
+        else
+            WP_MULTISITE_TYPE="subdirectory"
+        fi
+        info "  Multisite 模式: ${WP_MULTISITE_TYPE}"
+    fi
+
     info "--- 数据库 ---"
     read -rp "MariaDB WireGuard IP: " DB_HOST || true
     [[ -n "$DB_HOST" ]] || error "数据库 IP 不能为空"
     DB_HOST="${DB_HOST%%:*}"
-    read -rp "数据库名 [默认: wordpress]: " DB_NAME || true; DB_NAME="${DB_NAME:-wordpress}"
+    read -rp "数据库名 [默认: ${INST}]: " DB_NAME || true; DB_NAME="${DB_NAME:-${INST}}"
     read -rp "数据库用户名 [默认: wpuser]: " DB_USER || true; DB_USER="${DB_USER:-wpuser}"
     local DB_PW=""
     read_secret "数据库密码: " DB_PW
@@ -939,57 +1140,78 @@ cmd_master_init() {
     check_network "${DB_HOST}:3306" "${REDIS_HOST}:6379" || true
     check_port "$WG_IP" "$WP_PORT"
 
-    # v5.0: 生成统一 Salts，写入 .env 供后续 cmd_push 打包使用
     info "生成 WordPress Salts..."
     local S_AUTH_KEY S_SECURE_AUTH_KEY S_LOGGED_IN_KEY S_NONCE_KEY
     local S_AUTH_SALT S_SECURE_AUTH_SALT S_LOGGED_IN_SALT S_NONCE_SALT
-    S_AUTH_KEY=$(_gen_salt)
-    S_SECURE_AUTH_KEY=$(_gen_salt)
-    S_LOGGED_IN_KEY=$(_gen_salt)
-    S_NONCE_KEY=$(_gen_salt)
-    S_AUTH_SALT=$(_gen_salt)
-    S_SECURE_AUTH_SALT=$(_gen_salt)
-    S_LOGGED_IN_SALT=$(_gen_salt)
-    S_NONCE_SALT=$(_gen_salt)
+    S_AUTH_KEY=$(_gen_salt); S_SECURE_AUTH_KEY=$(_gen_salt)
+    S_LOGGED_IN_KEY=$(_gen_salt); S_NONCE_KEY=$(_gen_salt)
+    S_AUTH_SALT=$(_gen_salt); S_SECURE_AUTH_SALT=$(_gen_salt)
+    S_LOGGED_IN_SALT=$(_gen_salt); S_NONCE_SALT=$(_gen_salt)
 
     mkdir -p "$DIR"/{data/uploads,data/cache,conf,logs}
 
     {
-        printf 'WORDPRESS_DB_PASSWORD=%s\n' "${DB_PW}"
-        printf 'WORDPRESS_DB_NAME=%s\n'     "${DB_NAME}"
-        printf 'WORDPRESS_DB_USER=%s\n'     "${DB_USER}"
-        printf 'DB_HOST=%s\n'               "${DB_HOST}"
-        printf 'REDIS_HOST=%s\n'            "${REDIS_HOST}"
-        printf 'REDIS_PW=%s\n'              "${REDIS_PW}"
-        printf 'WG_IP=%s\n'                 "${WG_IP}"
-        printf 'WP_PORT=%s\n'               "${WP_PORT}"
-        printf 'WP_SITEURL_FALLBACK=%s\n'   "${WP_URL}"
-        printf 'REGISTRY_HOST=%s\n'         "${REGISTRY_HOST}"
-        printf 'IMAGE_TAG=latest\n'
-        printf 'NODE_ROLE=master\n'
-        printf 'CF_ZONE_ID=%s\n'            "${CF_ZONE_ID}"
-        printf 'CF_TOKEN=%s\n'              "${CF_TOKEN}"
-        printf 'WP_AUTH_KEY=%s\n'           "${S_AUTH_KEY}"
-        printf 'WP_SECURE_AUTH_KEY=%s\n'    "${S_SECURE_AUTH_KEY}"
-        printf 'WP_LOGGED_IN_KEY=%s\n'      "${S_LOGGED_IN_KEY}"
-        printf 'WP_NONCE_KEY=%s\n'          "${S_NONCE_KEY}"
-        printf 'WP_AUTH_SALT=%s\n'          "${S_AUTH_SALT}"
-        printf 'WP_SECURE_AUTH_SALT=%s\n'   "${S_SECURE_AUTH_SALT}"
-        printf 'WP_LOGGED_IN_SALT=%s\n'     "${S_LOGGED_IN_SALT}"
-        printf 'WP_NONCE_SALT=%s\n'         "${S_NONCE_SALT}"
+        printf 'WORDPRESS_DB_PASSWORD=%s
+' "${DB_PW}"
+        printf 'WORDPRESS_DB_NAME=%s
+'     "${DB_NAME}"
+        printf 'WORDPRESS_DB_USER=%s
+'     "${DB_USER}"
+        printf 'DB_HOST=%s
+'               "${DB_HOST}"
+        printf 'REDIS_HOST=%s
+'            "${REDIS_HOST}"
+        printf 'REDIS_PW=%s
+'              "${REDIS_PW}"
+        printf 'WG_IP=%s
+'                 "${WG_IP}"
+        printf 'WP_PORT=%s
+'               "${WP_PORT}"
+        printf 'WP_SITEURL_FALLBACK=%s
+'   "${WP_URL}"
+        printf 'REGISTRY_HOST=%s
+'         "${REGISTRY_HOST}"
+        printf 'IMAGE_TAG=latest
+'
+        printf 'NODE_ROLE=master
+'
+        printf 'CF_ZONE_ID=%s
+'            "${CF_ZONE_ID}"
+        printf 'CF_TOKEN=%s
+'              "${CF_TOKEN}"
+        printf 'WP_INSTANCE=%s
+'           "${INST}"
+        printf 'WP_MULTISITE_TYPE=%s
+'     "${WP_MULTISITE_TYPE}"
+        printf 'WP_MULTISITE_DOMAIN=%s
+'   "${WP_MULTISITE_DOMAIN}"
+        printf 'WP_AUTH_KEY=%s
+'           "${S_AUTH_KEY}"
+        printf 'WP_SECURE_AUTH_KEY=%s
+'    "${S_SECURE_AUTH_KEY}"
+        printf 'WP_LOGGED_IN_KEY=%s
+'      "${S_LOGGED_IN_KEY}"
+        printf 'WP_NONCE_KEY=%s
+'          "${S_NONCE_KEY}"
+        printf 'WP_AUTH_SALT=%s
+'          "${S_AUTH_SALT}"
+        printf 'WP_SECURE_AUTH_SALT=%s
+'   "${S_SECURE_AUTH_SALT}"
+        printf 'WP_LOGGED_IN_SALT=%s
+'     "${S_LOGGED_IN_SALT}"
+        printf 'WP_NONCE_SALT=%s
+'         "${S_NONCE_SALT}"
     } > "$DIR/.env"
     chmod 600 "$DIR/.env"
 
     _write_nginx_main_conf    "$DIR/conf/nginx.conf"
-    _write_nginx_wp_conf      "$DIR/conf/nginx-wp.conf"
+    _write_nginx_wp_conf      "$DIR/conf/nginx-wp.conf" "$WP_MULTISITE_TYPE" "$WP_MULTISITE_DOMAIN"
     _sed_nginx_wp_conf        "$DIR/conf/nginx-wp.conf" "$WG_IP" "$WP_PORT"
     _write_php_uploads_ini    "$DIR/conf/php-uploads.ini"
     _write_opcache_ini        "$DIR/conf/opcache.ini"
     _write_php_fpm_www_conf   "$DIR/conf/php-fpm-www.conf"
     _write_supervisord_conf   "$DIR/conf/supervisord.conf"
-    _write_wp_config_extra    "$DIR/conf/wp-config-extra.php" "master" \
-        "$S_AUTH_KEY" "$S_SECURE_AUTH_KEY" "$S_LOGGED_IN_KEY" "$S_NONCE_KEY" \
-        "$S_AUTH_SALT" "$S_SECURE_AUTH_SALT" "$S_LOGGED_IN_SALT" "$S_NONCE_SALT"
+    _write_wp_config_extra    "$DIR/conf/wp-config-extra.php" "master"         "$S_AUTH_KEY" "$S_SECURE_AUTH_KEY" "$S_LOGGED_IN_KEY" "$S_NONCE_KEY"         "$S_AUTH_SALT" "$S_SECURE_AUTH_SALT" "$S_LOGGED_IN_SALT" "$S_NONCE_SALT"         "$WP_MULTISITE_TYPE" "$WP_MULTISITE_DOMAIN"
     _write_init_dockerfile    "$DIR"
     _write_entrypoint_script  "$DIR/entrypoint.sh"
     _write_init_compose       "$DIR"
@@ -999,14 +1221,17 @@ cmd_master_init() {
     docker compose -f "$DIR/docker-compose.yml" build --pull || error "镜像构建失败"
     docker compose -f "$DIR/docker-compose.yml" up -d       || error "容器启动失败"
 
-    _setup_plugins "$DIR" "true" \
-        "$WP_URL" "$WP_TITLE" "$WP_ADMIN" "$WP_PASS" "$WP_EMAIL" "$WP_LOCALE" \
-        || warn "插件配置未完全成功，可通过菜单 11 重试"
+    _setup_plugins "$DIR" "true"         "$WP_URL" "$WP_TITLE" "$WP_ADMIN" "$WP_PASS" "$WP_EMAIL" "$WP_LOCALE"         "$WP_MULTISITE_TYPE" "$WP_MULTISITE_DOMAIN"         || warn "插件配置未完全成功，可通过菜单 11 重试"
 
     log "主节点初始化完成！"
+    echo -e "  实例:     \e[36m${INST}\e[0m"
     echo -e "  内网访问: \e[33mhttp://${WG_IP}\e[0m"
     echo -e "  站点:     \e[33m${WP_URL}\e[0m"
     echo -e "  账号:     \e[32m${WP_ADMIN}\e[0m / \e[32m${WP_PASS}\e[0m"
+    if [[ "$WP_MULTISITE_TYPE" != "single" ]]; then
+        echo -e "  Multisite: \e[35m${WP_MULTISITE_TYPE}\e[0m"
+        [[ -n "$WP_MULTISITE_DOMAIN" ]] && echo -e "  根域名:   \e[35m${WP_MULTISITE_DOMAIN}\e[0m"
+    fi
     echo ""
     _c "1;33" ">>> WP-Cron 定时任务提示 <<<"
     echo -e "  内置 WP-Cron 已禁用，请在\e[33m某一台节点宿主机\e[0m添加以下 crontab："
@@ -1021,9 +1246,12 @@ cmd_master_init() {
 # ════════════════════════════════════════════════════════
 cmd_push() {
     header "打包推送镜像到私有仓库"
-    read -rp "主节点目录 [默认: ${DEFAULT_DIR}]: " DIR || true
-    DIR="${DIR:-$DEFAULT_DIR}"
-    [[ -f "$DIR/.env" ]] || error "未找到 .env：${DIR}"
+
+    # v6.0: 实例选择
+    local DIR INST
+    _resolve_instance DIR INST
+    [[ -f "$DIR/.env" ]] || error "未找到 .env：${DIR}，请先执行主节点初始化"
+    info "实例: ${INST}"
 
     local REGISTRY_HOST WG_IP
     REGISTRY_HOST=$(env_get "$DIR/.env" "REGISTRY_HOST")
@@ -1032,7 +1260,8 @@ cmd_push() {
     [[ -n "$WG_IP" ]]         || WG_IP=$(get_wg_ip)
 
     local IMAGE_TAG="v$(date +%Y%m%d%H%M)"
-    local IMAGE_BASE="${REGISTRY_HOST}/wordpress-site"
+    # v6.0: 镜像名以实例名为命名空间
+    local IMAGE_BASE="${REGISTRY_HOST}/wordpress-${INST}"
 
     local CID
     CID=$(docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" ps -q wordpress 2>/dev/null || true)
@@ -1098,6 +1327,11 @@ cmd_push() {
     P_LOGGED_IN_SALT=$(env_get    "$DIR/.env" "WP_LOGGED_IN_SALT")
     P_NONCE_SALT=$(env_get        "$DIR/.env" "WP_NONCE_SALT")
 
+    # v6.0: 读取 Multisite 配置
+    local P_MS_TYPE P_MS_DOMAIN
+    P_MS_TYPE=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE");   P_MS_TYPE="${P_MS_TYPE:-single}"
+    P_MS_DOMAIN=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN"); P_MS_DOMAIN="${P_MS_DOMAIN:-}"
+
     if [[ -z "$P_AUTH_KEY" ]]; then
         warn ".env 中未找到 Salts（旧版部署？），将生成新 Salts 并写回 .env"
         P_AUTH_KEY=$(_gen_salt);        P_SECURE_AUTH_KEY=$(_gen_salt)
@@ -1105,34 +1339,37 @@ cmd_push() {
         P_AUTH_SALT=$(_gen_salt);       P_SECURE_AUTH_SALT=$(_gen_salt)
         P_LOGGED_IN_SALT=$(_gen_salt);  P_NONCE_SALT=$(_gen_salt)
         {
-            printf 'WP_AUTH_KEY=%s\n'          "${P_AUTH_KEY}"
-            printf 'WP_SECURE_AUTH_KEY=%s\n'   "${P_SECURE_AUTH_KEY}"
-            printf 'WP_LOGGED_IN_KEY=%s\n'     "${P_LOGGED_IN_KEY}"
-            printf 'WP_NONCE_KEY=%s\n'         "${P_NONCE_KEY}"
-            printf 'WP_AUTH_SALT=%s\n'         "${P_AUTH_SALT}"
-            printf 'WP_SECURE_AUTH_SALT=%s\n'  "${P_SECURE_AUTH_SALT}"
-            printf 'WP_LOGGED_IN_SALT=%s\n'    "${P_LOGGED_IN_SALT}"
-            printf 'WP_NONCE_SALT=%s\n'        "${P_NONCE_SALT}"
+            printf 'WP_AUTH_KEY=%s
+'          "${P_AUTH_KEY}"
+            printf 'WP_SECURE_AUTH_KEY=%s
+'   "${P_SECURE_AUTH_KEY}"
+            printf 'WP_LOGGED_IN_KEY=%s
+'     "${P_LOGGED_IN_KEY}"
+            printf 'WP_NONCE_KEY=%s
+'         "${P_NONCE_KEY}"
+            printf 'WP_AUTH_SALT=%s
+'         "${P_AUTH_SALT}"
+            printf 'WP_SECURE_AUTH_SALT=%s
+'  "${P_SECURE_AUTH_SALT}"
+            printf 'WP_LOGGED_IN_SALT=%s
+'    "${P_LOGGED_IN_SALT}"
+            printf 'WP_NONCE_SALT=%s
+'        "${P_NONCE_SALT}"
         } >> "$DIR/.env"
-        # 同步更新主节点本地的 wp-config-extra.php
-        _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master" \
-            "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
-            "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT"
+        _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master"             "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY"             "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT"             "$P_MS_TYPE" "$P_MS_DOMAIN"
         warn "主节点容器需重启后 salts 才会生效：菜单 10 → 重启节点"
     fi
 
     mkdir -p "$BUILD_DIR/conf"
     _write_nginx_main_conf   "$BUILD_DIR/conf/nginx.conf"
-    _write_nginx_wp_conf     "$BUILD_DIR/conf/nginx-wp.conf"
-    # 镜像内保留占位符，工作节点 cmd_pull_deploy 拿到后 sed 替换再挂载
+    # v6.0: 镜像内 nginx-wp.conf 含 Multisite rewrite/server_name，保留 IP 占位符
+    _write_nginx_wp_conf     "$BUILD_DIR/conf/nginx-wp.conf" "$P_MS_TYPE" "$P_MS_DOMAIN"
     _write_php_uploads_ini   "$BUILD_DIR/conf/php-uploads.ini"
     _write_opcache_ini       "$BUILD_DIR/conf/opcache.ini"
     _write_php_fpm_www_conf  "$BUILD_DIR/conf/php-fpm-www.conf"
     _write_supervisord_conf  "$BUILD_DIR/conf/supervisord.conf"
-    # worker 角色 + 统一 salts
-    _write_wp_config_extra   "$BUILD_DIR/conf/wp-config-extra.php" "worker" \
-        "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
-        "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT"
+    # v6.0: worker 角色 + 统一 salts + Multisite 常量
+    _write_wp_config_extra   "$BUILD_DIR/conf/wp-config-extra.php" "worker"         "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY"         "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT"         "$P_MS_TYPE" "$P_MS_DOMAIN"
     _write_entrypoint_script "$BUILD_DIR/entrypoint.sh"
     _write_master_dockerfile "$BUILD_DIR"
 
@@ -1172,9 +1409,10 @@ cmd_push() {
         | awk '{print $2}' | xargs -r docker rmi 2>/dev/null || true
 
     log "推送完成！"
-    echo -e "  镜像: \e[32m${IMAGE_BASE}:${IMAGE_TAG}\e[0m"
+    echo -e "  实例:    \e[36m${INST}\e[0m"
+    echo -e "  镜像:    \e[32m${IMAGE_BASE}:${IMAGE_TAG}\e[0m"
     echo -e "  WP 版本: \e[36m${WP_VER}\e[0m"
-    echo -e "  \e[36m工作节点执行菜单 4（拉取部署/更新）即可。\e[0m"
+    echo -e "  \e[36m工作节点执行菜单 4（拉取部署/更新），选择相同实例名即可。\e[0m"
 }
 
 # ════════════════════════════════════════════════════════
@@ -1182,8 +1420,11 @@ cmd_push() {
 # ════════════════════════════════════════════════════════
 cmd_pull_deploy() {
     header "工作节点拉取部署 / 更新"
-    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR || true
-    DIR="${DIR:-$DEFAULT_DIR}"
+
+    # v6.0: 实例选择
+    local DIR INST
+    _resolve_instance DIR INST
+    info "实例: ${INST}  目录: ${DIR}"
 
     local IS_FIRST=false
     local DB_HOST="" DB_NAME="" DB_USER="" DB_PW="" REDIS_HOST="" REDIS_PW=""
@@ -1198,7 +1439,7 @@ cmd_pull_deploy() {
         read -rp "MariaDB WireGuard IP: " DB_HOST || true
         [[ -n "$DB_HOST" ]] || error "数据库 IP 不能为空"
         DB_HOST="${DB_HOST%%:*}"
-        read -rp "数据库名 [默认: wordpress]: " DB_NAME || true; DB_NAME="${DB_NAME:-wordpress}"
+        read -rp "数据库名 [默认: ${INST}]: " DB_NAME || true; DB_NAME="${DB_NAME:-${INST}}"
         read -rp "数据库用户名 [默认: wpuser]: " DB_USER || true; DB_USER="${DB_USER:-wpuser}"
         read_secret "数据库密码: " DB_PW; [[ -n "$DB_PW" ]] || error "数据库密码不能为空"
 
@@ -1229,32 +1470,52 @@ cmd_pull_deploy() {
         mkdir -p "$DIR"/{data/uploads,data/cache,conf,logs}
 
         {
-            printf 'WORDPRESS_DB_PASSWORD=%s\n' "${DB_PW}"
-            printf 'WORDPRESS_DB_NAME=%s\n'     "${DB_NAME}"
-            printf 'WORDPRESS_DB_USER=%s\n'     "${DB_USER}"
-            printf 'DB_HOST=%s\n'               "${DB_HOST}"
-            printf 'REDIS_HOST=%s\n'            "${REDIS_HOST}"
-            printf 'REDIS_PW=%s\n'              "${REDIS_PW}"
-            printf 'WG_IP=%s\n'                 "${WG_IP}"
-            printf 'WP_PORT=%s\n'               "${WP_PORT}"
-            printf 'WP_SITEURL_FALLBACK=%s\n'   "${WP_URL}"
-            printf 'REGISTRY_HOST=%s\n'         "${REGISTRY_HOST}"
-            printf 'IMAGE_TAG=latest\n'
-            printf 'NODE_ROLE=worker\n'
-            printf 'CF_ZONE_ID=%s\n'            "${CF_ZONE_ID}"
-            printf 'CF_TOKEN=%s\n'              "${CF_TOKEN}"
+            printf 'WORDPRESS_DB_PASSWORD=%s
+' "${DB_PW}"
+            printf 'WORDPRESS_DB_NAME=%s
+'     "${DB_NAME}"
+            printf 'WORDPRESS_DB_USER=%s
+'     "${DB_USER}"
+            printf 'DB_HOST=%s
+'               "${DB_HOST}"
+            printf 'REDIS_HOST=%s
+'            "${REDIS_HOST}"
+            printf 'REDIS_PW=%s
+'              "${REDIS_PW}"
+            printf 'WG_IP=%s
+'                 "${WG_IP}"
+            printf 'WP_PORT=%s
+'               "${WP_PORT}"
+            printf 'WP_SITEURL_FALLBACK=%s
+'   "${WP_URL}"
+            printf 'REGISTRY_HOST=%s
+'         "${REGISTRY_HOST}"
+            printf 'IMAGE_TAG=latest
+'
+            printf 'NODE_ROLE=worker
+'
+            printf 'CF_ZONE_ID=%s
+'            "${CF_ZONE_ID}"
+            printf 'CF_TOKEN=%s
+'              "${CF_TOKEN}"
+            printf 'WP_INSTANCE=%s
+'           "${INST}"
         } > "$DIR/.env"
         chmod 600 "$DIR/.env"
-        # worker 的 wp-config-extra.php 来自镜像内（已打包 salts），此处生成占位版备用
-        # 实际挂载的是从镜像导出后覆盖写入的版本（见下方 docker cp 流程）
-        _write_worker_compose  "$DIR"
+        _write_worker_compose  "$DIR" "$INST"
         _register_node "$WG_IP"
     fi
 
     REGISTRY_HOST=$(env_get "$DIR/.env" "REGISTRY_HOST")
+    # v6.0: 从 .env 恢复实例名（续部署时）
+    local _ENV_INST; _ENV_INST=$(env_get "$DIR/.env" "WP_INSTANCE" 2>/dev/null || true)
+    [[ -n "$_ENV_INST" ]] && INST="$_ENV_INST"
     local IMAGE_TAG
     IMAGE_TAG=$(env_get "$DIR/.env" "IMAGE_TAG"); IMAGE_TAG="${IMAGE_TAG:-latest}"
     [[ -n "$REGISTRY_HOST" ]] || error ".env 中缺少 REGISTRY_HOST"
+
+    # 每次都重写 compose，确保镜像名与当前实例一致（修复旧版写死 wordpress-site 的问题）
+    _write_worker_compose "$DIR" "$INST"
 
     DB_HOST="${DB_HOST:-$(env_get "$DIR/.env" "DB_HOST")}"
     DB_NAME="${DB_NAME:-$(env_get "$DIR/.env" "WORDPRESS_DB_NAME")}"
@@ -1274,9 +1535,17 @@ cmd_pull_deploy() {
     docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" \
     || error "仓库登录失败"
 
-    local IMAGE_FULL="${REGISTRY_HOST}/wordpress-site:${IMAGE_TAG}"
+    # v6.0: 实例命名空间镜像
+    local IMAGE_FULL="${REGISTRY_HOST}/wordpress-${INST}:${IMAGE_TAG}"
     info "拉取镜像: ${IMAGE_FULL} ..."
     docker pull "$IMAGE_FULL" || error "镜像拉取失败"
+
+    # 拉取成功后，将实际使用的 IMAGE_TAG 写回 .env（保持同步）
+    if grep -q '^IMAGE_TAG=' "$DIR/.env"; then
+        sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${IMAGE_TAG}|" "$DIR/.env"
+    else
+        echo "IMAGE_TAG=${IMAGE_TAG}" >> "$DIR/.env"
+    fi
 
     # v5.0: 从镜像导出 wp-config-extra.php（含 salts）到宿主机 conf/
     # 这是权威版本，不在宿主机重新生成，确保与打包时一致
@@ -1296,7 +1565,7 @@ cmd_pull_deploy() {
     if [[ ! -f "$DIR/conf/wp-config.php" ]]; then
         info "预启动容器以生成 wp-config.php ..."
         if [[ ! -f "$DIR/docker-compose.yml" ]]; then
-            _write_worker_compose "$DIR"
+            _write_worker_compose "$DIR" "$INST"
         fi
         dc "$DIR" up -d 2>/dev/null || true
 
@@ -1329,23 +1598,25 @@ cmd_pull_deploy() {
     _WG_IP_VAL=$(env_get "$DIR/.env" "WG_IP")
     _WP_PORT_VAL=$(env_get "$DIR/.env" "WP_PORT"); _WP_PORT_VAL="${_WP_PORT_VAL:-80}"
 
-    if [[ ! -f "$DIR/conf/nginx-wp.conf" ]]; then
-        info "从镜像导出 nginx-wp.conf ..."
-        local _TMP_CID2
-        _TMP_CID2=$(docker create "${IMAGE_FULL}" sh 2>/dev/null || true)
-        if [[ -n "$_TMP_CID2" ]]; then
-            docker cp "${_TMP_CID2}:/etc/nginx/http.d/default.conf" \
-                "$DIR/conf/nginx-wp.conf" 2>/dev/null || true
-            docker rm -f "$_TMP_CID2" &>/dev/null || true
-        fi
+    # 每次从新镜像导出全部 conf（确保与镜像版本一致，而非沿用旧文件）
+    info "从镜像导出配置文件..."
+    local _TMP_CID2
+    _TMP_CID2=$(docker create "${IMAGE_FULL}" sh 2>/dev/null || true)
+    if [[ -n "$_TMP_CID2" ]]; then
+        docker cp "${_TMP_CID2}:/etc/nginx/nginx.conf"          "$DIR/conf/nginx.conf"        2>/dev/null && log "  nginx.conf 已导出"        || warn "  nginx.conf 导出失败"
+        docker cp "${_TMP_CID2}:/etc/nginx/http.d/default.conf" "$DIR/conf/nginx-wp.conf"     2>/dev/null && log "  nginx-wp.conf 已导出"     || warn "  nginx-wp.conf 导出失败"
+        docker cp "${_TMP_CID2}:/usr/local/etc/php/conf.d/uploads.ini"   "$DIR/conf/php-uploads.ini"  2>/dev/null || true
+        docker cp "${_TMP_CID2}:/usr/local/etc/php/conf.d/opcache.ini"   "$DIR/conf/opcache.ini"      2>/dev/null || true
+        docker cp "${_TMP_CID2}:/usr/local/etc/php-fpm.d/www.conf"       "$DIR/conf/php-fpm-www.conf" 2>/dev/null || true
+        docker cp "${_TMP_CID2}:/etc/supervisord.conf"                    "$DIR/conf/supervisord.conf" 2>/dev/null || true
+        docker rm -f "$_TMP_CID2" &>/dev/null || true
+    else
+        warn "无法创建临时容器，跳过配置文件导出（将使用已有版本）"
     fi
 
     if [[ -f "$DIR/conf/nginx-wp.conf" ]]; then
         info "替换 nginx-wp.conf 占位符 → ${_WG_IP_VAL}:${_WP_PORT_VAL}"
         _sed_nginx_wp_conf "$DIR/conf/nginx-wp.conf" "$_WG_IP_VAL" "$_WP_PORT_VAL"
-        if ! grep -q "nginx-wp.conf" "$DIR/docker-compose.yml" 2>/dev/null; then
-            warn "docker-compose.yml 未挂载 nginx-wp.conf，请检查 _write_worker_compose 输出"
-        fi
     else
         warn "未能获取 nginx-wp.conf，nginx 将使用镜像内默认配置（含占位符）"
     fi
@@ -1378,9 +1649,12 @@ cmd_pull_deploy() {
 # ════════════════════════════════════════════════════════
 cmd_rollback() {
     header "镜像回滚"
-    read -rp "部署目录 [默认: ${DEFAULT_DIR}]: " DIR || true
-    DIR="${DIR:-$DEFAULT_DIR}"
+    local DIR INST
+    _resolve_instance DIR INST
     [[ -f "$DIR/.env" ]] || error "未找到 .env：${DIR}"
+    local _ENV_INST; _ENV_INST=$(env_get "$DIR/.env" "WP_INSTANCE" 2>/dev/null || true)
+    [[ -n "$_ENV_INST" ]] && INST="$_ENV_INST"
+    info "实例: ${INST}"
 
     local REGISTRY_HOST; REGISTRY_HOST=$(env_get "$DIR/.env" "REGISTRY_HOST")
     [[ -n "$REGISTRY_HOST" ]] || error ".env 中缺少 REGISTRY_HOST"
@@ -1396,7 +1670,7 @@ cmd_rollback() {
 
     local TAGS_JSON
     TAGS_JSON=$(curl -sf -u "${REG_USER}:${REG_PASS}" \
-        "http://${REGISTRY_HOST}/v2/wordpress-site/tags/list" 2>/dev/null)
+        "http://${REGISTRY_HOST}/v2/wordpress-${INST}/tags/list" 2>/dev/null)
     if [[ -z "$TAGS_JSON" ]]; then
         warn "无法从仓库获取标签列表"; return
     fi
@@ -1422,8 +1696,8 @@ cmd_rollback() {
     sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${SELECTED_TAG}|" "$DIR/.env"
     _ensure_insecure_registry "$REGISTRY_HOST"
     docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" &>/dev/null
-    info "拉取 ${REGISTRY_HOST}/wordpress-site:${SELECTED_TAG} ..."
-    docker pull "${REGISTRY_HOST}/wordpress-site:${SELECTED_TAG}" || error "拉取失败"
+    info "拉取 ${REGISTRY_HOST}/wordpress-${INST}:${SELECTED_TAG} ..."
+    docker pull "${REGISTRY_HOST}/wordpress-${INST}:${SELECTED_TAG}" || error "拉取失败"
     dc "$DIR" up -d --force-recreate || error "容器重启失败"
     _flush_all_caches "$DIR"
     log "回滚到 ${SELECTED_TAG} 完成！"
@@ -1433,26 +1707,30 @@ cmd_rollback() {
 # 运维命令
 # ════════════════════════════════════════════════════════
 cmd_status() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true
-    DIR="${DIR:-$DEFAULT_DIR}"
+    local DIR INST; _resolve_instance DIR INST
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     dc "$DIR" ps; echo ""
     local WP_VER
     WP_VER=$(dc "$DIR" exec -T wordpress \
         cat /var/www/html/wp-includes/version.php 2>/dev/null \
         | grep -oP "(?<=wp_version = ')[^']+") || WP_VER="未知"
+    echo -e "  实例:           \e[35m${INST}\e[0m"
     echo -e "  WordPress 版本: \e[36m${WP_VER}\e[0m"
     echo -e "  当前镜像版本:   \e[32m$(env_get "$DIR/.env" IMAGE_TAG)\e[0m"
     echo -e "  仓库地址:       \e[36m$(env_get "$DIR/.env" REGISTRY_HOST)\e[0m"
-    local _WG _PORT
+    local _WG _PORT _MS_TYPE _MS_DOMAIN
     _WG=$(env_get "$DIR/.env" WG_IP)
     _PORT=$(env_get "$DIR/.env" WP_PORT); _PORT="${_PORT:-80}"
+    _MS_TYPE=$(env_get "$DIR/.env" WP_MULTISITE_TYPE 2>/dev/null || true); _MS_TYPE="${_MS_TYPE:-single}"
+    _MS_DOMAIN=$(env_get "$DIR/.env" WP_MULTISITE_DOMAIN 2>/dev/null || true)
     echo -e "  健康检查:       \e[36mhttp://${_WG}:${_PORT}/health\e[0m"
+    if [[ "$_MS_TYPE" != "single" ]]; then
+        echo -e "  Multisite:      \e[35m${_MS_TYPE}\e[0m${_MS_DOMAIN:+  根域名: \e[35m${_MS_DOMAIN}\e[0m}"
+    fi
 }
 
 cmd_logs() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true
-    DIR="${DIR:-$DEFAULT_DIR}"
+    local DIR INST; _resolve_instance DIR INST
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     echo "  1. 容器总日志  2. Nginx 访问日志  3. Nginx 错误日志"
     read -rp "选择 [默认: 1]: " LOG_CHOICE || true
@@ -1463,13 +1741,12 @@ cmd_logs() {
     esac
 }
 
-cmd_stop()    { read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true; DIR="${DIR:-$DEFAULT_DIR}"; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" stop    && log "已停止。"; }
-cmd_start()   { read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true; DIR="${DIR:-$DEFAULT_DIR}"; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" up -d   && log "已启动。"; }
-cmd_restart() { read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true; DIR="${DIR:-$DEFAULT_DIR}"; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" restart && log "已重启。"; }
+cmd_stop()    { local DIR INST; _resolve_instance DIR INST; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" stop    && log "已停止。"; }
+cmd_start()   { local DIR INST; _resolve_instance DIR INST; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" up -d   && log "已启动。"; }
+cmd_restart() { local DIR INST; _resolve_instance DIR INST; [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"; dc "$DIR" restart && log "已重启。"; }
 
 cmd_destroy() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true
-    DIR="${DIR:-$DEFAULT_DIR}"
+    local DIR INST; _resolve_instance DIR INST
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     warn "将停止容器并删除全部数据（不可恢复）。"
     read -rp "输入 'yes' 确认: " CONFIRM || true
@@ -1484,8 +1761,7 @@ cmd_destroy() {
 }
 
 cmd_retry_plugins() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true
-    DIR="${DIR:-$DEFAULT_DIR}"
+    local DIR INST; _resolve_instance DIR INST
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     dc "$DIR" ps --services --filter status=running | grep -q "wordpress" \
         || { warn "wordpress 容器未运行，请先启动。"; return; }
@@ -1496,14 +1772,16 @@ cmd_retry_plugins() {
 }
 
 cmd_flush() {
-    read -rp "目录 [默认: ${DEFAULT_DIR}]: " DIR || true
-    DIR="${DIR:-$DEFAULT_DIR}"
+    local DIR INST; _resolve_instance DIR INST
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     _flush_all_caches "$DIR"
 }
 
 cmd_nodes() {
     header "节点列表管理"
+    # v6.0: 必须先选实例以确定 NODES_FILE
+    local DIR INST; _resolve_instance DIR INST
+    info "实例: ${INST}  节点文件: ${NODES_FILE}"
     echo "  1. 列出所有节点  2. 添加节点  3. 删除节点"
     read -rp "选择: " NODE_CHOICE || true
     case "$NODE_CHOICE" in
@@ -1524,8 +1802,8 @@ interactive_menu() {
     while true; do
         echo ""
         _c "1;35" "========================================"
-        _c "1;35" "  WordPress 多节点分发管理 v5.0"
-        _c "1;35" "  单容器全打包版（nginx+php+wordpress）"
+        _c "1;35" "  WordPress 多节点分发管理 v6.0"
+        _c "1;35" "  多实例 | Multisite | 单容器全打包"
         _c "1;35" "========================================"
         echo -e "  \e[36m── 仓库管理 ──────────────────────────\e[0m"
         echo -e "  \e[32m 1.\e[0m 部署私有镜像仓库"
