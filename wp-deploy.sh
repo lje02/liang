@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
-# v6.2
+# v6.3
 #   变更:
-#     [fix] cmd_restore: 重启容器前补调 _ensure_insecure_registry
-#           避免还原后镜像拉取因 insecure-registries 未配置而失败
-#     [fix] cmd_rollback: docker login 错误不再 &>/dev/null 静默吞掉
-#           登录失败时明确 error 退出，输出仓库返回的原始错误信息
-#     [fix] AList 旧备份清理：改用文件名中的 YYYYmmddHHMMSS 时间戳判断
-#           不再依赖 -mtime（FUSE 挂载后 mtime 会被重置为当前时间，导致误删）
-#     继承 v6.1 全部功能
+#     [fix] _setup_plugins: multisite-convert 成功后立即重启容器
+#           使 wp-config-extra.php 中的 Multisite 常量（MULTISITE/DOMAIN_CURRENT_SITE 等）
+#           在后续 WP-CLI 命令执行前生效，避免 "Site 'localhost/' not found" 错误
+#     [fix] _setup_plugins: multisite-convert 改用 if/else，消除转换失败时
+#           仍输出"已启用"的误导性日志
+#     [fix] _setup_plugins: Multisite 模式下语言包、Redis 插件、redis enable
+#           等所有 WP-CLI 命令统一追加 --url=<主站URL>，确保命令在正确的
+#           子站上下文中执行
+#     继承 v6.2 全部功能
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
@@ -910,16 +912,28 @@ _setup_plugins() {
             echo -e "  站点: \e[32m${URL}\e[0m"
             echo -e "  账号: \e[32m${ADMIN}\e[0m / 密码: \e[32m${PASS}\e[0m"
 
-            # v6.0: Multisite 安装
+            # v6.2: Multisite 安装
             if [[ "$MS_TYPE" == "subdirectory" || "$MS_TYPE" == "subdomain" ]]; then
                 info "配置 WordPress Multisite (${MS_TYPE})..."
                 local _MS_FLAGS=""
                 [[ "$MS_TYPE" == "subdomain" ]] && _MS_FLAGS="--subdomains"
-                "${WP_CMD[@]}" core multisite-convert ${_MS_FLAGS} 2>/dev/null \
-                || warn "Multisite 转换失败，请在后台手动完成（工具→网络设置）"
-                log "Multisite 已启用（${MS_TYPE} 模式）"
-                if [[ "$MS_TYPE" == "subdomain" && -n "$MS_DOMAIN" ]]; then
-                    info "  根域名: ${MS_DOMAIN}（确保 DNS 通配符解析已配置）"
+                if "${WP_CMD[@]}" core multisite-convert ${_MS_FLAGS} 2>/dev/null; then
+                    log "Multisite 已启用（${MS_TYPE} 模式）"
+                    if [[ "$MS_TYPE" == "subdomain" && -n "$MS_DOMAIN" ]]; then
+                        info "  根域名: ${MS_DOMAIN}（确保 DNS 通配符解析已配置）"
+                    fi
+                    # 转换后必须重启容器，使 wp-config-extra.php 中的 Multisite 常量生效，
+                    # 否则后续 WP-CLI 命令无法在 Multisite 上下文中定位站点
+                    info "重启容器以应用 Multisite 常量..."
+                    dc "$DIR" restart wordpress 2>/dev/null || true
+                    local _MS_WAIT=20
+                    while ! "${WP_CMD[@]}" cli version &>/dev/null; do
+                        sleep 3
+                        _MS_WAIT=$((_MS_WAIT - 1))
+                        [[ $_MS_WAIT -le 0 ]] && { warn "容器重启后未就绪，后续命令可能失败"; break; }
+                    done
+                else
+                    warn "Multisite 转换失败，请在后台手动完成（工具→网络设置）"
                 fi
             fi
         else
@@ -929,16 +943,20 @@ _setup_plugins() {
 
     # v5.0: 语言包安装移至此处，IS_AUTO_INSTALL 分支外
     # 菜单 11 重试时也会执行
+    # v6.2: Multisite 模式下所有 WP-CLI 命令需加 --url 指定主站，避免 "Site not found" 错误
+    local _WP_URL_FLAG=()
+    [[ "$MS_TYPE" != "single" && -n "$URL" ]] && _WP_URL_FLAG=("--url=${URL}")
+
     if [[ -n "$LOCALE" && "$LOCALE" != "en_US" ]]; then
         info "安装语言包: ${LOCALE}..."
-        "${WP_CMD[@]}" language core install   "$LOCALE" 2>/dev/null || true
-        "${WP_CMD[@]}" language theme  install --all "$LOCALE" 2>/dev/null || true
-        "${WP_CMD[@]}" language plugin install --all "$LOCALE" 2>/dev/null || true
-        "${WP_CMD[@]}" option update WPLANG "$LOCALE" || true
+        "${WP_CMD[@]}" language core install   "$LOCALE" "${_WP_URL_FLAG[@]}" 2>/dev/null || true
+        "${WP_CMD[@]}" language theme  install --all "$LOCALE" "${_WP_URL_FLAG[@]}" 2>/dev/null || true
+        "${WP_CMD[@]}" language plugin install --all "$LOCALE" "${_WP_URL_FLAG[@]}" 2>/dev/null || true
+        "${WP_CMD[@]}" option update WPLANG "$LOCALE" "${_WP_URL_FLAG[@]}" || true
         if [[ -n "$ADMIN" ]]; then
             local ADMIN_ID
-            ADMIN_ID=$("${WP_CMD[@]}" user get "$ADMIN" --field=ID 2>/dev/null || echo "1")
-            "${WP_CMD[@]}" user meta update "$ADMIN_ID" locale "$LOCALE" 2>/dev/null || true
+            ADMIN_ID=$("${WP_CMD[@]}" user get "$ADMIN" --field=ID "${_WP_URL_FLAG[@]}" 2>/dev/null || echo "1")
+            "${WP_CMD[@]}" user meta update "$ADMIN_ID" locale "$LOCALE" "${_WP_URL_FLAG[@]}" 2>/dev/null || true
         fi
         log "界面语言已设为 ${LOCALE}"
     fi
@@ -947,10 +965,10 @@ _setup_plugins() {
     dc "$DIR" exec -T wordpress chown -R www-data:www-data /var/www/html/wp-content || true
 
     info "配置 Redis 插件..."
-    if "${WP_CMD[@]}" plugin is-installed redis-cache &>/dev/null; then
-        "${WP_CMD[@]}" plugin activate redis-cache || warn "Redis 插件激活失败"
+    if "${WP_CMD[@]}" plugin is-installed redis-cache "${_WP_URL_FLAG[@]}" &>/dev/null; then
+        "${WP_CMD[@]}" plugin activate redis-cache "${_WP_URL_FLAG[@]}" || warn "Redis 插件激活失败"
     else
-        "${WP_CMD[@]}" plugin install redis-cache --activate || warn "Redis 插件安装失败"
+        "${WP_CMD[@]}" plugin install redis-cache --activate "${_WP_URL_FLAG[@]}" || warn "Redis 插件安装失败"
     fi
 
     info "探测 Redis 连通性..."
@@ -958,7 +976,7 @@ _setup_plugins() {
     REDIS_HOST_VAL=$(env_get "$DIR/.env" "REDIS_HOST")
     local PROBE="\$c=@fsockopen('${REDIS_HOST_VAL}',6379,\$e,\$s,5);if(\$c){fclose(\$c);exit(0);}exit(1);"
     if dc "$DIR" exec -T wordpress php -r "$PROBE" 2>/dev/null; then
-        "${WP_CMD[@]}" redis enable && log "Redis 对象缓存已启用！" || warn "redis enable 失败"
+        "${WP_CMD[@]}" redis enable "${_WP_URL_FLAG[@]}" && log "Redis 对象缓存已启用！" || warn "redis enable 失败"
     else
         warn "无法连接 Redis (${REDIS_HOST_VAL}:6379)，跳过启用"
     fi
@@ -2198,7 +2216,7 @@ interactive_menu() {
     while true; do
         echo ""
         _c "1;35" "========================================"
-        _c "1;35" "  WordPress 多节点分发管理 v6.2"
+        _c "1;35" "  WordPress 多节点分发管理 v6.3"
         _c "1;35" "  多实例 | Multisite | 单容器全打包"
         _c "1;35" "========================================"
         echo -e "  \e[36m── 仓库管理 ──────────────────────────\e[0m"
