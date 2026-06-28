@@ -13,6 +13,8 @@
 #   ./infra-shared.sh passwd  [DIR] <USER> [NEW_PW]
 #   ./infra-shared.sh backup  [DIR] [DEST] [--rsync] [--alist]
 #   ./infra-shared.sh restore [DIR] <SQL文件|rsync://user@host[:port]/path/file|alist:///path/file>
+#   ./infra-shared.sh tune-db    [DIR]               # 查看/调整 MariaDB 性能参数
+#   ./infra-shared.sh tune-redis [DIR]               # 查看/调整 Redis 性能参数
 #   ./infra-shared.sh rsync-push   [DIR] [LOCAL_DIR]   # 推送备份到远端
 #   ./infra-shared.sh rsync-pull   [DIR] [LOCAL_DEST]  # 拉取远端备份到本地
 #   ./infra-shared.sh rsync-config [DIR]               # 配置/查看远端 rsync 参数
@@ -96,7 +98,7 @@ load_env() {
     [[ -f "$1/.env" ]] || error ".env 不存在: $1/.env"
     chmod 600 "$1/.env" 2>/dev/null || true
     # 允许加载的 key 白名单（防止 .env 被篡改污染关键环境变量）
-    local _ALLOWED_KEYS='WG_IP|MARIADB_ROOT_PASSWORD|MARIADB_DATABASE|MARIADB_USER|MARIADB_PASSWORD|REDIS_PASSWORD|DEPLOY_DB|DEPLOY_REDIS|RSYNC_REMOTE|RSYNC_USER|RSYNC_PORT|RSYNC_KEY|RSYNC_REMOTE_DIR|ALIST_MODE|ALIST_MOUNT|ALIST_URL|ALIST_TOKEN|ALIST_REMOTE_DIR'
+    local _ALLOWED_KEYS='WG_IP|MARIADB_ROOT_PASSWORD|MARIADB_DATABASE|MARIADB_USER|MARIADB_PASSWORD|REDIS_PASSWORD|DEPLOY_DB|DEPLOY_REDIS|RSYNC_REMOTE|RSYNC_USER|RSYNC_PORT|RSYNC_KEY|RSYNC_REMOTE_DIR|ALIST_MODE|ALIST_MOUNT|ALIST_URL|ALIST_TOKEN|ALIST_REMOTE_DIR|INNODB_BUFFER_POOL_SIZE|INNODB_LOG_FILE_SIZE|INNODB_FLUSH_LOG|MAX_CONNECTIONS|REDIS_MAXMEMORY'
     local key val line
     while IFS= read -r line || [[ -n "$line" ]]; do
         # 跳过注释和空行
@@ -191,14 +193,57 @@ db_sql_on() {   # DIR DB SQL  — 直接指定目标库，避免 USE 在 pipe �
 # ════════════════════════════════════════════════════════════
 # 配置文件生成
 # ════════════════════════════════════════════════════════════
+# ── 自动计算调优默认值 ───────────────────────────────────────
+# 输出变量（调用方 local 后 eval 或直接在同 subshell 使用）：
+#   _AT_BUFFER_POOL   _AT_LOG_FILE   _AT_MAX_CONN   _AT_REDIS_MEM
+_auto_tune() {
+    # 物理内存（KB → MB）
+    local total_kb; total_kb=$(awk '/^MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local total_mb=$(( total_kb / 1024 ))
+
+    # innodb_buffer_pool_size = 25% 物理内存，最小 128M，最大 4096M
+    local bp=$(( total_mb / 4 ))
+    (( bp <  128  )) && bp=128
+    (( bp > 4096  )) && bp=4096
+    _AT_BUFFER_POOL="${bp}M"
+
+    # innodb_log_file_size = buffer_pool / 4，最小 64M，最大 1024M
+    local lf=$(( bp / 4 ))
+    (( lf <   64 )) && lf=64
+    (( lf > 1024 )) && lf=1024
+    _AT_LOG_FILE="${lf}M"
+
+    # max_connections 按内存档位梯度
+    if   (( total_mb >=  8192 )); then _AT_MAX_CONN=500
+    elif (( total_mb >=  4096 )); then _AT_MAX_CONN=300
+    elif (( total_mb >=  2048 )); then _AT_MAX_CONN=200
+    else                               _AT_MAX_CONN=100
+    fi
+
+    # redis maxmemory = 10% 物理内存，最小 128M，最大 2048M
+    local rm=$(( total_mb / 10 ))
+    (( rm <  128  )) && rm=128
+    (( rm > 2048  )) && rm=2048
+    _AT_REDIS_MEM="${rm}mb"
+}
+
 _write_mariadb_conf() {
-    mkdir -p "$1/mariadb-conf"
-    cat > "$1/mariadb-conf/custom.cnf" <<'INI'
+    local dir="$1"
+    mkdir -p "$dir/mariadb-conf"
+    # 运行时参数：优先 .env 中的显式配置，其次自动计算值
+    _auto_tune
+    load_env "$dir" 2>/dev/null || true
+    local buf="${INNODB_BUFFER_POOL_SIZE:-${_AT_BUFFER_POOL}}"
+    local log="${INNODB_LOG_FILE_SIZE:-${_AT_LOG_FILE}}"
+    local flush="${INNODB_FLUSH_LOG:-2}"
+    local conn="${MAX_CONNECTIONS:-${_AT_MAX_CONN}}"
+    # 写入配置（heredoc 变量展开，去掉单引号 'INI'）
+    cat > "$dir/mariadb-conf/custom.cnf" <<INI
 [mysqld]
-innodb_buffer_pool_size        = 512M
-innodb_log_file_size           = 128M
-innodb_flush_log_at_trx_commit = 2
-max_connections                = 200
+innodb_buffer_pool_size        = ${buf}
+innodb_log_file_size           = ${log}
+innodb_flush_log_at_trx_commit = ${flush}
+max_connections                = ${conn}
 query_cache_type               = 0
 character-set-server           = utf8mb4
 collation-server               = utf8mb4_unicode_ci
@@ -207,12 +252,15 @@ slow_query_log                 = 1
 slow_query_log_file            = /var/lib/mysql/slow.log
 long_query_time                = 2
 INI
+    log "MariaDB 配置: buffer_pool=${buf}  log_file=${log}  flush=${flush}  max_conn=${conn}"
 }
 
 _write_redis_conf() {
-    # 调用方须在调用前完成 load_env，此处不重复 load
     local dir="$1"
     mkdir -p "$dir/redis-conf"
+    _auto_tune
+    load_env "$dir" 2>/dev/null || true
+    local maxmem="${REDIS_MAXMEMORY:-${_AT_REDIS_MEM}}"
     cat > "$dir/redis-conf/redis.conf" <<CONF
 bind 0.0.0.0
 port ${REDIS_PORT}
@@ -222,11 +270,12 @@ save 300 10
 save 60 10000
 appendonly yes
 appendfsync everysec
-maxmemory 512mb
+maxmemory ${maxmem}
 maxmemory-policy allkeys-lru
 loglevel notice
 logfile ""
 CONF
+    log "Redis 配置: maxmemory=${maxmem}"
 }
 
 _write_compose() {
@@ -520,8 +569,148 @@ cmd_passwd() {
 }
 
 # ════════════════════════════════════════════════════════════
-# rsync 工具函数
+# 性能调优子命令
 # ════════════════════════════════════════════════════════════
+
+# tune-db [DIR] — 交互式查看/修改 MariaDB 调优参数
+cmd_tune_db() {
+    local dir="${1:-$DEFAULT_DIR}"
+    [[ -f "$dir/.env" ]] || error ".env 不存在: ${dir}/.env"
+    _auto_tune
+    load_env "$dir"
+
+    local buf="${INNODB_BUFFER_POOL_SIZE:-${_AT_BUFFER_POOL}}"
+    local log="${INNODB_LOG_FILE_SIZE:-${_AT_LOG_FILE}}"
+    local flush="${INNODB_FLUSH_LOG:-2}"
+    local conn="${MAX_CONNECTIONS:-${_AT_MAX_CONN}}"
+
+    local total_kb; total_kb=$(awk '/^MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local total_mb=$(( total_kb / 1024 ))
+
+    header "MariaDB 性能参数  （系统内存: ${total_mb}MB）"
+    printf "  %-35s %s\n" "innodb_buffer_pool_size"        "${buf}  （自动推荐: ${_AT_BUFFER_POOL}）"
+    printf "  %-35s %s\n" "innodb_log_file_size"           "${log}  （自动推荐: ${_AT_LOG_FILE}）"
+    printf "  %-35s %s\n" "innodb_flush_log_at_trx_commit" "${flush}  （0=最快/不安全 1=最安全 2=折中）"
+    printf "  %-35s %s\n" "max_connections"                "${conn}  （自动推荐: ${_AT_MAX_CONN}）"
+    echo
+    printf "  当前配置文件: %s/mariadb-conf/custom.cnf\n" "$dir"
+    [[ -f "$dir/mariadb-conf/custom.cnf" ]] && {
+        echo; echo "  ── 当前文件内容 ──"
+        sed 's/^/  /' "$dir/mariadb-conf/custom.cnf"
+        echo
+    }
+
+    read -rp "  是否修改参数？[y/N] " yn
+    [[ "${yn,,}" == "y" ]] || return 0
+
+    echo
+    echo "  提示：留空保持当前值；输入 auto 恢复为自动计算值"
+    echo
+
+    local val
+    read -rp "  innodb_buffer_pool_size  [${buf}]: " val
+    case "$val" in
+        auto|AUTO) _env_set "$dir" "INNODB_BUFFER_POOL_SIZE" ""; buf=$_AT_BUFFER_POOL ;;
+        "")        : ;;
+        *[0-9][MmGg])  _env_set "$dir" "INNODB_BUFFER_POOL_SIZE" "${val^^}"; buf="${val^^}" ;;
+        *)         warn "格式无效（示例: 512M 1G 2048M），跳过" ;;
+    esac
+
+    read -rp "  innodb_log_file_size     [${log}]: " val
+    case "$val" in
+        auto|AUTO) _env_set "$dir" "INNODB_LOG_FILE_SIZE" ""; log=$_AT_LOG_FILE ;;
+        "")        : ;;
+        *[0-9][MmGg])  _env_set "$dir" "INNODB_LOG_FILE_SIZE" "${val^^}"; log="${val^^}" ;;
+        *)         warn "格式无效，跳过" ;;
+    esac
+
+    read -rp "  innodb_flush_log (0/1/2) [${flush}]: " val
+    case "$val" in
+        0|1|2) _env_set "$dir" "INNODB_FLUSH_LOG" "$val"; flush="$val" ;;
+        "")    : ;;
+        *)     warn "只能输入 0、1 或 2，跳过" ;;
+    esac
+
+    read -rp "  max_connections          [${conn}]: " val
+    case "$val" in
+        auto|AUTO) _env_set "$dir" "MAX_CONNECTIONS" ""; conn=$_AT_MAX_CONN ;;
+        "")        : ;;
+        [0-9]*)
+            if (( val >= 10 && val <= 10000 )); then
+                _env_set "$dir" "MAX_CONNECTIONS" "$val"; conn="$val"
+            else warn "范围 10-10000，跳过"; fi ;;
+        *) warn "需要数字，跳过" ;;
+    esac
+
+    # 重写配置文件
+    _write_mariadb_conf "$dir"
+    log "配置文件已更新: ${dir}/mariadb-conf/custom.cnf"
+
+    # 提示重启
+    if _svc_exists "$dir" "db" 2>/dev/null; then
+        read -rp "  是否立即重启 MariaDB 使配置生效？[y/N] " yn
+        if [[ "${yn,,}" == "y" ]]; then
+            compose_run "$dir" restart db \
+                && log "MariaDB 已重启" \
+                || warn "重启失败，请手动执行: docker compose -f ${dir}/docker-compose.yml restart db"
+        else
+            warn "配置已写入，请手动重启 MariaDB 生效"
+        fi
+    fi
+}
+
+# tune-redis [DIR] — 交互式查看/修改 Redis 调优参数
+cmd_tune_redis() {
+    local dir="${1:-$DEFAULT_DIR}"
+    [[ -f "$dir/.env" ]] || error ".env 不存在: ${dir}/.env"
+    _auto_tune
+    load_env "$dir"
+
+    local maxmem="${REDIS_MAXMEMORY:-${_AT_REDIS_MEM}}"
+    local total_kb; total_kb=$(awk '/^MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local total_mb=$(( total_kb / 1024 ))
+
+    header "Redis 性能参数  （系统内存: ${total_mb}MB）"
+    printf "  %-20s %s\n" "maxmemory" "${maxmem}  （自动推荐: ${_AT_REDIS_MEM}）"
+    echo
+    printf "  当前配置文件: %s/redis-conf/redis.conf\n" "$dir"
+    [[ -f "$dir/redis-conf/redis.conf" ]] && {
+        echo; echo "  ── 当前文件内容 ──"
+        grep -v "requirepass" "$dir/redis-conf/redis.conf" | sed 's/^/  /'
+        echo
+    }
+
+    read -rp "  是否修改参数？[y/N] " yn
+    [[ "${yn,,}" == "y" ]] || return 0
+
+    echo
+    local val
+    read -rp "  maxmemory  [${maxmem}]（示例: 256mb 512mb 1gb，auto=自动推荐）: " val
+    case "$val" in
+        auto|AUTO) _env_set "$dir" "REDIS_MAXMEMORY" "" ;;
+        "")        : ;;
+        *[0-9][mMgGbB]*)
+            _env_set "$dir" "REDIS_MAXMEMORY" "${val,,}"; maxmem="${val,,}" ;;
+        *) warn "格式无效（示例: 512mb），跳过" ;;
+    esac
+
+    load_env "$dir"
+    _write_redis_conf "$dir"
+    log "配置文件已更新: ${dir}/redis-conf/redis.conf"
+
+    if _svc_exists "$dir" "redis" 2>/dev/null; then
+        read -rp "  是否立即重启 Redis 使配置生效？[y/N] " yn
+        if [[ "${yn,,}" == "y" ]]; then
+            compose_run "$dir" restart redis \
+                && log "Redis 已重启" \
+                || warn "重启失败，请手动执行: docker compose -f ${dir}/docker-compose.yml restart redis"
+        else
+            warn "配置已写入，请手动重启 Redis 生效"
+        fi
+    fi
+}
+
+
 
 # 校验 rsync 依赖
 _check_rsync() {
@@ -1275,15 +1464,18 @@ menu_main() {
         echo "  3) 查看状态    4) 启动    5) 停止    6) 日志"
         echo "  ─── 数据 ────────────────────────────────────"
         echo "  7) 数据库管理 ▶        8) 备份 / 恢复 ▶"
+        echo "  ─── 调优 ────────────────────────────────────"
+        echo "  9) 性能调优 ▶（buffer_pool / maxmemory 等）"
         echo "  ─────────────────────────────────────────────"
         echo "  0) 退出"
         echo
-        read -rp "  请选择 [0-8]: " CH
+        read -rp "  请选择 [0-9]: " CH
         case "$CH" in
             1) menu_deploy  ;; 2) menu_update ;;
             3) menu_status  ;; 4) menu_svc start ;;
             5) menu_svc stop ;; 6) menu_logs ;;
             7) menu_db      ;; 8) menu_bk ;;
+            9) menu_tune    ;;
             0) info "再见！"; exit 0 ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
@@ -1554,6 +1746,34 @@ menu_bk_alist_config() {
     _menu_run cmd_alist_config "$DIR" || true; _pause
 }
 
+# ── 调优菜单 ──────────────────────────────────────────────────
+menu_tune() {
+    while true; do
+        _mhdr; _c "1;33" "  ▶ 性能调优"; echo
+        echo "  1) MariaDB 参数（buffer_pool / log / connections）"
+        echo "  2) Redis 参数（maxmemory）"
+        echo "  0) 返回"
+        echo
+        read -rp "  请选择 [0-2]: " CH
+        case "$CH" in
+            1) menu_tune_db    ;;
+            2) menu_tune_redis ;;
+            0) return ;;
+            *) warn "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
+menu_tune_db() {
+    _db_menu_head "MariaDB 性能调优"
+    _menu_run cmd_tune_db "$DIR" || true; _pause
+}
+
+menu_tune_redis() {
+    _db_menu_head "Redis 性能调优"
+    _menu_run cmd_tune_redis "$DIR" || true; _pause
+}
+
 # ════════════════════════════════════════════════════════════
 # 入口
 # ════════════════════════════════════════════════════════════
@@ -1571,6 +1791,8 @@ main() {
         passwd)    cmd_passwd   "$@" ;;
         backup)       cmd_backup       "$@" ;;
         restore)      cmd_restore      "$@" ;;
+        tune-db)      cmd_tune_db      "$@" ;;
+        tune-redis)   cmd_tune_redis   "$@" ;;
         rsync-push)   cmd_rsync_push   "$@" ;;
         rsync-pull)   cmd_rsync_pull   "$@" ;;
         rsync-config) cmd_rsync_config "$@" ;;
