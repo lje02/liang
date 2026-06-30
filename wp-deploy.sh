@@ -507,8 +507,12 @@ CONF
 
 # v6.0:
 #   - 新增 Multisite 常量注入
+# v6.4:
+#   - 新增 R2 / Advanced Media Offloader 常量，字面量烘焙进文件（随镜像分发），
+#     不再依赖容器 getenv()，主/工作节点共享同一份，不需要逐节点配置 .env
 # 参数: $1=DEST $2=NODE_ROLE $3...$10=8个 salt 值
 #       $11=MS_TYPE(single|subdirectory|subdomain)  $12=MS_DOMAIN
+#       $13=R2_KEY $14=R2_SECRET $15=R2_BUCKET $16=R2_DOMAIN $17=R2_ENDPOINT
 _write_wp_config_extra() {
     local DEST="$1"
     local NODE_ROLE="${2:-worker}"
@@ -522,6 +526,11 @@ _write_wp_config_extra() {
     local NONCE_SALT="${10:-}"
     local MS_TYPE="${11:-single}"
     local MS_DOMAIN="${12:-}"
+    local R2_KEY="${13:-}"
+    local R2_SECRET="${14:-}"
+    local R2_BUCKET="${15:-}"
+    local R2_DOMAIN="${16:-}"
+    local R2_ENDPOINT="${17:-}"
 
     # 如果没有传入 salts（如老的调用路径），生成临时值并告警
     if [[ -z "$AUTH_KEY" ]]; then
@@ -608,16 +617,6 @@ if (extension_loaded('redis') && php_sapi_name() !== 'cli' && !headers_sent()) {
     ini_set('session.save_path',
         'tcp://' . $_redis_host . ':6379?auth=' . urlencode($_redis_pw));
 }
-
-// Advanced Media Offloader - Cloudflare R2（仅在 .env 配置了凭证时启用）
-$_r2_key = getenv('R2_ACCESS_KEY') ?: '';
-if ($_r2_key !== '') {
-    define('ADVMO_CLOUDFLARE_R2_KEY',      $_r2_key);
-    define('ADVMO_CLOUDFLARE_R2_SECRET',   getenv('R2_SECRET_KEY') ?: '');
-    define('ADVMO_CLOUDFLARE_R2_BUCKET',   getenv('R2_BUCKET')     ?: '');
-    define('ADVMO_CLOUDFLARE_R2_DOMAIN',   getenv('R2_DOMAIN')     ?: '');
-    define('ADVMO_CLOUDFLARE_R2_ENDPOINT', getenv('R2_ENDPOINT')   ?: '');
-}
 PHP_BODY
 
         # Multisite 常量
@@ -640,6 +639,17 @@ PHP_BODY
             printf "define('PATH_CURRENT_SITE',    '/');\n"
             printf "define('SITE_ID_CURRENT_SITE', 1);\n"
             printf "define('BLOG_ID_CURRENT_SITE', 1);\n"
+        fi
+
+        # v6.4: Advanced Media Offloader - Cloudflare R2
+        # 字面量烘焙进文件（随镜像分发到所有节点），不再依赖 .env / getenv()
+        if [[ -n "$R2_KEY" ]]; then
+            printf '\n// Advanced Media Offloader - Cloudflare R2\n'
+            printf "define('ADVMO_CLOUDFLARE_R2_KEY',      '%s');\n" "${R2_KEY//\'/\\\'}"
+            printf "define('ADVMO_CLOUDFLARE_R2_SECRET',   '%s');\n" "${R2_SECRET//\'/\\\'}"
+            printf "define('ADVMO_CLOUDFLARE_R2_BUCKET',   '%s');\n" "${R2_BUCKET//\'/\\\'}"
+            printf "define('ADVMO_CLOUDFLARE_R2_DOMAIN',   '%s');\n" "${R2_DOMAIN//\'/\\\'}"
+            printf "define('ADVMO_CLOUDFLARE_R2_ENDPOINT', '%s');\n" "${R2_ENDPOINT//\'/\\\'}"
         fi
     } > "$DEST"
 }
@@ -781,11 +791,6 @@ services:
       REDIS_HOST:             ${REDIS_HOST}
       REDIS_PW:               ${REDIS_PW}
       WP_SITEURL_FALLBACK:    ${WP_SITEURL_FALLBACK}
-      R2_ACCESS_KEY:          ${R2_ACCESS_KEY:-}
-      R2_SECRET_KEY:          ${R2_SECRET_KEY:-}
-      R2_BUCKET:              ${R2_BUCKET:-}
-      R2_DOMAIN:              ${R2_DOMAIN:-}
-      R2_ENDPOINT:            ${R2_ENDPOINT:-}
     volumes:
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./data/cache:/var/www/html/wp-content/cache
@@ -795,6 +800,7 @@ services:
       - ./conf/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
       - ./conf/php-fpm-www.conf:/usr/local/etc/php-fpm.d/www.conf:ro
       - ./conf/supervisord.conf:/etc/supervisord.conf:ro
+      - ./conf/wp-config.php:/var/www/html/wp-config.php
       - ./conf/wp-config-extra.php:/etc/wordpress/wp-config-extra.php:ro
       - ./logs:/var/log/nginx
 YAML
@@ -821,11 +827,6 @@ services:
       REDIS_HOST:             \${REDIS_HOST}
       REDIS_PW:               \${REDIS_PW}
       WP_SITEURL_FALLBACK:    \${WP_SITEURL_FALLBACK}
-      R2_ACCESS_KEY:          \${R2_ACCESS_KEY:-}
-      R2_SECRET_KEY:          \${R2_SECRET_KEY:-}
-      R2_BUCKET:              \${R2_BUCKET:-}
-      R2_DOMAIN:              \${R2_DOMAIN:-}
-      R2_ENDPOINT:            \${R2_ENDPOINT:-}
     volumes:
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./data/cache:/var/www/html/wp-content/cache
@@ -835,7 +836,7 @@ services:
       - ./conf/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
       - ./conf/php-fpm-www.conf:/usr/local/etc/php-fpm.d/www.conf:ro
       - ./conf/supervisord.conf:/etc/supervisord.conf:ro
-      - ./conf/wp-config.php:/var/www/html/wp-config.php:ro
+      - ./conf/wp-config.php:/var/www/html/wp-config.php
       - ./conf/wp-config-extra.php:/etc/wordpress/wp-config-extra.php:ro
       - ./logs:/var/log/nginx
 YAML
@@ -942,7 +943,9 @@ _setup_plugins() {
         [[ $RETRIES -le 0 ]] && { warn "容器未就绪，中止插件配置。"; return 1; }
     done
 
-    if ! dc "$DIR" exec -T wordpress test -f /var/www/html/wp-config.php; then
+    # [fix] v6.4: wp-config.php 现在是宿主机 bind mount，启动前会被 touch 成空文件，
+    # 用 -f 判断会永远为真而跳过生成；改用 -s 判断"非空"才算已生成
+    if ! dc "$DIR" exec -T wordpress test -s /var/www/html/wp-config.php; then
         info "创建 wp-config.php ..."
         local DB_NAME DB_USER DB_PW DB_HOST
         DB_NAME=$(env_get "$DIR/.env" "WORDPRESS_DB_NAME")
@@ -953,6 +956,21 @@ _setup_plugins() {
         _wp_config_create_with_extra "$DIR" "$DB_NAME" "$DB_USER" "$DB_PW" "$DB_HOST" \
             || { warn "wp-config.php 创建失败，请检查数据库连接。"; return 1; }
         log "wp-config.php 已自动生成。"
+
+        # [fix] v6.4: 主节点 wp-config.php 此前只存在于容器可写层，
+        # --force-recreate（如菜单17修改R2配置后的重启）会导致其丢失，
+        # 进而触发 WordPress 重新走安装向导。这里生成后立即导出落盘，
+        # 并配合 _write_init_compose 中新增的 bind mount 持久化。
+        local _CID_FOR_CFG
+        _CID_FOR_CFG=$(dc "$DIR" ps -q wordpress 2>/dev/null)
+        if [[ -n "$_CID_FOR_CFG" ]]; then
+            dc "$DIR" exec -T wordpress cp /var/www/html/wp-config.php /tmp/wp-config-out.php \
+            && docker cp "${_CID_FOR_CFG}:/tmp/wp-config-out.php" "$DIR/conf/wp-config.php" \
+            && log "wp-config.php 已落盘到 ${DIR}/conf/，重建容器不会再丢失" \
+            || warn "wp-config.php 落盘失败，重建容器（如菜单17）仍有丢失风险，请手动执行菜单11修复"
+        else
+            warn "未取得容器 ID，wp-config.php 未落盘，重建容器仍有丢失风险"
+        fi
     fi
 
     if [[ "$IS_AUTO_INSTALL" == "true" ]]; then
@@ -1221,6 +1239,9 @@ cmd_master_init() {
     S_LOGGED_IN_SALT=$(_gen_salt); S_NONCE_SALT=$(_gen_salt)
 
     mkdir -p "$DIR"/{data/uploads,data/cache,conf,logs}
+    # [fix] v6.4: 预先 touch 出空文件，避免 Docker 在 bind mount 源文件
+    # 不存在时自动建出同名目录，导致容器内路径变成目录而非文件
+    touch "$DIR/conf/wp-config.php"
 
     {
         printf 'WORDPRESS_DB_PASSWORD=%s
@@ -1283,7 +1304,17 @@ cmd_master_init() {
     _write_opcache_ini        "$DIR/conf/opcache.ini"
     _write_php_fpm_www_conf   "$DIR/conf/php-fpm-www.conf"
     _write_supervisord_conf   "$DIR/conf/supervisord.conf"
-    _write_wp_config_extra    "$DIR/conf/wp-config-extra.php" "master"         "$S_AUTH_KEY" "$S_SECURE_AUTH_KEY" "$S_LOGGED_IN_KEY" "$S_NONCE_KEY"         "$S_AUTH_SALT" "$S_SECURE_AUTH_SALT" "$S_LOGGED_IN_SALT" "$S_NONCE_SALT"         "$WP_MULTISITE_TYPE" "$WP_MULTISITE_DOMAIN"
+    local R2_KEY R2_SECRET R2_BUCKET R2_DOMAIN R2_ENDPOINT
+    R2_KEY=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
+    R2_SECRET=$(env_get "$DIR/.env" "R2_SECRET_KEY" 2>/dev/null || true)
+    R2_BUCKET=$(env_get "$DIR/.env" "R2_BUCKET" 2>/dev/null || true)
+    R2_DOMAIN=$(env_get "$DIR/.env" "R2_DOMAIN" 2>/dev/null || true)
+    R2_ENDPOINT=$(env_get "$DIR/.env" "R2_ENDPOINT" 2>/dev/null || true)
+    _write_wp_config_extra    "$DIR/conf/wp-config-extra.php" "master" \
+        "$S_AUTH_KEY" "$S_SECURE_AUTH_KEY" "$S_LOGGED_IN_KEY" "$S_NONCE_KEY" \
+        "$S_AUTH_SALT" "$S_SECURE_AUTH_SALT" "$S_LOGGED_IN_SALT" "$S_NONCE_SALT" \
+        "$WP_MULTISITE_TYPE" "$WP_MULTISITE_DOMAIN" \
+        "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT"
     _write_init_dockerfile    "$DIR"
     _write_entrypoint_script  "$DIR/entrypoint.sh"
     _write_init_compose       "$DIR"
@@ -1428,7 +1459,17 @@ cmd_push() {
             printf 'WP_NONCE_SALT=%s
 '        "${P_NONCE_SALT}"
         } >> "$DIR/.env"
-        _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master"             "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY"             "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT"             "$P_MS_TYPE" "$P_MS_DOMAIN"
+        local R2_KEY R2_SECRET R2_BUCKET R2_DOMAIN R2_ENDPOINT
+        R2_KEY=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
+        R2_SECRET=$(env_get "$DIR/.env" "R2_SECRET_KEY" 2>/dev/null || true)
+        R2_BUCKET=$(env_get "$DIR/.env" "R2_BUCKET" 2>/dev/null || true)
+        R2_DOMAIN=$(env_get "$DIR/.env" "R2_DOMAIN" 2>/dev/null || true)
+        R2_ENDPOINT=$(env_get "$DIR/.env" "R2_ENDPOINT" 2>/dev/null || true)
+        _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master" \
+            "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
+            "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT" \
+            "$P_MS_TYPE" "$P_MS_DOMAIN" \
+            "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT"
         warn "主节点容器需重启后 salts 才会生效：菜单 10 → 重启节点"
     fi
 
@@ -1441,6 +1482,8 @@ cmd_push() {
     _write_php_fpm_www_conf  "$BUILD_DIR/conf/php-fpm-www.conf"
     _write_supervisord_conf  "$BUILD_DIR/conf/supervisord.conf"
     # v6.0: worker 角色 + 统一 salts + Multisite 常量
+    # 注意: worker 节点不进 wp-admin、不跑 Test Connection，刻意不传 R2 凭证
+    # ($13-$17 留空)，避免凭证扩散到所有 worker 节点，减少泄露面
     _write_wp_config_extra   "$BUILD_DIR/conf/wp-config-extra.php" "worker"         "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY"         "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT"         "$P_MS_TYPE" "$P_MS_DOMAIN"
     _write_entrypoint_script "$BUILD_DIR/entrypoint.sh"
     _write_master_dockerfile "$BUILD_DIR"
@@ -1540,6 +1583,9 @@ cmd_pull_deploy() {
         check_network "${DB_HOST}:3306" "${REDIS_HOST}:6379" || true
 
         mkdir -p "$DIR"/{data/uploads,data/cache,conf,logs}
+    # [fix] v6.4: 预先 touch 出空文件，避免 Docker 在 bind mount 源文件
+    # 不存在时自动建出同名目录，导致容器内路径变成目录而非文件
+    touch "$DIR/conf/wp-config.php"
 
         {
             printf 'WORDPRESS_DB_PASSWORD=%s
@@ -1634,7 +1680,7 @@ cmd_pull_deploy() {
         warn "无法创建临时容器，跳过 wp-config-extra.php 导出"
     fi
 
-    if [[ ! -f "$DIR/conf/wp-config.php" ]]; then
+    if [[ ! -s "$DIR/conf/wp-config.php" ]]; then
         info "预启动容器以生成 wp-config.php ..."
         if [[ ! -f "$DIR/docker-compose.yml" ]]; then
             _write_worker_compose "$DIR" "$INST"
@@ -1830,6 +1876,12 @@ cmd_setup_r2() {
     local DIR INST; _resolve_instance DIR INST
     [[ -f "$DIR/.env" ]] || error "未找到 .env，请先完成节点初始化"
 
+    # R2 凭证只在主节点生效：worker 不进 wp-admin，不需要也不应该持有凭证
+    local _ROLE; _ROLE=$(env_get "$DIR/.env" "NODE_ROLE" 2>/dev/null || echo "master")
+    if [[ "$_ROLE" != "master" ]]; then
+        error "R2 凭证只能在主节点配置（当前节点角色: ${_ROLE}）。Media Offloader 后台只有主节点能访问。"
+    fi
+
     info "--- Advanced Media Offloader · Cloudflare R2 ---"
     local _CUR_KEY _CUR_BUCKET _CUR_DOMAIN _CUR_ENDPOINT
     _CUR_KEY=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
@@ -1862,14 +1914,29 @@ cmd_setup_r2() {
     chmod 600 "$DIR/.env"
     log "R2 凭证已写入 .env"
 
+    # 就地重新生成 wp-config-extra.php：复用已有 salts/Multisite 设置，
+    # 只刷新 R2 常量，不影响登录态、不需要重新生成 wp-config.php 主文件
+    local AK SK LK NK AS SS LS NS MT MD
+    AK=$(env_get "$DIR/.env" "WP_AUTH_KEY");        SK=$(env_get "$DIR/.env" "WP_SECURE_AUTH_KEY")
+    LK=$(env_get "$DIR/.env" "WP_LOGGED_IN_KEY");   NK=$(env_get "$DIR/.env" "WP_NONCE_KEY")
+    AS=$(env_get "$DIR/.env" "WP_AUTH_SALT");       SS=$(env_get "$DIR/.env" "WP_SECURE_AUTH_SALT")
+    LS=$(env_get "$DIR/.env" "WP_LOGGED_IN_SALT");  NS=$(env_get "$DIR/.env" "WP_NONCE_SALT")
+    MT=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE" 2>/dev/null || echo "single")
+    MD=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN" 2>/dev/null || true)
+    _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master" \
+        "$AK" "$SK" "$LK" "$NK" "$AS" "$SS" "$LS" "$NS" "$MT" "$MD" \
+        "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT"
+    log "wp-config-extra.php 已刷新（R2 常量已写入，salts 保持不变）"
+
     if dc "$DIR" ps --services --filter status=running 2>/dev/null | grep -q "wordpress"; then
-        read -rp "立即重建容器以生效？[y/N]: " _R2_APPLY || true
+        info "wp-config-extra.php 通过 require_once 加载，重启容器（非 force-recreate）即可生效"
+        read -rp "立即重启容器？[y/N]: " _R2_APPLY || true
         if [[ "${_R2_APPLY,,}" == "y" ]]; then
-            dc "$DIR" up -d --force-recreate wordpress \
-                && log "容器已重建，请到 Media Offloader 后台选择 Cloudflare R2 并 Test Connection" \
-                || warn "容器重建失败，请手动执行 docker compose up -d --force-recreate"
+            dc "$DIR" restart wordpress \
+                && log "容器已重启，请到 Media Offloader 后台选择 Cloudflare R2 并 Test Connection" \
+                || warn "容器重启失败，请手动执行 docker compose restart wordpress"
         else
-            info "记得稍后执行菜单重建容器，或手动 docker compose up -d --force-recreate 使配置生效"
+            info "记得稍后执行菜单重启容器，或手动 docker compose restart wordpress 使配置生效"
         fi
     else
         info "节点未运行，下次启动时会自动加载该配置"
