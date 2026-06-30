@@ -800,7 +800,7 @@ services:
       - ./conf/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
       - ./conf/php-fpm-www.conf:/usr/local/etc/php-fpm.d/www.conf:ro
       - ./conf/supervisord.conf:/etc/supervisord.conf:ro
-      - ./conf/wp-config.php:/var/www/html/wp-config.php:ro
+      - ./conf/wp-config.php:/var/www/html/wp-config.php
       - ./conf/wp-config-extra.php:/etc/wordpress/wp-config-extra.php:ro
       - ./logs:/var/log/nginx
 YAML
