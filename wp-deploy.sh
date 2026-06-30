@@ -809,8 +809,15 @@ YAML
 _write_worker_compose() {
     local DIR="$1"
     local INST="${2:-${INSTANCE}}"   # 接收实例名，fallback 到全局 INSTANCE
+    # $3: wp-config.php 挂载模式，默认只读(ro)。仅在首次部署生成 wp-config.php
+    #     的引导阶段传入 "rw"，生成完成后必须重写回 "ro" 再做最终启动，
+    #     避免 worker 节点对 wp-config.php 保持长期可写。
+    local WPCFG_MODE="${3:-ro}"
+    [[ "$WPCFG_MODE" == "ro" || "$WPCFG_MODE" == "rw" ]] || { warn "_write_worker_compose: 无效 WPCFG_MODE='${WPCFG_MODE}'，已回退为 ro"; WPCFG_MODE="ro"; }
+    local WPCFG_SUFFIX=":ro"
+    [[ "$WPCFG_MODE" == "rw" ]] && WPCFG_SUFFIX=""
     # 注意：此处不能用 heredoc + 单引号（'YAML'）否则变量无法展开，
-    # 改用 printf / cat 拼接，只让 INST 展开，其余 ${...} 保留为 compose 变量
+    # 改用 printf / cat 拼接，只让 INST/WPCFG_SUFFIX 展开，其余 ${...} 保留为 compose 变量
     cat > "$DIR/docker-compose.yml" <<YAML
 services:
   wordpress:
@@ -836,7 +843,7 @@ services:
       - ./conf/opcache.ini:/usr/local/etc/php/conf.d/opcache.ini:ro
       - ./conf/php-fpm-www.conf:/usr/local/etc/php-fpm.d/www.conf:ro
       - ./conf/supervisord.conf:/etc/supervisord.conf:ro
-      - ./conf/wp-config.php:/var/www/html/wp-config.php:ro
+      - ./conf/wp-config.php:/var/www/html/wp-config.php${WPCFG_SUFFIX}
       - ./conf/wp-config-extra.php:/etc/wordpress/wp-config-extra.php:ro
       - ./logs:/var/log/nginx
 YAML
@@ -989,13 +996,15 @@ _setup_plugins() {
             # v6.2: Multisite 安装
             if [[ "$MS_TYPE" == "subdirectory" || "$MS_TYPE" == "subdomain" ]]; then
                 info "配置 WordPress Multisite (${MS_TYPE})..."
-                local _MS_FLAGS=""
-                [[ "$MS_TYPE" == "subdomain" ]] && _MS_FLAGS="--subdomains"
-                if "${WP_CMD[@]}" core multisite-convert ${_MS_FLAGS} 2>/dev/null; then
+                local -a _MS_FLAGS=()
+                [[ "$MS_TYPE" == "subdomain" ]] && _MS_FLAGS=("--subdomains")
+                local _MS_ERR; _MS_ERR=$(mktemp)
+                if "${WP_CMD[@]}" core multisite-convert "${_MS_FLAGS[@]}" 2>"$_MS_ERR"; then
                     log "Multisite 已启用（${MS_TYPE} 模式）"
                     if [[ "$MS_TYPE" == "subdomain" && -n "$MS_DOMAIN" ]]; then
                         info "  根域名: ${MS_DOMAIN}（确保 DNS 通配符解析已配置）"
                     fi
+                    rm -f "$_MS_ERR"
                     # 转换后必须重启容器，使 wp-config-extra.php 中的 Multisite 常量生效，
                     # 否则后续 WP-CLI 命令无法在 Multisite 上下文中定位站点
                     info "重启容器以应用 Multisite 常量..."
@@ -1004,10 +1013,18 @@ _setup_plugins() {
                     while ! "${WP_CMD[@]}" cli version &>/dev/null; do
                         sleep 3
                         _MS_WAIT=$((_MS_WAIT - 1))
-                        [[ $_MS_WAIT -le 0 ]] && { warn "容器重启后未就绪，后续命令可能失败"; break; }
+                        if [[ $_MS_WAIT -le 0 ]]; then
+                            warn "容器重启后未就绪，已中止后续插件配置（语言包/Redis），请稍后执行菜单11重试"
+                            return 1
+                        fi
                     done
                 else
                     warn "Multisite 转换失败，请在后台手动完成（工具→网络设置）"
+                    if [[ -s "$_MS_ERR" ]]; then
+                        warn "错误详情："
+                        sed 's/^/    /' "$_MS_ERR" >&2
+                    fi
+                    rm -f "$_MS_ERR"
                 fi
             fi
         else
@@ -1634,7 +1651,12 @@ cmd_pull_deploy() {
     [[ -n "$REGISTRY_HOST" ]] || error ".env 中缺少 REGISTRY_HOST"
 
     # 每次都重写 compose，确保镜像名与当前实例一致（修复旧版写死 wordpress-site 的问题）
-    _write_worker_compose "$DIR" "$INST"
+    # [fix] wp-config.php 尚未生成时必须临时挂载为可写，否则容器内
+    # `wp config create` 写入只读 bind mount 会失败，首次部署直接挂掉；
+    # 生成完成后必须立即重写回只读，恢复 worker 节点的防篡改边界。
+    local _WPCFG_MODE="ro"
+    [[ -s "$DIR/conf/wp-config.php" ]] || _WPCFG_MODE="rw"
+    _write_worker_compose "$DIR" "$INST" "$_WPCFG_MODE"
 
     DB_HOST="${DB_HOST:-$(env_get "$DIR/.env" "DB_HOST")}"
     DB_NAME="${DB_NAME:-$(env_get "$DIR/.env" "WORDPRESS_DB_NAME")}"
@@ -1683,9 +1705,8 @@ cmd_pull_deploy() {
 
     if [[ ! -s "$DIR/conf/wp-config.php" ]]; then
         info "预启动容器以生成 wp-config.php ..."
-        if [[ ! -f "$DIR/docker-compose.yml" ]]; then
-            _write_worker_compose "$DIR" "$INST"
-        fi
+        # 上面已按 _WPCFG_MODE=rw 写过 compose；若文件意外不存在则补写一次，同样要 rw
+        [[ -f "$DIR/docker-compose.yml" ]] || _write_worker_compose "$DIR" "$INST" "rw"
         dc "$DIR" up -d 2>/dev/null || true
 
         local RETRIES=20
@@ -1703,6 +1724,10 @@ cmd_pull_deploy() {
             && log "wp-config.php 已生成并导出至 conf/" \
             || warn "wp-config.php 生成失败，请手动创建或稍后重试（菜单 11）"
         fi
+
+        # [fix] 无论生成成功与否，都要把 compose 重写回只读挂载，
+        # 防止 worker 节点的 wp-config.php 长期保持可写状态
+        _write_worker_compose "$DIR" "$INST" "ro"
     fi
 
     # v5.0: 统一占位符替换逻辑（主/工作节点一致）
