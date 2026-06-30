@@ -107,6 +107,20 @@ env_get() {
     grep "^${KEY}=" "$FILE" 2>/dev/null | cut -d= -f2- | head -1
 }
 
+# 幂等写入/更新 .env 中的键值：存在则原地替换，不存在则追加
+env_set() {
+    local FILE="$1" KEY="$2" VALUE="$3"
+    [[ -f "$FILE" ]] || : > "$FILE"
+    if grep -q "^${KEY}=" "$FILE" 2>/dev/null; then
+        local TMP; TMP=$(mktemp)
+        awk -F= -v k="$KEY" -v v="$VALUE" \
+            'BEGIN{OFS="="} $1==k{$0=k"="v} {print}' "$FILE" > "$TMP" \
+            && mv "$TMP" "$FILE"
+    else
+        printf '%s=%s\n' "$KEY" "$VALUE" >> "$FILE"
+    fi
+}
+
 # 本地生成 64 字符随机字符串，不依赖外网
 _gen_salt() {
     LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()-_=+[]|;:,.<>?' \
@@ -594,6 +608,16 @@ if (extension_loaded('redis') && php_sapi_name() !== 'cli' && !headers_sent()) {
     ini_set('session.save_path',
         'tcp://' . $_redis_host . ':6379?auth=' . urlencode($_redis_pw));
 }
+
+// Advanced Media Offloader - Cloudflare R2（仅在 .env 配置了凭证时启用）
+$_r2_key = getenv('R2_ACCESS_KEY') ?: '';
+if ($_r2_key !== '') {
+    define('ADVMO_CLOUDFLARE_R2_KEY',      $_r2_key);
+    define('ADVMO_CLOUDFLARE_R2_SECRET',   getenv('R2_SECRET_KEY') ?: '');
+    define('ADVMO_CLOUDFLARE_R2_BUCKET',   getenv('R2_BUCKET')     ?: '');
+    define('ADVMO_CLOUDFLARE_R2_DOMAIN',   getenv('R2_DOMAIN')     ?: '');
+    define('ADVMO_CLOUDFLARE_R2_ENDPOINT', getenv('R2_ENDPOINT')   ?: '');
+}
 PHP_BODY
 
         # Multisite 常量
@@ -638,9 +662,12 @@ RUN apk add --no-cache \
     && apk del .build-deps libpng-dev libjpeg-turbo-dev freetype-dev imagemagick-dev \
     && rm -rf /tmp/pear /var/cache/apk/*
 
-RUN curl -4 -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
+ARG WP_CLI_VERSION=2.12.0
+RUN curl -4 -fsSL "https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION}/wp-cli-${WP_CLI_VERSION}.phar" \
         -o /usr/local/bin/wp \
-    && chmod +x /usr/local/bin/wp
+    && chmod +x /usr/local/bin/wp \
+    && php /usr/local/bin/wp --allow-root --version | grep -q "${WP_CLI_VERSION}" \
+    || (echo "wp-cli version mismatch or corrupted download" && exit 1)
 
 COPY wp-core/ /var/www/html/
 RUN rm -f /var/www/html/wp-config.php /var/www/html/wp-config-sample.php
@@ -703,9 +730,12 @@ RUN apk add --no-cache \
     && apk del .build-deps libpng-dev libjpeg-turbo-dev freetype-dev imagemagick-dev \
     && rm -rf /tmp/pear /var/cache/apk/*
 
-RUN curl -4 -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar \
+ARG WP_CLI_VERSION=2.12.0
+RUN curl -4 -fsSL "https://github.com/wp-cli/wp-cli/releases/download/v${WP_CLI_VERSION}/wp-cli-${WP_CLI_VERSION}.phar" \
         -o /usr/local/bin/wp \
-    && chmod +x /usr/local/bin/wp
+    && chmod +x /usr/local/bin/wp \
+    && php /usr/local/bin/wp --allow-root --version | grep -q "${WP_CLI_VERSION}" \
+    || (echo "wp-cli version mismatch or corrupted download" && exit 1)
 
 RUN curl -4 -fsSL https://wordpress.org/latest.tar.gz \
         | tar -xz -C /var/www/html --strip-components=1 \
@@ -751,6 +781,11 @@ services:
       REDIS_HOST:             ${REDIS_HOST}
       REDIS_PW:               ${REDIS_PW}
       WP_SITEURL_FALLBACK:    ${WP_SITEURL_FALLBACK}
+      R2_ACCESS_KEY:          ${R2_ACCESS_KEY:-}
+      R2_SECRET_KEY:          ${R2_SECRET_KEY:-}
+      R2_BUCKET:              ${R2_BUCKET:-}
+      R2_DOMAIN:              ${R2_DOMAIN:-}
+      R2_ENDPOINT:            ${R2_ENDPOINT:-}
     volumes:
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./data/cache:/var/www/html/wp-content/cache
@@ -786,6 +821,11 @@ services:
       REDIS_HOST:             \${REDIS_HOST}
       REDIS_PW:               \${REDIS_PW}
       WP_SITEURL_FALLBACK:    \${WP_SITEURL_FALLBACK}
+      R2_ACCESS_KEY:          \${R2_ACCESS_KEY:-}
+      R2_SECRET_KEY:          \${R2_SECRET_KEY:-}
+      R2_BUCKET:              \${R2_BUCKET:-}
+      R2_DOMAIN:              \${R2_DOMAIN:-}
+      R2_ENDPOINT:            \${R2_ENDPOINT:-}
     volumes:
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./data/cache:/var/www/html/wp-content/cache
@@ -849,6 +889,26 @@ _flush_all_caches() {
 }
 
 # ════════════════════════════════════════════════════════
+# _wp_config_create_with_extra
+#   统一封装 wp-config.php 生成逻辑：
+#   - 用 --skip-salts 跳过随机 KEY/SALT（由 wp-config-extra.php 统一管理），
+#     避免事后 sed 删行
+#   - 用 --extra-php 让 WP-CLI 把 require_once 插入到
+#     "/* That's all, stop editing! */" 之前，避免手写正则 sed 插入
+#   参数: $1=DIR  $2..$5=DB_NAME DB_USER DB_PW DB_HOST
+#   返回: 0=成功 1=失败
+# ════════════════════════════════════════════════════════
+_wp_config_create_with_extra() {
+    local DIR="$1" DB_NAME="$2" DB_USER="$3" DB_PW="$4" DB_HOST="$5"
+    dc "$DIR" exec -T wordpress sh -c "wp --allow-root config create \
+        --dbname='${DB_NAME}' --dbuser='${DB_USER}' --dbpass='${DB_PW}' \
+        --dbhost='${DB_HOST}' --dbcharset=utf8mb4 --skip-check --skip-salts \
+        --extra-php <<'PHP'
+require_once('/etc/wordpress/wp-config-extra.php');
+PHP"
+}
+
+# ════════════════════════════════════════════════════════
 # _setup_plugins
 # ════════════════════════════════════════════════════════
 _setup_plugins() {
@@ -890,13 +950,8 @@ _setup_plugins() {
         DB_PW=$(env_get "$DIR/.env" "WORDPRESS_DB_PASSWORD")
         DB_HOST=$(env_get "$DIR/.env" "DB_HOST")
 
-        "${WP_CMD[@]}" config create \
-            --dbname="$DB_NAME" --dbuser="$DB_USER" --dbpass="$DB_PW" \
-            --dbhost="$DB_HOST" --dbcharset=utf8mb4 --skip-check \
+        _wp_config_create_with_extra "$DIR" "$DB_NAME" "$DB_USER" "$DB_PW" "$DB_HOST" \
             || { warn "wp-config.php 创建失败，请检查数据库连接。"; return 1; }
-        dc "$DIR" exec -T wordpress sed -i '/_KEY/d; /_SALT/d' /var/www/html/wp-config.php
-        dc "$DIR" exec -T wordpress sh -c \
-            "sed -i \"/require_once.*wp-settings/i require_once('\/etc\/wordpress\/wp-config-extra.php');\" /var/www/html/wp-config.php" || true
         log "wp-config.php 已自动生成。"
     fi
 
@@ -1595,14 +1650,7 @@ cmd_pull_deploy() {
         if dc "$DIR" exec -T wordpress sh -c 'command -v wp' &>/dev/null; then
             local CID
             CID=$(docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" ps -q wordpress)
-            dc "$DIR" exec -T wordpress wp --allow-root config create \
-                --dbname="$DB_NAME" --dbuser="$DB_USER" \
-                --dbpass="$DB_PW"   --dbhost="$DB_HOST" \
-                --dbcharset=utf8mb4 --path=/var/www/html \
-                --skip-check 2>/dev/null \
-            && dc "$DIR" exec -T wordpress sed -i '/_KEY/d; /_SALT/d' /var/www/html/wp-config.php \
-            && dc "$DIR" exec -T wordpress sh -c \
-                "sed -i \"/require_once.*wp-settings/i require_once('\/etc\/wordpress\/wp-config-extra.php');\" /var/www/html/wp-config.php" \
+            _wp_config_create_with_extra "$DIR" "$DB_NAME" "$DB_USER" "$DB_PW" "$DB_HOST" \
             && dc "$DIR" exec -T wordpress cp /var/www/html/wp-config.php /tmp/wp-config-out.php \
             && docker cp "${CID}:/tmp/wp-config-out.php" "$DIR/conf/wp-config.php" \
             && log "wp-config.php 已生成并导出至 conf/" \
@@ -1776,6 +1824,56 @@ cmd_destroy() {
     dc "$DIR" down --volumes --remove-orphans 2>/dev/null || true
     rm -rf "$DIR"
     log "节点及数据已完全删除：${DIR}"
+}
+
+cmd_setup_r2() {
+    local DIR INST; _resolve_instance DIR INST
+    [[ -f "$DIR/.env" ]] || error "未找到 .env，请先完成节点初始化"
+
+    info "--- Advanced Media Offloader · Cloudflare R2 ---"
+    local _CUR_KEY _CUR_BUCKET _CUR_DOMAIN _CUR_ENDPOINT
+    _CUR_KEY=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
+    _CUR_BUCKET=$(env_get "$DIR/.env" "R2_BUCKET" 2>/dev/null || true)
+    _CUR_DOMAIN=$(env_get "$DIR/.env" "R2_DOMAIN" 2>/dev/null || true)
+    _CUR_ENDPOINT=$(env_get "$DIR/.env" "R2_ENDPOINT" 2>/dev/null || true)
+    [[ -n "$_CUR_KEY" ]] && info "  当前已配置（留空回车保留原值）"
+
+    local R2_KEY R2_SECRET R2_BUCKET R2_DOMAIN R2_ENDPOINT
+    read -rp "R2 Access Key Id [${_CUR_KEY:+已设置}]: " R2_KEY || true
+    R2_KEY="${R2_KEY:-$_CUR_KEY}"
+    [[ -n "$R2_KEY" ]] || error "Access Key 不能为空"
+    read_secret "R2 Secret Access Key（留空保留原值）: " R2_SECRET
+    [[ -n "$R2_SECRET" ]] || R2_SECRET=$(env_get "$DIR/.env" "R2_SECRET_KEY" 2>/dev/null || true)
+    [[ -n "$R2_SECRET" ]] || error "Secret Key 不能为空"
+    read -rp "R2 Bucket 名称 [${_CUR_BUCKET}]: " R2_BUCKET || true
+    R2_BUCKET="${R2_BUCKET:-$_CUR_BUCKET}"
+    [[ -n "$R2_BUCKET" ]] || error "Bucket 不能为空"
+    read -rp "自定义域名 / CDN Domain（完整 https:// URL）[${_CUR_DOMAIN}]: " R2_DOMAIN || true
+    R2_DOMAIN="${R2_DOMAIN:-$_CUR_DOMAIN}"
+    read -rp "R2 Endpoint（完整 https://<account_id>.r2.cloudflarestorage.com）[${_CUR_ENDPOINT}]: " R2_ENDPOINT || true
+    R2_ENDPOINT="${R2_ENDPOINT:-$_CUR_ENDPOINT}"
+    [[ -n "$R2_ENDPOINT" ]] || error "Endpoint 不能为空"
+
+    env_set "$DIR/.env" "R2_ACCESS_KEY" "$R2_KEY"
+    env_set "$DIR/.env" "R2_SECRET_KEY" "$R2_SECRET"
+    env_set "$DIR/.env" "R2_BUCKET"     "$R2_BUCKET"
+    env_set "$DIR/.env" "R2_DOMAIN"     "$R2_DOMAIN"
+    env_set "$DIR/.env" "R2_ENDPOINT"   "$R2_ENDPOINT"
+    chmod 600 "$DIR/.env"
+    log "R2 凭证已写入 .env"
+
+    if dc "$DIR" ps --services --filter status=running 2>/dev/null | grep -q "wordpress"; then
+        read -rp "立即重建容器以生效？[y/N]: " _R2_APPLY || true
+        if [[ "${_R2_APPLY,,}" == "y" ]]; then
+            dc "$DIR" up -d --force-recreate wordpress \
+                && log "容器已重建，请到 Media Offloader 后台选择 Cloudflare R2 并 Test Connection" \
+                || warn "容器重建失败，请手动执行 docker compose up -d --force-recreate"
+        else
+            info "记得稍后执行菜单重建容器，或手动 docker compose up -d --force-recreate 使配置生效"
+        fi
+    else
+        info "节点未运行，下次启动时会自动加载该配置"
+    fi
 }
 
 cmd_retry_plugins() {
@@ -2236,6 +2334,7 @@ interactive_menu() {
         echo -e "  \e[33m11.\e[0m 重试插件配置 / 补装语言包"
         echo -e "  \e[33m12.\e[0m 手动刷新全层缓存"
         echo -e "  \e[36m13.\e[0m 节点列表管理"
+        echo -e "  \e[32m17.\e[0m 配置 R2 媒体卸载（Advanced Media Offloader）"
         echo -e "  \e[32m15.\e[0m 备份配置（.env + conf → rsync / S3 / AList）"
         echo -e "  \e[32m16.\e[0m 还原配置（本地 / rsync / S3 / AList）"
         echo -e "  \e[31m14.\e[0m 删除节点（不可恢复）"
@@ -2256,6 +2355,7 @@ interactive_menu() {
             11) cmd_retry_plugins ;;
             12) cmd_flush ;;
             13) cmd_nodes ;;
+            17) cmd_setup_r2 ;;
             14) cmd_destroy ;;
             15) cmd_backup ;;
             16) cmd_restore ;;
