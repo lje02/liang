@@ -904,6 +904,7 @@ _wp_config_create_with_extra() {
     dc "$DIR" exec -T wordpress sh -c "wp --allow-root config create \
         --dbname='${DB_NAME}' --dbuser='${DB_USER}' --dbpass='${DB_PW}' \
         --dbhost='${DB_HOST}' --dbcharset=utf8mb4 --skip-check --skip-salts \
+        --force \
         --extra-php <<'PHP'
 require_once('/etc/wordpress/wp-config-extra.php');
 PHP"
