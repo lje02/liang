@@ -104,7 +104,7 @@ read_secret() {
 
 env_get() {
     local FILE="$1" KEY="$2"
-    grep "^${KEY}=" "$FILE" 2>/dev/null | cut -d= -f2- | head -1
+    grep -a "^${KEY}=" "$FILE" 2>/dev/null | cut -d= -f2- | head -1
 }
 
 # 幂等写入/更新 .env 中的键值：存在则原地替换，不存在则追加
