@@ -21,7 +21,7 @@ export LC_ALL=en_US.UTF-8
 # 脚本版本与自身路径（用于自更新）
 SCRIPT_VERSION="6.4"
 SCRIPT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-SCRIPT_GITHUB_RAW="${SCRIPT_GITHUB_RAW:-https://raw.githubusercontent.com/yourorg/wp-deploy/main/wp-deploy.sh}"
+SCRIPT_GITHUB_RAW="${SCRIPT_GITHUB_RAW:-https://raw.githubusercontent.com/lje02/liang/main/wp-deploy.sh}"
 
 BASE_DIR="${BASE_DIR:-/srv}"
 WG_IFACE="${WG_IFACE:-wg0}"
