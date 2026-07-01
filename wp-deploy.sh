@@ -1,6 +1,27 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
+# v6.6
+#   变更:
+#     [fix] v6.5 的 Redis 全页缓存实际是没接通的摆设，本版修复：
+#       - _write_wp_config_extra 补上 WP_PAGE_CACHE_ENABLED 常量输出，
+#         之前收了 $18 参数但从未写进生成的 wp-config-extra.php
+#       - master_init / push / setup_r2 三处调用点补传 $18，全部接上开关
+#       - Dockerfile 补 COPY advanced-cache.php + mu-plugins/pagecache-purge.php，
+#         init/worker compose 补 bind mount，pull_deploy 补 docker cp 导出
+#       - 新增菜单19 / cmd_setup_pagecache：真正实现开关切换（之前只在注释里提过）
+#       - _flush_all_caches（菜单12）补上清 Redis db1（页面缓存命名空间）
+#       - pagecache-purge.php 补 transition_post_status 钩子：文章下架/移入回收站
+#         之前不会清缓存，得等 6 小时 TTL 自动过期
+#       - 菜单标题写死的 v6.4 字样改为读 SCRIPT_VERSION
+# v6.5
+#   变更:
+#     [feat] 新增 Redis 全页缓存（advanced-cache.php + mu-plugins 清缓存钩子）
+#            所有节点共享同一个 Redis，缓存写入即全节点生效，不需要跨节点广播清理
+#            通过 .env 的 PAGE_CACHE_ENABLED 开关控制，默认关闭
+#            主节点初始化时可选开启，也可通过菜单19随时开关（cmd_setup_pagecache）
+#            菜单12（刷新全层缓存）同步清空页面缓存的 Redis 命名空间
+#     继承 v6.4 全部功能
 # v6.4
 #   变更:
 #     [feat] 新增菜单18：脚本自更新（从 GitHub 拉取最新版本）
@@ -19,7 +40,7 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # 脚本版本与自身路径（用于自更新）
-SCRIPT_VERSION="6.4"
+SCRIPT_VERSION="6.6"
 SCRIPT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_GITHUB_RAW="${SCRIPT_GITHUB_RAW:-https://raw.githubusercontent.com/lje02/liang/main/wp-deploy.sh}"
 
@@ -492,6 +513,135 @@ opcache.enable_cli=0
 INI
 }
 
+# ════════════════════════════════════════════════════════
+# Redis 全页缓存（v6.5）
+#   - advanced-cache.php: WordPress 原生 drop-in，WP_CACHE=true 时
+#     wp-settings.php 会在几乎没加载任何东西之前 include 它，可以在此
+#     直接输出缓存好的 HTML 并 exit，跳过整个 WP 加载流程。
+#   - 是否生效由 wp-config-extra.php 里的 WP_PAGE_CACHE_ENABLED 常量
+#     统一控制（随镜像分发到所有节点），本文件内容本身不区分开关状态，
+#     即使 PAGE_CACHE_ENABLED=false 也可以放心随镜像分发，不会有副作用。
+#   - 用独立的 Redis 逻辑库（SELECT 1），与对象缓存（db0）分开，
+#     互不挤占、互不影响，出问题也方便单独排查/清空。
+# ════════════════════════════════════════════════════════
+_write_advanced_cache_php() {
+    cat > "$1" <<'PHP'
+<?php
+// advanced-cache.php — Redis 全页缓存（自动生成，勿手动编辑）
+// 开关由 wp-config-extra.php 中的 WP_PAGE_CACHE_ENABLED 常量控制
+if (!defined('WP_PAGE_CACHE_ENABLED') || !WP_PAGE_CACHE_ENABLED) return;
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'GET') return;
+if (!empty($_SERVER['QUERY_STRING'])) return;               // 带参数请求不缓存，简化正确性
+$uri = $_SERVER['REQUEST_URI'] ?? '/';
+if (strpos($uri, '/wp-admin') === 0
+    || strpos($uri, '/wp-login') === 0
+    || strpos($uri, '/wp-json') === 0
+    || strpos($uri, '/wp-cron.php') === 0) {
+    return;
+}
+foreach (array_keys($_COOKIE) as $_k) {
+    // 登录用户 / 刚发表评论的访客：不缓存，避免看到别人的缓存页或缓存自己的过渡态
+    if (strpos($_k, 'wordpress_logged_in_') === 0 || strpos($_k, 'comment_author_') === 0) {
+        return;
+    }
+}
+if (!extension_loaded('redis')) return;
+if (!defined('WP_REDIS_HOST')) return;
+
+$_pc_key = 'pagecache:' . md5(
+    ((!empty($_SERVER['HTTPS'])) ? 'https' : 'http') . '://' .
+    ($_SERVER['HTTP_HOST'] ?? '') . $uri
+);
+
+try {
+    $_pc_redis = new Redis();
+    $_pc_redis->connect(WP_REDIS_HOST, 6379, 0.3);   // 300ms 超时，Redis 异常时不拖垮全站
+    if (defined('WP_REDIS_PASSWORD') && WP_REDIS_PASSWORD !== '') {
+        $_pc_redis->auth(WP_REDIS_PASSWORD);
+    }
+    $_pc_redis->select(1); // 独立逻辑库，与对象缓存(db0)分开
+
+    $_pc_cached = $_pc_redis->get($_pc_key);
+    if ($_pc_cached !== false) {
+        header('X-Page-Cache: HIT');
+        echo $_pc_cached;
+        exit;
+    }
+
+    header('X-Page-Cache: MISS');
+    ob_start(function ($html) use ($_pc_redis, $_pc_key) {
+        if (function_exists('http_response_code') && http_response_code() === 200 && strlen($html) > 1000) {
+            // 6 小时 TTL 兜底：即使某些页面漏了主动清缓存，也会自动过期，不会长期陈旧
+            $_pc_redis->setex($_pc_key, 21600, $html);
+        }
+        return $html;
+    });
+} catch (\Throwable $e) {
+    // Redis 不可用时静默降级为不缓存，绝不影响正常访问
+    return;
+}
+PHP
+}
+
+_write_pagecache_purge_mu_plugin() {
+    cat > "$1" <<'PHP'
+<?php
+// pagecache-purge.php — 文章状态变化时清对应的 Redis 页面缓存（自动生成，勿手动编辑）
+// mu-plugin 无需手动激活，放进 wp-content/mu-plugins/ 即自动加载
+
+function _pc_purge_post_urls($post_id) {
+    if (!extension_loaded('redis') || !defined('WP_REDIS_HOST')) return;
+
+    $urls = array_filter([home_url('/'), get_permalink($post_id)]);
+    if (function_exists('get_the_category')) {
+        foreach (get_the_category($post_id) as $cat) {
+            $link = get_category_link($cat->term_id);
+            if ($link) $urls[] = $link;
+        }
+    }
+
+    try {
+        $redis = new Redis();
+        $redis->connect(WP_REDIS_HOST, 6379, 0.3);
+        if (defined('WP_REDIS_PASSWORD') && WP_REDIS_PASSWORD !== '') {
+            $redis->auth(WP_REDIS_PASSWORD);
+        }
+        $redis->select(1);
+        foreach ($urls as $url) {
+            $p = wp_parse_url($url);
+            if (empty($p['host'])) continue;
+            $scheme = $p['scheme'] ?? 'http';
+            $path   = $p['path']   ?? '/';
+            $redis->del('pagecache:' . md5("{$scheme}://{$p['host']}{$path}"));
+        }
+    } catch (\Throwable $e) {
+        // 静默失败：漏清的 key 靠 advanced-cache.php 里的 6 小时 TTL 自动兜底
+    }
+}
+
+// 编辑/重新发表已发布文章：清首页 + 该文章 + 所在分类页
+add_action('save_post', function ($post_id) {
+    if (!defined('WP_PAGE_CACHE_ENABLED') || !WP_PAGE_CACHE_ENABLED) return;
+    if (wp_is_post_revision($post_id) || wp_is_post_autosave($post_id)) return;
+
+    $post = get_post($post_id);
+    if (!$post || $post->post_status !== 'publish') return;
+
+    _pc_purge_post_urls($post_id);
+}, 20);
+
+// [fix] v6.6: 原来只挂 save_post 且要求 post_status==='publish'，文章被下架/移入回收站时
+// save_post 触发时状态已经是 trash，直接被上面的判断拦掉，导致下架后首页/文章页缓存
+// 继续展示已下架内容，最长要等 6 小时 TTL 才会自动过期。这里补一个“曾发布→现在不是
+// 发布”的转场钩子，专门覆盖下架场景，避免和 save_post 重复清理。
+add_action('transition_post_status', function ($new_status, $old_status, $post) {
+    if (!defined('WP_PAGE_CACHE_ENABLED') || !WP_PAGE_CACHE_ENABLED) return;
+    if ($old_status !== 'publish' || $new_status === 'publish') return;
+    _pc_purge_post_urls($post->ID);
+}, 20, 3);
+PHP
+}
+
 _write_php_fpm_www_conf() { cat > "$1" <<'CONF'
 [www]
 user  = www-data
@@ -517,9 +667,13 @@ CONF
 # v6.4:
 #   - 新增 R2 / Advanced Media Offloader 常量，字面量烘焙进文件（随镜像分发），
 #     不再依赖容器 getenv()，主/工作节点共享同一份，不需要逐节点配置 .env
+# v6.5:
+#   - 新增 $18=PAGE_CACHE_ENABLED，与 Multisite 参数同样字面量烘焙、
+#     主/工作节点都传（不像 R2 凭证那样只在主节点传），确保全节点开关一致
 # 参数: $1=DEST $2=NODE_ROLE $3...$10=8个 salt 值
 #       $11=MS_TYPE(single|subdirectory|subdomain)  $12=MS_DOMAIN
 #       $13=R2_KEY $14=R2_SECRET $15=R2_BUCKET $16=R2_DOMAIN $17=R2_ENDPOINT
+#       $18=PAGE_CACHE_ENABLED(true|false)
 _write_wp_config_extra() {
     local DEST="$1"
     local NODE_ROLE="${2:-worker}"
@@ -538,6 +692,8 @@ _write_wp_config_extra() {
     local R2_BUCKET="${15:-}"
     local R2_DOMAIN="${16:-}"
     local R2_ENDPOINT="${17:-}"
+    local PAGE_CACHE_ENABLED="${18:-false}"
+    [[ "$PAGE_CACHE_ENABLED" == "true" ]] || PAGE_CACHE_ENABLED="false"
 
     # 如果没有传入 salts（如老的调用路径），生成临时值并告警
     if [[ -z "$AUTH_KEY" ]]; then
@@ -626,6 +782,11 @@ if (extension_loaded('redis') && php_sapi_name() !== 'cli' && !headers_sent()) {
 }
 PHP_BODY
 
+        # [fix] v6.6: 之前这里从未输出 WP_PAGE_CACHE_ENABLED 常量，导致 $18 参数
+        # 传了也是白传，advanced-cache.php 里 !defined(...) 恒为真，缓存永远不生效
+        printf '\n// Redis 全页缓存开关（由 PAGE_CACHE_ENABLED 控制，见 advanced-cache.php）\n'
+        printf "define('WP_PAGE_CACHE_ENABLED', %s);\n" "$PAGE_CACHE_ENABLED"
+
         # Multisite 常量
         if [[ "$MS_TYPE" == "subdirectory" || "$MS_TYPE" == "subdomain" ]]; then
             printf '\n// WordPress Multisite\n'
@@ -703,6 +864,13 @@ COPY conf/supervisord.conf      /etc/supervisord.conf
 # 若不打入镜像，docker cp 失败 → 宿主机 conf/wp-config-extra.php 不存在 →
 # Docker 把 bind mount 源当目录创建 → PHP require_once 拿到目录 → Fatal Error → 全站 500。
 COPY conf/wp-config-extra.php   /etc/wordpress/wp-config-extra.php
+# [fix] v6.6: 同样的原因（见上面 wp-config-extra.php 的注释）打进镜像：
+# cmd_pull_deploy 会 docker cp 取出这两个文件放到宿主机 conf/，再由
+# _write_worker_compose bind mount(:ro) 覆盖回同样的路径。若不打入镜像，
+# docker cp 会失败，宿主机文件缺失导致 Docker 把 bind mount 源当目录创建，
+# advanced-cache.php/mu-plugins/pagecache-purge.php 变成目录 → 全站 500。
+COPY conf/advanced-cache.php    /var/www/html/wp-content/advanced-cache.php
+COPY conf/pagecache-purge.php   /var/www/html/wp-content/mu-plugins/pagecache-purge.php
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
@@ -832,6 +1000,8 @@ services:
       - ./conf/supervisord.conf:/etc/supervisord.conf:ro
       - ./conf/wp-config.php:/var/www/html/wp-config.php
       - ./conf/wp-config-extra.php:/etc/wordpress/wp-config-extra.php:ro
+      - ./conf/advanced-cache.php:/var/www/html/wp-content/advanced-cache.php:ro
+      - ./conf/pagecache-purge.php:/var/www/html/wp-content/mu-plugins/pagecache-purge.php:ro
       - ./logs:/var/log/nginx
 YAML
 }
@@ -875,6 +1045,8 @@ services:
       - ./conf/supervisord.conf:/etc/supervisord.conf:ro
       - ./conf/wp-config.php:/var/www/html/wp-config.php${WPCFG_SUFFIX}
       - ./conf/wp-config-extra.php:/etc/wordpress/wp-config-extra.php:ro
+      - ./conf/advanced-cache.php:/var/www/html/wp-content/advanced-cache.php:ro
+      - ./conf/pagecache-purge.php:/var/www/html/wp-content/mu-plugins/pagecache-purge.php:ro
       - ./logs:/var/log/nginx
 YAML
 }
@@ -893,6 +1065,26 @@ _flush_all_caches() {
 
     dc "$DIR" exec -T wordpress wp --allow-root cache flush 2>/dev/null \
     && info "  Redis 对象缓存已刷新" || warn "  Redis 对象缓存刷新失败"
+
+    # [fix] v6.6: 之前只 flush 了对象缓存（db0），页面缓存独立用 db1（select 1），
+    # 从未被这里清过，导致关闭/开启页面缓存开关或强制刷新时，旧页面仍会命中缓存
+    local _PC_FLUSH
+    _PC_FLUSH=$(dc "$DIR" exec -T wordpress wp --allow-root eval '
+        $h = getenv("REDIS_HOST") ?: "127.0.0.1";
+        $p = getenv("REDIS_PW")   ?: "";
+        try {
+            $r = new Redis();
+            $r->connect($h, 6379, 0.5);
+            if ($p !== "") { $r->auth($p); }
+            $r->select(1);
+            $r->flushDB();
+            echo "OK";
+        } catch (\Throwable $e) {
+            echo "FAIL";
+        }
+    ' 2>/dev/null || true)
+    [[ "$_PC_FLUSH" == "OK" ]] \
+    && info "  Redis 页面缓存（db1）已清空" || warn "  Redis 页面缓存清空失败（可忽略，6小时TTL会自动过期）"
 
     dc "$DIR" exec -T wordpress wp --allow-root rewrite flush 2>/dev/null \
     && info "  Rewrite rules 已刷新" || warn "  Rewrite rules 刷新失败"
@@ -1240,6 +1432,12 @@ cmd_master_init() {
         info "  Multisite 模式: ${WP_MULTISITE_TYPE}"
     fi
 
+    # v6.6: Redis 全页缓存开关
+    info "--- Redis 全页缓存（可选，默认关闭）---"
+    local WP_PAGE_CACHE_ENABLED="false"
+    read -rp "启用 Redis 全页缓存？[y/N]: " _PC_ENABLE || true
+    [[ "${_PC_ENABLE,,}" == "y" ]] && WP_PAGE_CACHE_ENABLED="true"
+
     info "--- 数据库 ---"
     read -rp "MariaDB WireGuard IP: " DB_HOST || true
     [[ -n "$DB_HOST" ]] || error "数据库 IP 不能为空"
@@ -1326,6 +1524,8 @@ cmd_master_init() {
 '     "${WP_MULTISITE_TYPE}"
         printf 'WP_MULTISITE_DOMAIN=%s
 '   "${WP_MULTISITE_DOMAIN}"
+        printf 'PAGE_CACHE_ENABLED=%s
+'   "${WP_PAGE_CACHE_ENABLED}"
         printf 'WP_AUTH_KEY=%s
 '           "${S_AUTH_KEY}"
         printf 'WP_SECURE_AUTH_KEY=%s
@@ -1352,6 +1552,10 @@ cmd_master_init() {
     _write_opcache_ini        "$DIR/conf/opcache.ini"
     _write_php_fpm_www_conf   "$DIR/conf/php-fpm-www.conf"
     _write_supervisord_conf   "$DIR/conf/supervisord.conf"
+    # v6.6: 页面缓存 drop-in 文件内容本身不区分开关状态，无条件写出，
+    # 实际是否生效由 wp-config-extra.php 里的 WP_PAGE_CACHE_ENABLED 常量控制
+    _write_advanced_cache_php        "$DIR/conf/advanced-cache.php"
+    _write_pagecache_purge_mu_plugin "$DIR/conf/pagecache-purge.php"
     local R2_KEY R2_SECRET R2_BUCKET R2_DOMAIN R2_ENDPOINT
     R2_KEY=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
     R2_SECRET=$(env_get "$DIR/.env" "R2_SECRET_KEY" 2>/dev/null || true)
@@ -1362,7 +1566,8 @@ cmd_master_init() {
         "$S_AUTH_KEY" "$S_SECURE_AUTH_KEY" "$S_LOGGED_IN_KEY" "$S_NONCE_KEY" \
         "$S_AUTH_SALT" "$S_SECURE_AUTH_SALT" "$S_LOGGED_IN_SALT" "$S_NONCE_SALT" \
         "$WP_MULTISITE_TYPE" "$WP_MULTISITE_DOMAIN" \
-        "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT"
+        "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" \
+        "$WP_PAGE_CACHE_ENABLED"
     _write_init_dockerfile    "$DIR"
     _write_entrypoint_script  "$DIR/entrypoint.sh"
     _write_init_compose       "$DIR" "$INST"
@@ -1488,6 +1693,11 @@ cmd_push() {
     P_MS_TYPE=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE");   P_MS_TYPE="${P_MS_TYPE:-single}"
     P_MS_DOMAIN=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN"); P_MS_DOMAIN="${P_MS_DOMAIN:-}"
 
+    # v6.6: 读取页面缓存开关，主/工作节点镜像都传，确保全节点开关一致
+    local P_PAGE_CACHE_ENABLED
+    P_PAGE_CACHE_ENABLED=$(env_get "$DIR/.env" "PAGE_CACHE_ENABLED" 2>/dev/null || true)
+    [[ "$P_PAGE_CACHE_ENABLED" == "true" ]] || P_PAGE_CACHE_ENABLED="false"
+
     if [[ -z "$P_AUTH_KEY" ]]; then
         warn ".env 中未找到 Salts（旧版部署？），将生成新 Salts 并写回 .env"
         P_AUTH_KEY=$(_gen_salt);        P_SECURE_AUTH_KEY=$(_gen_salt)
@@ -1522,7 +1732,8 @@ cmd_push() {
             "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
             "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT" \
             "$P_MS_TYPE" "$P_MS_DOMAIN" \
-            "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT"
+            "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" \
+            "$P_PAGE_CACHE_ENABLED"
         warn "主节点容器需重启后 salts 才会生效：菜单 10 → 重启节点"
     fi
 
@@ -1534,10 +1745,19 @@ cmd_push() {
     _write_opcache_ini       "$BUILD_DIR/conf/opcache.ini"
     _write_php_fpm_www_conf  "$BUILD_DIR/conf/php-fpm-www.conf"
     _write_supervisord_conf  "$BUILD_DIR/conf/supervisord.conf"
+    # v6.6: 页面缓存 drop-in 文件，内容不区分开关状态，随镜像无条件打包
+    _write_advanced_cache_php        "$BUILD_DIR/conf/advanced-cache.php"
+    _write_pagecache_purge_mu_plugin "$BUILD_DIR/conf/pagecache-purge.php"
     # v6.0: worker 角色 + 统一 salts + Multisite 常量
     # 注意: worker 节点不进 wp-admin、不跑 Test Connection，刻意不传 R2 凭证
     # ($13-$17 留空)，避免凭证扩散到所有 worker 节点，减少泄露面
-    _write_wp_config_extra   "$BUILD_DIR/conf/wp-config-extra.php" "worker"         "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY"         "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT"         "$P_MS_TYPE" "$P_MS_DOMAIN"
+    # v6.6: 但页面缓存开关（$18）主/工作节点都传，全节点开关必须一致
+    _write_wp_config_extra   "$BUILD_DIR/conf/wp-config-extra.php" "worker" \
+        "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
+        "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT" \
+        "$P_MS_TYPE" "$P_MS_DOMAIN" \
+        "" "" "" "" "" \
+        "$P_PAGE_CACHE_ENABLED"
     _write_entrypoint_script "$BUILD_DIR/entrypoint.sh"
     _write_master_dockerfile "$BUILD_DIR"
 
@@ -1788,6 +2008,9 @@ cmd_pull_deploy() {
         docker cp "${_TMP_CID2}:/usr/local/etc/php/conf.d/opcache.ini"   "$DIR/conf/opcache.ini"      2>/dev/null || true
         docker cp "${_TMP_CID2}:/usr/local/etc/php-fpm.d/www.conf"       "$DIR/conf/php-fpm-www.conf" 2>/dev/null || true
         docker cp "${_TMP_CID2}:/etc/supervisord.conf"                    "$DIR/conf/supervisord.conf" 2>/dev/null || true
+        # v6.6: 页面缓存 drop-in 文件也要导出，_write_worker_compose 会 bind mount 回同样的路径
+        docker cp "${_TMP_CID2}:/var/www/html/wp-content/advanced-cache.php"  "$DIR/conf/advanced-cache.php"  2>/dev/null || true
+        docker cp "${_TMP_CID2}:/var/www/html/wp-content/mu-plugins/pagecache-purge.php" "$DIR/conf/pagecache-purge.php" 2>/dev/null || true
         docker rm -f "$_TMP_CID2" &>/dev/null || true
     else
         warn "无法创建临时容器，跳过配置文件导出（将使用已有版本）"
@@ -1984,17 +2207,20 @@ cmd_setup_r2() {
 
     # 就地重新生成 wp-config-extra.php：复用已有 salts/Multisite 设置，
     # 只刷新 R2 常量，不影响登录态、不需要重新生成 wp-config.php 主文件
-    local AK SK LK NK AS SS LS NS MT MD
+    # [fix] v6.6: 之前这里没读/传 PAGE_CACHE_ENABLED，函数内 $18 缺省为 false，
+    # 配置 R2 会把已经开启的页面缓存开关静默改回关闭，这里补上读取+透传。
+    local AK SK LK NK AS SS LS NS MT MD PC
     AK=$(env_get "$DIR/.env" "WP_AUTH_KEY");        SK=$(env_get "$DIR/.env" "WP_SECURE_AUTH_KEY")
     LK=$(env_get "$DIR/.env" "WP_LOGGED_IN_KEY");   NK=$(env_get "$DIR/.env" "WP_NONCE_KEY")
     AS=$(env_get "$DIR/.env" "WP_AUTH_SALT");       SS=$(env_get "$DIR/.env" "WP_SECURE_AUTH_SALT")
     LS=$(env_get "$DIR/.env" "WP_LOGGED_IN_SALT");  NS=$(env_get "$DIR/.env" "WP_NONCE_SALT")
     MT=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE" 2>/dev/null || echo "single")
     MD=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN" 2>/dev/null || true)
+    PC=$(env_get "$DIR/.env" "PAGE_CACHE_ENABLED" 2>/dev/null || true); [[ "$PC" == "true" ]] || PC="false"
     _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master" \
         "$AK" "$SK" "$LK" "$NK" "$AS" "$SS" "$LS" "$NS" "$MT" "$MD" \
-        "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT"
-    log "wp-config-extra.php 已刷新（R2 常量已写入，salts 保持不变）"
+        "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" "$PC"
+    log "wp-config-extra.php 已刷新（R2 常量已写入，salts 与页面缓存开关保持不变）"
 
     if dc "$DIR" ps --services --filter status=running 2>/dev/null | grep -q "wordpress"; then
         info "wp-config-extra.php 通过 require_once 加载，重启容器（非 force-recreate）即可生效"
@@ -2005,6 +2231,81 @@ cmd_setup_r2() {
                 || warn "容器重启失败，请手动执行 docker compose restart wordpress"
         else
             info "记得稍后执行菜单重启容器，或手动 docker compose restart wordpress 使配置生效"
+        fi
+    else
+        info "节点未运行，下次启动时会自动加载该配置"
+    fi
+}
+
+cmd_setup_pagecache() {
+    local DIR INST; _resolve_instance DIR INST
+    [[ -f "$DIR/.env" ]] || error "未找到 .env，请先完成节点初始化"
+
+    local _ROLE; _ROLE=$(env_get "$DIR/.env" "NODE_ROLE" 2>/dev/null || echo "master")
+    local _CUR; _CUR=$(env_get "$DIR/.env" "PAGE_CACHE_ENABLED" 2>/dev/null || true)
+    [[ "$_CUR" == "true" ]] || _CUR="false"
+
+    info "--- Redis 全页缓存 ---"
+    info "  当前状态: $([[ "$_CUR" == "true" ]] && echo "开启" || echo "关闭")"
+    read -rp "开启页面缓存？[y/N，直接回车保持不变]: " _PC || true
+    local NEW="$_CUR"
+    if [[ -n "$_PC" ]]; then
+        [[ "${_PC,,}" == "y" ]] && NEW="true" || NEW="false"
+    fi
+
+    if [[ "$NEW" == "$_CUR" ]]; then
+        info "开关未变化（当前: $([[ "$NEW" == "true" ]] && echo 开启 || echo 关闭)），未做修改"
+        return
+    fi
+
+    env_set "$DIR/.env" "PAGE_CACHE_ENABLED" "$NEW"
+    chmod 600 "$DIR/.env"
+    log "PAGE_CACHE_ENABLED=${NEW} 已写入 .env"
+
+    # 回填 drop-in 文件：老实例（本功能上线前部署的节点）conf/ 下可能还没有这两个文件
+    if [[ ! -s "$DIR/conf/advanced-cache.php" || ! -s "$DIR/conf/pagecache-purge.php" ]]; then
+        info "回填页面缓存 drop-in 文件..."
+        _write_advanced_cache_php        "$DIR/conf/advanced-cache.php"
+        _write_pagecache_purge_mu_plugin "$DIR/conf/pagecache-purge.php"
+    fi
+
+    # 重写 compose：老实例的 docker-compose.yml 里可能还没有这两个 bind mount
+    if [[ "$_ROLE" == "worker" ]]; then
+        _write_worker_compose "$DIR" "$INST" "ro"
+    else
+        _write_init_compose "$DIR" "$INST"
+    fi
+
+    # 就地重新生成 wp-config-extra.php：复用已有 salts/Multisite/R2 设置，只刷新开关常量
+    local AK SK LK NK AS SS LS NS MT MD R2K R2S R2B R2D R2E
+    AK=$(env_get "$DIR/.env" "WP_AUTH_KEY");        SK=$(env_get "$DIR/.env" "WP_SECURE_AUTH_KEY")
+    LK=$(env_get "$DIR/.env" "WP_LOGGED_IN_KEY");   NK=$(env_get "$DIR/.env" "WP_NONCE_KEY")
+    AS=$(env_get "$DIR/.env" "WP_AUTH_SALT");       SS=$(env_get "$DIR/.env" "WP_SECURE_AUTH_SALT")
+    LS=$(env_get "$DIR/.env" "WP_LOGGED_IN_SALT");  NS=$(env_get "$DIR/.env" "WP_NONCE_SALT")
+    MT=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE" 2>/dev/null || echo "single")
+    MD=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN" 2>/dev/null || true)
+    if [[ "$_ROLE" == "master" ]]; then
+        R2K=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
+        R2S=$(env_get "$DIR/.env" "R2_SECRET_KEY" 2>/dev/null || true)
+        R2B=$(env_get "$DIR/.env" "R2_BUCKET" 2>/dev/null || true)
+        R2D=$(env_get "$DIR/.env" "R2_DOMAIN" 2>/dev/null || true)
+        R2E=$(env_get "$DIR/.env" "R2_ENDPOINT" 2>/dev/null || true)
+    fi
+    _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "$_ROLE" \
+        "$AK" "$SK" "$LK" "$NK" "$AS" "$SS" "$LS" "$NS" "$MT" "$MD" \
+        "$R2K" "$R2S" "$R2B" "$R2D" "$R2E" "$NEW"
+    log "wp-config-extra.php 已刷新"
+
+    if dc "$DIR" ps --services --filter status=running 2>/dev/null | grep -q "wordpress"; then
+        info "新增了 bind mount，需要 up -d 让 compose 重新创建容器（普通 restart 不会挂载新文件）"
+        read -rp "立即应用？[y/N]: " _APPLY || true
+        if [[ "${_APPLY,,}" == "y" ]]; then
+            dc "$DIR" up -d \
+                && log "容器已重建，页面缓存开关已生效" \
+                || warn "容器重建失败，请手动执行 docker compose up -d"
+            [[ "$NEW" == "true" ]] && _flush_all_caches "$DIR"
+        else
+            info "记得稍后执行 docker compose up -d 使配置生效"
         fi
     else
         info "节点未运行，下次启动时会自动加载该配置"
@@ -2550,7 +2851,7 @@ interactive_menu() {
     while true; do
         echo ""
         _c "1;35" "========================================"
-        _c "1;35" "  WordPress 多节点分发管理 v6.4"
+        _c "1;35" "  WordPress 多节点分发管理 v${SCRIPT_VERSION}"
         _c "1;35" "  多实例 | Multisite | 单容器全打包"
         _c "1;35" "========================================"
         echo -e "  \e[36m── 仓库管理 ──────────────────────────\e[0m"
@@ -2571,6 +2872,7 @@ interactive_menu() {
         echo -e "  \e[33m12.\e[0m 手动刷新全层缓存"
         echo -e "  \e[36m13.\e[0m 节点列表管理"
         echo -e "  \e[32m17.\e[0m 配置 R2 媒体卸载（Advanced Media Offloader）"
+        echo -e "  \e[32m19.\e[0m 配置 Redis 全页缓存开关"
         echo -e "  \e[32m15.\e[0m 备份配置（.env + conf → rsync / S3 / AList）"
         echo -e "  \e[32m16.\e[0m 还原配置（本地 / rsync / S3 / AList）"
         echo -e "  \e[31m14.\e[0m 删除节点（不可恢复）"
@@ -2594,6 +2896,7 @@ interactive_menu() {
             13) cmd_nodes ;;
             17) cmd_setup_r2 ;;
             18) cmd_self_update ;;
+            19) cmd_setup_pagecache ;;
             14) cmd_destroy ;;
             15) cmd_backup ;;
             16) cmd_restore ;;
