@@ -201,29 +201,30 @@ _auto_tune() {
     local total_kb; total_kb=$(awk '/^MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
     local total_mb=$(( total_kb / 1024 ))
 
-    # innodb_buffer_pool_size = 25% 物理内存，最小 128M，最大 4096M
-    local bp=$(( total_mb / 4 ))
-    (( bp <  128  )) && bp=128
-    (( bp > 4096  )) && bp=4096
+    # innodb_buffer_pool_size = 50% 物理内存（专用 DB 主机），最小 256M，最大 8192M
+    local bp=$(( total_mb / 2 ))
+    (( bp <  256  )) && bp=256
+    (( bp > 8192  )) && bp=8192
     _AT_BUFFER_POOL="${bp}M"
 
-    # innodb_log_file_size = buffer_pool / 4，最小 64M，最大 1024M
+    # innodb_log_file_size = buffer_pool / 4，最小 64M，最大 2048M
     local lf=$(( bp / 4 ))
     (( lf <   64 )) && lf=64
-    (( lf > 1024 )) && lf=1024
+    (( lf > 2048 )) && lf=2048
     _AT_LOG_FILE="${lf}M"
 
     # max_connections 按内存档位梯度
-    if   (( total_mb >=  8192 )); then _AT_MAX_CONN=500
+    if   (( total_mb >= 16384 )); then _AT_MAX_CONN=800
+    elif (( total_mb >=  8192 )); then _AT_MAX_CONN=500
     elif (( total_mb >=  4096 )); then _AT_MAX_CONN=300
     elif (( total_mb >=  2048 )); then _AT_MAX_CONN=200
     else                               _AT_MAX_CONN=100
     fi
 
-    # redis maxmemory = 10% 物理内存，最小 128M，最大 2048M
-    local rm=$(( total_mb / 10 ))
+    # redis maxmemory = 15% 物理内存，最小 128M，最大 4096M
+    local rm=$(( total_mb * 15 / 100 ))
     (( rm <  128  )) && rm=128
-    (( rm > 2048  )) && rm=2048
+    (( rm > 4096  )) && rm=4096
     _AT_REDIS_MEM="${rm}mb"
 }
 
@@ -1419,11 +1420,14 @@ cmd_logs() {
 # ════════════════════════════════════════════════════════════
 # 交互菜单
 # ════════════════════════════════════════════════════════════
-_pause() { echo; read -rp "  按 Enter 返回..." _; }
+_pause() { echo; read -rp "  按 Enter 返回..." _ || true; }
 _ask()   {   # PROMPT VAR [DEFAULT]
     local hint=""; [[ -n "${3:-}" ]] && hint=" [${3}]"
     read -rp "  ${1}${hint}: " "$2"
-    [[ -z "${!2}" && -n "${3:-}" ]] && printf -v "$2" '%s' "$3"
+    if [[ -z "${!2}" && -n "${3:-}" ]]; then
+        printf -v "$2" '%s' "$3"
+    fi
+    return 0
 }
 
 _mhdr() {
