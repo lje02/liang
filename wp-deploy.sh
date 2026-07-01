@@ -1,6 +1,28 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
+# v6.7
+#   变更（安全加固，本轮 code review 发现）:
+#     [fix] env_get 的 `$(env_get ... || echo "master")` 回退模式失效：
+#           env_get 内部是 grep|cut|head -1，管道退出码取决于 head，
+#           grep 未命中时 head 仍返回 0，"||" 分支永远不会触发，
+#           缺 NODE_ROLE 的老实例会拿到空字符串而不是 "master"。
+#           cmd_setup_r2 / cmd_setup_pagecache 两处改为 ${_ROLE:-master} 写法。
+#     [fix] conf/wp-config.php、conf/wp-config-extra.php 落盘后从未 chmod 600，
+#           默认 umask 下明文数据库密码 / WP salts / R2 Secret Key 本机任何用户可读。
+#           _write_wp_config_extra 结尾统一补 chmod 600；wp-config.php 每处
+#           落盘（_setup_plugins 主节点首次生成、cmd_pull_deploy 工作节点首次生成）
+#           后补 chmod 600。
+#     [fix] cmd_backup 的 BACKUP_TAR、cmd_restore 的 _PRE_BAK 均含 .env 明文密钥，
+#           落在 /tmp 却未 chmod 600，补齐权限收紧。
+#     [fix] htpasswd 密码通过命令行参数传递（-Bbn user pass），执行瞬间可被同机
+#           其他用户用 ps/proc 看到；改用 -Bin + stdin 管道传密码。
+#     [fix] wp config create 的 --dbpass 同样是命令行参数泄露面；改用
+#           --prompt=dbpass + stdin 管道，密码不再出现在进程参数里。
+#     [feat] docker login 完成对应操作后新增 docker logout，减少 root 的
+#           ~/.docker/config.json 里残留仓库凭证（base64，非加密）的时间窗口。
+#     [fix] _gen_salt 补齐输出长度校验：/dev/urandom 异常导致空输出时不再静默
+#           放过，直接 error 中止，避免用空 salt 生成 wp-config-extra.php。
 # v6.6
 #   变更:
 #     [fix] v6.5 的 Redis 全页缓存实际是没接通的摆设，本版修复：
@@ -40,7 +62,7 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # 脚本版本与自身路径（用于自更新）
-SCRIPT_VERSION="6.6"
+SCRIPT_VERSION="6.7"
 SCRIPT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_GITHUB_RAW="${SCRIPT_GITHUB_RAW:-https://raw.githubusercontent.com/lje02/liang/main/wp-deploy.sh}"
 
@@ -150,9 +172,18 @@ env_set() {
 }
 
 # 本地生成 64 字符随机字符串，不依赖外网
+# [fix] v6.7: 补齐长度校验。原来末尾的 "; true" 只是为了吞掉
+# head 提前退出导致 tr 收到 SIGPIPE 而产生的"假失败"（这一步是对的，
+# 不能去掉，否则 set -euo pipefail 会把脚本杀掉）。但这也让
+# /dev/urandom 不可读等极端情况下的"真失败"（空输出）被一并吞掉，
+# 调用方拿到空字符串却毫无察觉。这里补一次输出长度检查，不够 64
+# 字符直接 error 中止，避免用空/短 salt 生成 wp-config-extra.php。
 _gen_salt() {
-    LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()-_=+[]|;:,.<>?' \
-        < /dev/urandom 2>/dev/null | head -c 64; true
+    local _s
+    _s=$(LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()-_=+[]|;:,.<>?' \
+        < /dev/urandom 2>/dev/null | head -c 64; true)
+    [[ ${#_s} -eq 64 ]] || error "_gen_salt: 生成的随机串长度异常（${#_s}/64），请检查 /dev/urandom 是否可读"
+    printf '%s' "$_s"
 }
 
 # ════════════════════════════════════════════════════════
@@ -820,6 +851,9 @@ PHP_BODY
             printf "define('ADVMO_CLOUDFLARE_R2_ENDPOINT', '%s');\n" "${R2_ENDPOINT//\'/\\\'}"
         fi
     } > "$DEST"
+    # [fix] v6.7: 此文件含 8 个 WP salts + 主节点的 R2 Secret Access Key，
+    # 默认 umask 下落盘后是明文可被本机其他用户读取，写完立即收紧权限。
+    chmod 600 "$DEST" 2>/dev/null || true
 }
 
 _write_master_dockerfile() {
@@ -1128,15 +1162,41 @@ _flush_all_caches() {
 #   参数: $1=DIR  $2..$5=DB_NAME DB_USER DB_PW DB_HOST
 #   返回: 0=成功 1=失败
 # ════════════════════════════════════════════════════════
+# [fix] v6.7: 原来用 dc ... exec -T wordpress sh -c "... --dbpass='${DB_PW}' ..."，
+# 数据库密码是这条 sh -c 命令的参数文本，docker-compose 在宿主机上执行期间，
+# 进程 argv（ps aux / /proc/<pid>/cmdline，两者默认对本机所有用户可读）会
+# 完整包含明文密码。改为把要执行的命令写进一个宿主机上权限 600 的临时脚本，
+# docker cp 进容器后再用容器内路径执行、执行完立即删除，密码只出现在
+# 文件内容里，不会出现在任何进程的命令行参数中。
 _wp_config_create_with_extra() {
     local DIR="$1" DB_NAME="$2" DB_USER="$3" DB_PW="$4" DB_HOST="$5"
-    dc "$DIR" exec -T wordpress sh -c "wp --allow-root config create \
-        --dbname='${DB_NAME}' --dbuser='${DB_USER}' --dbpass='${DB_PW}' \
-        --dbhost='${DB_HOST}' --dbcharset=utf8mb4 --skip-check --skip-salts \
-        --force \
-        --extra-php <<'PHP'
+
+    local _CID
+    _CID=$(dc "$DIR" ps -q wordpress 2>/dev/null)
+    [[ -n "$_CID" ]] || { warn "_wp_config_create_with_extra: 未找到运行中的 wordpress 容器"; return 1; }
+
+    local _SCRIPT_LOCAL; _SCRIPT_LOCAL=$(mktemp)
+    chmod 600 "$_SCRIPT_LOCAL"
+    cat > "$_SCRIPT_LOCAL" <<SCRIPT
+wp --allow-root config create \\
+    --dbname='${DB_NAME}' --dbuser='${DB_USER}' --dbpass='${DB_PW}' \\
+    --dbhost='${DB_HOST}' --dbcharset=utf8mb4 --skip-check --skip-salts \\
+    --force \\
+    --extra-php <<'PHP'
 require_once('/etc/wordpress/wp-config-extra.php');
-PHP"
+PHP
+SCRIPT
+
+    local _SCRIPT_REMOTE="/tmp/.wpcfg-$(date +%s%N)-$$.sh"
+    local _RC=1
+    if docker cp "$_SCRIPT_LOCAL" "${_CID}:${_SCRIPT_REMOTE}" 2>/dev/null; then
+        docker exec "$_CID" chmod 600 "$_SCRIPT_REMOTE" 2>/dev/null || true
+        docker exec "$_CID" sh "$_SCRIPT_REMOTE"
+        _RC=$?
+        docker exec "$_CID" rm -f "$_SCRIPT_REMOTE" 2>/dev/null || true
+    fi
+    rm -f "$_SCRIPT_LOCAL"
+    return "$_RC"
 }
 
 # ════════════════════════════════════════════════════════
@@ -1196,6 +1256,7 @@ _setup_plugins() {
         if [[ -n "$_CID_FOR_CFG" ]]; then
             dc "$DIR" exec -T wordpress cp /var/www/html/wp-config.php /tmp/wp-config-out.php \
             && docker cp "${_CID_FOR_CFG}:/tmp/wp-config-out.php" "$DIR/conf/wp-config.php" \
+            && chmod 600 "$DIR/conf/wp-config.php" \
             && log "wp-config.php 已落盘到 ${DIR}/conf/，重建容器不会再丢失" \
             || warn "wp-config.php 落盘失败，重建容器（如菜单17）仍有丢失风险，请手动执行菜单11修复"
         else
@@ -1323,12 +1384,15 @@ cmd_registry() {
     local HTPASSWD_TMP; HTPASSWD_TMP=$(mktemp)
     trap 'rm -f "$HTPASSWD_TMP"' RETURN ERR
     local HTPASSWD_OK=false
+    # [fix] v6.7: 原来用 -Bbn "$REG_USER" "$REG_PASS"，密码作为命令行参数，
+    # 执行瞬间同机其他用户用 ps/proc 能看到。改用 -Bin（从 stdin 读密码，
+    # 不回显、不校验）+ 管道传参，密码不再出现在进程参数列表里。
     if command -v htpasswd &>/dev/null; then
-        htpasswd -Bbn "$REG_USER" "$REG_PASS" > "$HTPASSWD_TMP" && HTPASSWD_OK=true
+        printf '%s' "$REG_PASS" | htpasswd -Bin "$REG_USER" > "$HTPASSWD_TMP" && HTPASSWD_OK=true
     fi
     if [[ "$HTPASSWD_OK" != "true" ]]; then
-        if docker run --rm --entrypoint htpasswd \
-                httpd:alpine -Bbn "$REG_USER" "$REG_PASS" \
+        if printf '%s' "$REG_PASS" | docker run --rm -i --entrypoint htpasswd \
+                httpd:alpine -Bin "$REG_USER" \
                 > "$HTPASSWD_TMP" 2>/dev/null; then
             HTPASSWD_OK=true
         fi
@@ -1785,6 +1849,10 @@ cmd_push() {
     docker push "${IMAGE_BASE}:${IMAGE_TAG}" || error "推送失败"
     docker push "${IMAGE_BASE}:latest"       || error "推送 latest 失败"
 
+    # [fix] v6.7: docker login 会把仓库密码以 base64（非加密）形式写进
+    # ~/.docker/config.json 并长期保留；操作完成后登出，缩短凭证残留窗口
+    docker logout "$REGISTRY_HOST" &>/dev/null || true
+
     if grep -q '^IMAGE_TAG=' "$DIR/.env"; then
         sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${IMAGE_TAG}|" "$DIR/.env"
     else
@@ -1943,6 +2011,10 @@ cmd_pull_deploy() {
     info "拉取镜像: ${IMAGE_FULL} ..."
     docker pull "$IMAGE_FULL" || error "镜像拉取失败"
 
+    # [fix] v6.7: 镜像已拉到本地，后续 docker create/cp 导出配置文件不需要仓库
+    # 认证，登出以缩短凭证在 ~/.docker/config.json 中的残留窗口
+    docker logout "$REGISTRY_HOST" &>/dev/null || true
+
     # 拉取成功后，将实际使用的 IMAGE_TAG 写回 .env（保持同步）
     if grep -q '^IMAGE_TAG=' "$DIR/.env"; then
         sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=${IMAGE_TAG}|" "$DIR/.env"
@@ -1958,6 +2030,7 @@ cmd_pull_deploy() {
     if [[ -n "$_TMP_CID" ]]; then
         docker cp "${_TMP_CID}:/etc/wordpress/wp-config-extra.php" \
             "$DIR/conf/wp-config-extra.php" 2>/dev/null \
+        && chmod 600 "$DIR/conf/wp-config-extra.php" \
         && log "  wp-config-extra.php 已导出" \
         || warn "  wp-config-extra.php 导出失败，将使用已有版本"
         docker rm -f "$_TMP_CID" &>/dev/null || true
@@ -1983,6 +2056,7 @@ cmd_pull_deploy() {
             _wp_config_create_with_extra "$DIR" "$DB_NAME" "$DB_USER" "$DB_PW" "$DB_HOST" \
             && dc "$DIR" exec -T wordpress cp /var/www/html/wp-config.php /tmp/wp-config-out.php \
             && docker cp "${CID}:/tmp/wp-config-out.php" "$DIR/conf/wp-config.php" \
+            && chmod 600 "$DIR/conf/wp-config.php" \
             && log "wp-config.php 已生成并导出至 conf/" \
             || warn "wp-config.php 生成失败，请手动创建或稍后重试（菜单 11）"
         fi
@@ -2101,6 +2175,7 @@ cmd_rollback() {
     || error "仓库登录失败"
     info "拉取 ${REGISTRY_HOST}/wordpress-${INST}:${SELECTED_TAG} ..."
     docker pull "${REGISTRY_HOST}/wordpress-${INST}:${SELECTED_TAG}" || error "拉取失败"
+    docker logout "$REGISTRY_HOST" &>/dev/null || true
     dc "$DIR" up -d --force-recreate || error "容器重启失败"
     _flush_all_caches "$DIR"
     log "回滚到 ${SELECTED_TAG} 完成！"
@@ -2168,7 +2243,12 @@ cmd_setup_r2() {
     [[ -f "$DIR/.env" ]] || error "未找到 .env，请先完成节点初始化"
 
     # R2 凭证只在主节点生效：worker 不进 wp-admin，不需要也不应该持有凭证
-    local _ROLE; _ROLE=$(env_get "$DIR/.env" "NODE_ROLE" 2>/dev/null || echo "master")
+    # [fix] v6.7: 原来写 "$(env_get ... || echo master)"，但 env_get 内部是
+    # grep|cut|head -1，grep 未命中时 head 仍返回 0，"||" 分支永远不触发，
+    # 缺 NODE_ROLE 的老实例会拿到空字符串而不是 "master"，导致真正的主节点
+    # 也会被下面的判断误拒。改成先取值再用 ${VAR:-default} 兜底。
+    local _ROLE; _ROLE=$(env_get "$DIR/.env" "NODE_ROLE" 2>/dev/null || true)
+    _ROLE="${_ROLE:-master}"
     if [[ "$_ROLE" != "master" ]]; then
         error "R2 凭证只能在主节点配置（当前节点角色: ${_ROLE}）。Media Offloader 后台只有主节点能访问。"
     fi
@@ -2214,7 +2294,7 @@ cmd_setup_r2() {
     LK=$(env_get "$DIR/.env" "WP_LOGGED_IN_KEY");   NK=$(env_get "$DIR/.env" "WP_NONCE_KEY")
     AS=$(env_get "$DIR/.env" "WP_AUTH_SALT");       SS=$(env_get "$DIR/.env" "WP_SECURE_AUTH_SALT")
     LS=$(env_get "$DIR/.env" "WP_LOGGED_IN_SALT");  NS=$(env_get "$DIR/.env" "WP_NONCE_SALT")
-    MT=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE" 2>/dev/null || echo "single")
+    MT=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE" 2>/dev/null || true); MT="${MT:-single}"
     MD=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN" 2>/dev/null || true)
     PC=$(env_get "$DIR/.env" "PAGE_CACHE_ENABLED" 2>/dev/null || true); [[ "$PC" == "true" ]] || PC="false"
     _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master" \
@@ -2241,7 +2321,9 @@ cmd_setup_pagecache() {
     local DIR INST; _resolve_instance DIR INST
     [[ -f "$DIR/.env" ]] || error "未找到 .env，请先完成节点初始化"
 
-    local _ROLE; _ROLE=$(env_get "$DIR/.env" "NODE_ROLE" 2>/dev/null || echo "master")
+    # [fix] v6.7: 同 cmd_setup_r2，env_get 的 "||" 回退不生效，改用 ${VAR:-default}
+    local _ROLE; _ROLE=$(env_get "$DIR/.env" "NODE_ROLE" 2>/dev/null || true)
+    _ROLE="${_ROLE:-master}"
     local _CUR; _CUR=$(env_get "$DIR/.env" "PAGE_CACHE_ENABLED" 2>/dev/null || true)
     [[ "$_CUR" == "true" ]] || _CUR="false"
 
@@ -2282,7 +2364,7 @@ cmd_setup_pagecache() {
     LK=$(env_get "$DIR/.env" "WP_LOGGED_IN_KEY");   NK=$(env_get "$DIR/.env" "WP_NONCE_KEY")
     AS=$(env_get "$DIR/.env" "WP_AUTH_SALT");       SS=$(env_get "$DIR/.env" "WP_SECURE_AUTH_SALT")
     LS=$(env_get "$DIR/.env" "WP_LOGGED_IN_SALT");  NS=$(env_get "$DIR/.env" "WP_NONCE_SALT")
-    MT=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE" 2>/dev/null || echo "single")
+    MT=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE" 2>/dev/null || true); MT="${MT:-single}"
     MD=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN" 2>/dev/null || true)
     if [[ "$_ROLE" == "master" ]]; then
         R2K=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
@@ -2390,6 +2472,9 @@ cmd_backup() {
 
     local BACKUP_TAR="/tmp/${BACKUP_NAME}.tar.gz"
     tar -czf "$BACKUP_TAR" -C "$(dirname "$BACKUP_TMP")" "$(basename "$BACKUP_TMP")"
+    # [fix] v6.7: 包内 .env 含数据库/Redis密码、WP salts、R2 密钥，/tmp 默认
+    # umask 下是明文可读，写完立即收紧权限，避免留在 /tmp 期间被同机其他用户读取。
+    chmod 600 "$BACKUP_TAR"
     log "本地打包完成：${BACKUP_TAR}（$(du -sh "$BACKUP_TAR" | cut -f1)）"
 
     echo ""
@@ -2686,6 +2771,10 @@ cmd_restore() {
             ;;
     esac
 
+    # [fix] v6.7: RESTORE_TAR（无论来自本地/rsync/S3/AList）落在 /tmp 后
+    # 都含 .env 明文密钥，统一收紧权限
+    chmod 600 "$RESTORE_TAR" 2>/dev/null || true
+
     # ── 第二步：预检 ──
     info "检查备份内容..."
     tar -tzf "$RESTORE_TAR" | grep -q '\.env' || error "备份包中未找到 .env，文件可能损坏"
@@ -2709,6 +2798,7 @@ cmd_restore() {
     if [[ -f "$DIR/.env" ]]; then
         local _PRE_BAK="/tmp/wp-pre-restore-${INST}-$(date +%Y%m%d%H%M%S).tar.gz"
         tar -czf "$_PRE_BAK" -C "$DIR" .env conf docker-compose.yml 2>/dev/null || true
+        chmod 600 "$_PRE_BAK" 2>/dev/null || true
         info "已将当前配置预备份至：${_PRE_BAK}"
     fi
 
@@ -2756,6 +2846,8 @@ cmd_restore() {
         dc "$DIR" up -d --force-recreate 2>/dev/null \
         && log "容器已重启" \
         || warn "容器重启失败，请手动执行菜单 8（启动节点）"
+        # [fix] v6.7: up -d 期间可能已按需拉取镜像，登录态不再需要，登出缩短凭证残留窗口
+        docker logout "$_REGISTRY_HOST" &>/dev/null || true
     else
         warn "未找到 REGISTRY_HOST，跳过自动重启，请手动执行菜单 8"
     fi
