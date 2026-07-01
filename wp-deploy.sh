@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
-# v6.3
+# v6.4
 #   变更:
+#     [feat] 新增菜单18：脚本自更新（从 GitHub 拉取最新版本）
 #     [fix] _setup_plugins: multisite-convert 成功后立即重启容器
 #           使 wp-config-extra.php 中的 Multisite 常量（MULTISITE/DOMAIN_CURRENT_SITE 等）
 #           在后续 WP-CLI 命令执行前生效，避免 "Site 'localhost/' not found" 错误
@@ -16,6 +17,11 @@
 set -euo pipefail
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
+
+# 脚本版本与自身路径（用于自更新）
+SCRIPT_VERSION="6.4"
+SCRIPT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_GITHUB_RAW="${SCRIPT_GITHUB_RAW:-https://raw.githubusercontent.com/yourorg/wp-deploy/main/wp-deploy.sh}"
 
 BASE_DIR="${BASE_DIR:-/srv}"
 WG_IFACE="${WG_IFACE:-wg0}"
@@ -96,7 +102,8 @@ dc() {
 
 read_secret() {
     local PROMPT="$1" VAR_NAME="$2" VALUE=""
-    IFS= read -rp "$PROMPT" VALUE || true
+    IFS= read -rsp "$PROMPT" VALUE || true
+    echo ""   # 静默读取后补换行，保持终端整洁
     VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
     VALUE="${VALUE%"${VALUE##*[![:space:]]}"}"
     printf -v "$VAR_NAME" '%s' "$VALUE"
@@ -685,12 +692,17 @@ RUN rm -f /var/www/html/wp-config.php /var/www/html/wp-config-sample.php
 COPY wp-content/themes/   /var/www/html/wp-content/themes/
 COPY wp-content/plugins/  /var/www/html/wp-content/plugins/
 
-COPY conf/nginx.conf       /etc/nginx/nginx.conf
-COPY conf/nginx-wp.conf    /etc/nginx/http.d/default.conf
-COPY conf/php-uploads.ini  /usr/local/etc/php/conf.d/uploads.ini
-COPY conf/opcache.ini      /usr/local/etc/php/conf.d/opcache.ini
-COPY conf/php-fpm-www.conf /usr/local/etc/php-fpm.d/www.conf
-COPY conf/supervisord.conf /etc/supervisord.conf
+COPY conf/nginx.conf            /etc/nginx/nginx.conf
+COPY conf/nginx-wp.conf         /etc/nginx/http.d/default.conf
+COPY conf/php-uploads.ini       /usr/local/etc/php/conf.d/uploads.ini
+COPY conf/opcache.ini           /usr/local/etc/php/conf.d/opcache.ini
+COPY conf/php-fpm-www.conf      /usr/local/etc/php-fpm.d/www.conf
+COPY conf/supervisord.conf      /etc/supervisord.conf
+# [fix] wp-config-extra.php 必须打入镜像，cmd_pull_deploy 会从镜像里 docker cp 取出
+# 并放到 worker 宿主机的 conf/ 目录，再由 _write_worker_compose 以 bind mount(:ro) 挂载。
+# 若不打入镜像，docker cp 失败 → 宿主机 conf/wp-config-extra.php 不存在 →
+# Docker 把 bind mount 源当目录创建 → PHP require_once 拿到目录 → Fatal Error → 全站 500。
+COPY conf/wp-config-extra.php   /etc/wordpress/wp-config-extra.php
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
@@ -768,29 +780,47 @@ RUN mkdir -p /var/log/nginx /var/log/supervisor /run/nginx \
 EXPOSE 80
 CMD ["/entrypoint.sh"]
 DOCKERFILE
+
+    # [fix] .dockerignore 和 Dockerfile 放在一起（_write_master_dockerfile 同理）。
+    # 之前误放在 _write_init_compose，概念错位：.dockerignore 控制 docker build 上下文，
+    # 与 compose 无关。
+    # [fix] 原来写 wp-config.php 匹配不到 conf/wp-config.php（build context 根是 $DIR）。
+    cat > "$DIR/.dockerignore" <<'IGNORE'
+.env
+conf/wp-config.php
+conf/wp-config-extra.php
+wp-config-sample.php
+.git
+.htaccess
+data/uploads/*
+data/cache/*
+logs/*
+IGNORE
 }
 
 _write_init_compose() {
     local DIR="$1"
-    cat > "$DIR/docker-compose.yml" <<'YAML'
+    local INST="${2:-${INSTANCE}}"
+    # [fix] 镜像名带实例名后缀，多实例并发初始化时互不覆盖
+    cat > "$DIR/docker-compose.yml" <<YAML
 services:
   wordpress:
     build:
       context: .
       dockerfile: Dockerfile
-    image: wordpress-site-init:latest
+    image: wordpress-${INST}-init:latest
     restart: unless-stopped
     network_mode: host
     environment:
-      WG_IP:                  ${WG_IP}
-      WP_PORT:                ${WP_PORT:-80}
-      WORDPRESS_DB_HOST:      ${DB_HOST}:3306
-      WORDPRESS_DB_NAME:      ${WORDPRESS_DB_NAME}
-      WORDPRESS_DB_USER:      ${WORDPRESS_DB_USER}
-      WORDPRESS_DB_PASSWORD:  ${WORDPRESS_DB_PASSWORD}
-      REDIS_HOST:             ${REDIS_HOST}
-      REDIS_PW:               ${REDIS_PW}
-      WP_SITEURL_FALLBACK:    ${WP_SITEURL_FALLBACK}
+      WG_IP:                  \${WG_IP}
+      WP_PORT:                \${WP_PORT:-80}
+      WORDPRESS_DB_HOST:      \${DB_HOST}:3306
+      WORDPRESS_DB_NAME:      \${WORDPRESS_DB_NAME}
+      WORDPRESS_DB_USER:      \${WORDPRESS_DB_USER}
+      WORDPRESS_DB_PASSWORD:  \${WORDPRESS_DB_PASSWORD}
+      REDIS_HOST:             \${REDIS_HOST}
+      REDIS_PW:               \${REDIS_PW}
+      WP_SITEURL_FALLBACK:    \${WP_SITEURL_FALLBACK}
     volumes:
       - ./data/uploads:/var/www/html/wp-content/uploads
       - ./data/cache:/var/www/html/wp-content/cache
@@ -1335,7 +1365,7 @@ cmd_master_init() {
         "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT"
     _write_init_dockerfile    "$DIR"
     _write_entrypoint_script  "$DIR/entrypoint.sh"
-    _write_init_compose       "$DIR"
+    _write_init_compose       "$DIR" "$INST"
     _register_node "$WG_IP"
 
     info "构建初始化镜像并启动..."
@@ -1418,7 +1448,12 @@ cmd_push() {
         _PUSH_CLEANUP_DONE=true
         rm -rf "$BUILD_DIR"
     }
-    trap '_push_cleanup' RETURN ERR
+    # [fix] 原来 trap RETURN ERR：
+    #   - RETURN 只在函数正常 return 时触发，error() 调用 exit 1 会绕过它
+    #   - 脚本无 set -E（errtrace），ERR trap 在函数内不继承，同样不可靠
+    # 改用 EXIT trap：无论正常返回还是 error() → exit 1 都会触发，
+    # 函数末尾显式调用并重置，避免 trap 泄漏到后续菜单操作。
+    trap '_push_cleanup' EXIT
 
     info "从容器导出 WordPress 核心文件..."
     mkdir -p "$BUILD_DIR/wp-core" "$BUILD_DIR/wp-content/themes" "$BUILD_DIR/wp-content/plugins"
@@ -1537,15 +1572,22 @@ cmd_push() {
     fi
 
     info "清理本地旧镜像（保留最近 5 个）..."
-    docker images "${IMAGE_BASE}" --format "{{.Tag}}\t{{.ID}}" \
-        | grep -v 'latest' | sort -r | tail -n +6 \
-        | awk '{print $2}' | xargs -r docker rmi 2>/dev/null || true
+    # [fix] 原来用 {{.ID}} 再 docker rmi <id>：同一 ID 被多个 tag 引用时报
+    # "image is referenced in multiple repositories"，xargs 链中断。
+    # 改用 Repository:Tag 格式，精确删除指定 tag，不影响其他引用。
+    docker images "${IMAGE_BASE}" --format "{{.Repository}}:{{.Tag}}" \
+        | grep -v ':latest$' | sort -r | tail -n +6 \
+        | xargs -r docker rmi 2>/dev/null || true
 
     log "推送完成！"
     echo -e "  实例:    \e[36m${INST}\e[0m"
     echo -e "  镜像:    \e[32m${IMAGE_BASE}:${IMAGE_TAG}\e[0m"
     echo -e "  WP 版本: \e[36m${WP_VER}\e[0m"
     echo -e "  \e[36m工作节点执行菜单 4（拉取部署/更新），选择相同实例名即可。\e[0m"
+
+    # 正常结束：主动清理并重置 trap，避免 EXIT trap 泄漏到后续菜单操作
+    _push_cleanup
+    trap - EXIT
 }
 
 # ════════════════════════════════════════════════════════
@@ -1974,9 +2016,13 @@ cmd_retry_plugins() {
     [[ -f "$DIR/docker-compose.yml" ]] || error "未找到编排文件"
     dc "$DIR" ps --services --filter status=running | grep -q "wordpress" \
         || { warn "wordpress 容器未运行，请先启动。"; return; }
-    local _LOCALE
+    local _LOCALE _URL
     _LOCALE=$(env_get "$DIR/.env" "WP_LOCALE" 2>/dev/null || echo "zh_CN")
-    _setup_plugins "$DIR" "false" "" "" "" "" "" "${_LOCALE:-zh_CN}" \
+    # [fix] Multisite 模式下 _setup_plugins 需要 URL 来构造 --url flag；
+    # 不传 URL 时 _WP_URL_FLAG 为空，所有 WP-CLI 命令报 "Site not found"。
+    # 从 .env 读取 WP_SITEURL_FALLBACK（master_init 时写入的站点 URL）作为 URL。
+    _URL=$(env_get "$DIR/.env" "WP_SITEURL_FALLBACK" 2>/dev/null || true)
+    _setup_plugins "$DIR" "false" "${_URL}" "" "" "" "" "${_LOCALE:-zh_CN}" \
         || warn "插件配置未完全成功。"
 }
 
@@ -2030,7 +2076,10 @@ cmd_backup() {
         _BACKUP_DONE=true
         rm -rf "$BACKUP_TMP"
     }
-    trap '_backup_cleanup' RETURN ERR
+    # [fix] RETURN trap 在每次 shell 函数返回时都触发（包括 info/log 等辅助函数），
+    # 会在 cp 执行前就把 BACKUP_TMP 删掉。改用 EXIT trap，
+    # 函数末尾显式清理并重置，避免 trap 泄漏到后续菜单操作。
+    trap '_backup_cleanup' EXIT
 
     info "打包备份文件..."
     cp "$DIR/.env" "$BACKUP_TMP/.env"
@@ -2203,6 +2252,7 @@ cmd_backup() {
 
     _BACKUP_DONE=true
     rm -rf "$BACKUP_TMP"
+    trap - EXIT
 
     echo ""
     log "备份完成！"
@@ -2388,8 +2438,19 @@ cmd_restore() {
     local _REGISTRY_HOST; _REGISTRY_HOST=$(env_get "$DIR/.env" "REGISTRY_HOST")
     if [[ -n "$_REGISTRY_HOST" ]]; then
         local _IMAGE_TAG; _IMAGE_TAG=$(env_get "$DIR/.env" "IMAGE_TAG"); _IMAGE_TAG="${_IMAGE_TAG:-latest}"
-        # 确保本机 Docker 信任该仓库（HTTP insecure-registries），再拉取镜像
         _ensure_insecure_registry "$_REGISTRY_HOST"
+        # [fix] 原来只做 insecure-registry 配置，没有 docker login。
+        # 全新节点或登录态过期时，docker compose up 拉取私有镜像会 401 失败。
+        local _REG_USER _REG_PASS
+        if [[ -f "$REGISTRY_DIR/.env" ]]; then
+            _REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
+            _REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
+        else
+            read -rp "仓库用户名: " _REG_USER || true
+            read_secret "仓库密码: " _REG_PASS
+        fi
+        docker login "$_REGISTRY_HOST" -u "$_REG_USER" --password-stdin <<<"$_REG_PASS" \
+        || { warn "仓库登录失败，容器可能无法拉取镜像"; }
         info "重启容器（镜像: ${_REGISTRY_HOST}/wordpress-${_RESTORED_INST}:${_IMAGE_TAG}）..."
         dc "$DIR" up -d --force-recreate 2>/dev/null \
         && log "容器已重启" \
@@ -2403,11 +2464,93 @@ cmd_restore() {
     echo -e "  \e[33m如 salts 已变更，所有节点登录 cookie 将失效，用户需重新登录（正常现象）。\e[0m"
 }
 
+cmd_self_update() {
+    header "脚本自更新"
+
+    local RAW_URL="${SCRIPT_GITHUB_RAW}"
+    info "当前版本:  v${SCRIPT_VERSION}"
+    info "更新来源:  ${RAW_URL}"
+    info "安装路径:  ${SCRIPT_SELF}"
+    echo ""
+
+    # 允许用户临时覆盖 URL（私有 fork / 内网镜像）
+    read -rp "按回车使用以上地址，或输入自定义 URL: " _CUSTOM_URL || true
+    [[ -n "$_CUSTOM_URL" ]] && RAW_URL="$_CUSTOM_URL"
+
+    # 下载到临时文件，校验后再替换
+    local TMP_SCRIPT
+    TMP_SCRIPT=$(mktemp /tmp/wp-deploy-update-XXXXXX.sh)
+
+    local _UPDATE_CLEANUP_DONE=false
+    _update_cleanup() {
+        [[ "$_UPDATE_CLEANUP_DONE" == "true" ]] && return
+        _UPDATE_CLEANUP_DONE=true
+        rm -f "$TMP_SCRIPT"
+    }
+    trap '_update_cleanup' EXIT
+
+    info "正在下载..."
+    if ! curl -4 -fsSL --max-time 30 "$RAW_URL" -o "$TMP_SCRIPT"; then
+        _update_cleanup; trap - EXIT
+        error "下载失败，请检查网络或 URL：${RAW_URL}"
+    fi
+
+    # 基础完整性校验：必须是 bash 脚本且包含关键标识
+    if ! head -1 "$TMP_SCRIPT" | grep -q "bash"; then
+        _update_cleanup; trap - EXIT
+        error "下载内容不是有效的 bash 脚本，已中止（可能是 404 页面或网络劫持）"
+    fi
+    if ! grep -q "wp-deploy" "$TMP_SCRIPT"; then
+        _update_cleanup; trap - EXIT
+        error "下载内容未通过关键词校验（未找到 wp-deploy 标识），已中止"
+    fi
+
+    # 语法检查
+    if ! bash -n "$TMP_SCRIPT" 2>/dev/null; then
+        _update_cleanup; trap - EXIT
+        error "新版本语法检查失败，已中止更新"
+    fi
+
+    # 提取新版本号
+    local NEW_VER
+    NEW_VER=$(grep -oP 'SCRIPT_VERSION="\K[^"]+' "$TMP_SCRIPT" 2>/dev/null || echo "未知")
+    info "新版本:    v${NEW_VER}"
+
+    if [[ "$NEW_VER" == "$SCRIPT_VERSION" ]]; then
+        warn "当前已是最新版本（v${SCRIPT_VERSION}），无需更新"
+        _update_cleanup; trap - EXIT
+        return
+    fi
+
+    echo ""
+    read -rp "确认更新 v${SCRIPT_VERSION} → v${NEW_VER}？[y/N]: " _CONFIRM || true
+    if [[ "${_CONFIRM,,}" != "y" ]]; then
+        info "已取消"
+        _update_cleanup; trap - EXIT
+        return
+    fi
+
+    # 备份当前版本
+    local BACKUP_PATH="${SCRIPT_SELF}.v${SCRIPT_VERSION}.bak"
+    cp "$SCRIPT_SELF" "$BACKUP_PATH"
+    log "已备份当前版本至: ${BACKUP_PATH}"
+
+    # 原子替换：保留原始权限
+    chmod --reference="$SCRIPT_SELF" "$TMP_SCRIPT"
+    mv "$TMP_SCRIPT" "$SCRIPT_SELF"
+    _UPDATE_CLEANUP_DONE=true  # mv 已成功，不再需要 rm
+    trap - EXIT
+
+    log "更新完成！v${SCRIPT_VERSION} → v${NEW_VER}"
+    echo -e "  \e[33m脚本已替换，请退出后重新运行以加载新版本。\e[0m"
+    echo -e "  \e[36m旧版备份: ${BACKUP_PATH}\e[0m"
+}
+
 interactive_menu() {
     while true; do
         echo ""
         _c "1;35" "========================================"
-        _c "1;35" "  WordPress 多节点分发管理 v6.3"
+        _c "1;35" "  WordPress 多节点分发管理 v6.4"
         _c "1;35" "  多实例 | Multisite | 单容器全打包"
         _c "1;35" "========================================"
         echo -e "  \e[36m── 仓库管理 ──────────────────────────\e[0m"
@@ -2431,6 +2574,7 @@ interactive_menu() {
         echo -e "  \e[32m15.\e[0m 备份配置（.env + conf → rsync / S3 / AList）"
         echo -e "  \e[32m16.\e[0m 还原配置（本地 / rsync / S3 / AList）"
         echo -e "  \e[31m14.\e[0m 删除节点（不可恢复）"
+        echo -e "  \e[36m18.\e[0m 脚本自更新（从 GitHub 拉取）"
         echo -e "  \e[36m 0.\e[0m 退出"
         echo "----------------------------------------"
         read -rp "选择: " CHOICE || true
@@ -2449,6 +2593,7 @@ interactive_menu() {
             12) cmd_flush ;;
             13) cmd_nodes ;;
             17) cmd_setup_r2 ;;
+            18) cmd_self_update ;;
             14) cmd_destroy ;;
             15) cmd_backup ;;
             16) cmd_restore ;;
