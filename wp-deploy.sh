@@ -800,7 +800,9 @@ PHP_BODY
     } > "$DEST"
     # [fix] v6.7: 此文件含 8 个 WP salts + 主节点的 R2 Secret Access Key，
     # 默认 umask 下落盘后是明文可被本机其他用户读取，写完立即收紧权限。
-    chmod 600 "$DEST" 2>/dev/null || true
+    # [fix] v6.8: 600 会导致容器内 www-data 无法读取该 bind-mount 文件
+    # （require_once 报 Permission denied），改为 644。
+    chmod 644 "$DEST" 2>/dev/null || true
 }
 
 _write_master_dockerfile() {
@@ -1203,7 +1205,7 @@ _setup_plugins() {
         if [[ -n "$_CID_FOR_CFG" ]]; then
             dc "$DIR" exec -T wordpress cp /var/www/html/wp-config.php /tmp/wp-config-out.php \
             && docker cp "${_CID_FOR_CFG}:/tmp/wp-config-out.php" "$DIR/conf/wp-config.php" \
-            && chmod 600 "$DIR/conf/wp-config.php" \
+            && chmod 644 "$DIR/conf/wp-config.php" \
             && log "wp-config.php 已落盘到 ${DIR}/conf/，重建容器不会再丢失" \
             || warn "wp-config.php 落盘失败，重建容器（如菜单17）仍有丢失风险，请手动执行菜单11修复"
         else
@@ -1977,7 +1979,7 @@ cmd_pull_deploy() {
     if [[ -n "$_TMP_CID" ]]; then
         docker cp "${_TMP_CID}:/etc/wordpress/wp-config-extra.php" \
             "$DIR/conf/wp-config-extra.php" 2>/dev/null \
-        && chmod 600 "$DIR/conf/wp-config-extra.php" \
+        && chmod 644 "$DIR/conf/wp-config-extra.php" \
         && log "  wp-config-extra.php 已导出" \
         || warn "  wp-config-extra.php 导出失败，将使用已有版本"
         docker rm -f "$_TMP_CID" &>/dev/null || true
@@ -2003,7 +2005,7 @@ cmd_pull_deploy() {
             _wp_config_create_with_extra "$DIR" "$DB_NAME" "$DB_USER" "$DB_PW" "$DB_HOST" \
             && dc "$DIR" exec -T wordpress cp /var/www/html/wp-config.php /tmp/wp-config-out.php \
             && docker cp "${CID}:/tmp/wp-config-out.php" "$DIR/conf/wp-config.php" \
-            && chmod 600 "$DIR/conf/wp-config.php" \
+            && chmod 644 "$DIR/conf/wp-config.php" \
             && log "wp-config.php 已生成并导出至 conf/" \
             || warn "wp-config.php 生成失败，请手动创建或稍后重试（菜单 11）"
         fi
@@ -2910,12 +2912,12 @@ interactive_menu() {
         echo -e "  \e[33m11.\e[0m 重试插件配置 / 补装语言包"
         echo -e "  \e[33m12.\e[0m 手动刷新全层缓存"
         echo -e "  \e[36m13.\e[0m 节点列表管理"
-        echo -e "  \e[32m17.\e[0m 配置 R2 媒体卸载（Advanced Media Offloader）"
-        echo -e "  \e[32m19.\e[0m 配置 Redis 全页缓存开关"
+        echo -e "  \e[31m14.\e[0m 删除节点（不可恢复）"
         echo -e "  \e[32m15.\e[0m 备份配置（.env + conf → rsync / S3 / AList）"
         echo -e "  \e[32m16.\e[0m 还原配置（本地 / rsync / S3 / AList）"
-        echo -e "  \e[31m14.\e[0m 删除节点（不可恢复）"
+        echo -e "  \e[32m17.\e[0m 配置 R2 媒体卸载（Advanced Media Offloader）"
         echo -e "  \e[36m18.\e[0m 脚本自更新（从 GitHub 拉取）"
+        echo -e "  \e[32m19.\e[0m 配置 Redis 全页缓存开关"
         echo -e "  \e[36m 0.\e[0m 退出"
         echo "----------------------------------------"
         read -rp "选择: " CHOICE || true
@@ -2933,12 +2935,12 @@ interactive_menu() {
             11) cmd_retry_plugins ;;
             12) cmd_flush ;;
             13) cmd_nodes ;;
-            17) cmd_setup_r2 ;;
-            18) cmd_self_update ;;
-            19) cmd_setup_pagecache ;;
             14) cmd_destroy ;;
             15) cmd_backup ;;
             16) cmd_restore ;;
+            17) cmd_setup_r2 ;;
+            18) cmd_self_update ;;
+            19) cmd_setup_pagecache ;;
             0)  info "再见！"; exit 0 ;;
             *)  warn "无效输入" ;;
         esac
