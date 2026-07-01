@@ -2,60 +2,6 @@
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
 # v6.7
-#   变更（安全加固，本轮 code review 发现）:
-#     [fix] env_get 的 `$(env_get ... || echo "master")` 回退模式失效：
-#           env_get 内部是 grep|cut|head -1，管道退出码取决于 head，
-#           grep 未命中时 head 仍返回 0，"||" 分支永远不会触发，
-#           缺 NODE_ROLE 的老实例会拿到空字符串而不是 "master"。
-#           cmd_setup_r2 / cmd_setup_pagecache 两处改为 ${_ROLE:-master} 写法。
-#     [fix] conf/wp-config.php、conf/wp-config-extra.php 落盘后从未 chmod 600，
-#           默认 umask 下明文数据库密码 / WP salts / R2 Secret Key 本机任何用户可读。
-#           _write_wp_config_extra 结尾统一补 chmod 600；wp-config.php 每处
-#           落盘（_setup_plugins 主节点首次生成、cmd_pull_deploy 工作节点首次生成）
-#           后补 chmod 600。
-#     [fix] cmd_backup 的 BACKUP_TAR、cmd_restore 的 _PRE_BAK 均含 .env 明文密钥，
-#           落在 /tmp 却未 chmod 600，补齐权限收紧。
-#     [fix] htpasswd 密码通过命令行参数传递（-Bbn user pass），执行瞬间可被同机
-#           其他用户用 ps/proc 看到；改用 -Bin + stdin 管道传密码。
-#     [fix] wp config create 的 --dbpass 同样是命令行参数泄露面；改用
-#           --prompt=dbpass + stdin 管道，密码不再出现在进程参数里。
-#     [feat] docker login 完成对应操作后新增 docker logout，减少 root 的
-#           ~/.docker/config.json 里残留仓库凭证（base64，非加密）的时间窗口。
-#     [fix] _gen_salt 补齐输出长度校验：/dev/urandom 异常导致空输出时不再静默
-#           放过，直接 error 中止，避免用空 salt 生成 wp-config-extra.php。
-# v6.6
-#   变更:
-#     [fix] v6.5 的 Redis 全页缓存实际是没接通的摆设，本版修复：
-#       - _write_wp_config_extra 补上 WP_PAGE_CACHE_ENABLED 常量输出，
-#         之前收了 $18 参数但从未写进生成的 wp-config-extra.php
-#       - master_init / push / setup_r2 三处调用点补传 $18，全部接上开关
-#       - Dockerfile 补 COPY advanced-cache.php + mu-plugins/pagecache-purge.php，
-#         init/worker compose 补 bind mount，pull_deploy 补 docker cp 导出
-#       - 新增菜单19 / cmd_setup_pagecache：真正实现开关切换（之前只在注释里提过）
-#       - _flush_all_caches（菜单12）补上清 Redis db1（页面缓存命名空间）
-#       - pagecache-purge.php 补 transition_post_status 钩子：文章下架/移入回收站
-#         之前不会清缓存，得等 6 小时 TTL 自动过期
-#       - 菜单标题写死的 v6.4 字样改为读 SCRIPT_VERSION
-# v6.5
-#   变更:
-#     [feat] 新增 Redis 全页缓存（advanced-cache.php + mu-plugins 清缓存钩子）
-#            所有节点共享同一个 Redis，缓存写入即全节点生效，不需要跨节点广播清理
-#            通过 .env 的 PAGE_CACHE_ENABLED 开关控制，默认关闭
-#            主节点初始化时可选开启，也可通过菜单19随时开关（cmd_setup_pagecache）
-#            菜单12（刷新全层缓存）同步清空页面缓存的 Redis 命名空间
-#     继承 v6.4 全部功能
-# v6.4
-#   变更:
-#     [feat] 新增菜单18：脚本自更新（从 GitHub 拉取最新版本）
-#     [fix] _setup_plugins: multisite-convert 成功后立即重启容器
-#           使 wp-config-extra.php 中的 Multisite 常量（MULTISITE/DOMAIN_CURRENT_SITE 等）
-#           在后续 WP-CLI 命令执行前生效，避免 "Site 'localhost/' not found" 错误
-#     [fix] _setup_plugins: multisite-convert 改用 if/else，消除转换失败时
-#           仍输出"已启用"的误导性日志
-#     [fix] _setup_plugins: Multisite 模式下语言包、Redis 插件、redis enable
-#           等所有 WP-CLI 命令统一追加 --url=<主站URL>，确保命令在正确的
-#           子站上下文中执行
-#     继承 v6.2 全部功能
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
