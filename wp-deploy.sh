@@ -115,6 +115,7 @@ env_set() {
     else
         printf '%s=%s\n' "$KEY" "$VALUE" >> "$FILE"
     fi
+    chmod 600 "$FILE" 2>/dev/null || true
 }
 
 # 本地生成 64 字符随机字符串，不依赖外网
