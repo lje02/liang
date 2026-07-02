@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
-# v6.8
+# v7.1
+# v7.1: 去掉自更新的 GPG 签名校验（维护密钥/每次发布手动签名开销太大，
+#       回到 v6.9 的基础检查：bash 语法 + 关键字 + 版本号确认）。
+# v7.0: 默认管理员用户名不再用 "admin"；WordPress 默认监听端口 80 → 8080；
+#       隐式密码输入统一提示。
 # ============================================================
 set -euo pipefail
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # 脚本版本与自身路径（用于自更新）
-SCRIPT_VERSION="6.8"
+SCRIPT_VERSION="7.1"
 SCRIPT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_GITHUB_RAW="${SCRIPT_GITHUB_RAW:-https://raw.githubusercontent.com/lje02/liang/main/wp-deploy.sh}"
 
@@ -91,6 +95,14 @@ dc() {
 
 read_secret() {
     local PROMPT="$1" VAR_NAME="$2" VALUE=""
+    # 友好提示：输入密码时终端不回显字符属正常现象，避免用户以为卡住了。
+    # 统一在调用方传入的提示语末尾插入提示，兼容 "xxx: " 结尾的常见写法。
+    local HINT="（不回显，正常现象，输完直接回车）"
+    if [[ "$PROMPT" == *": " ]]; then
+        PROMPT="${PROMPT%: }${HINT}: "
+    else
+        PROMPT="${PROMPT}${HINT}"
+    fi
     IFS= read -rsp "$PROMPT" VALUE || true
     echo ""   # 静默读取后补换行，保持终端整洁
     VALUE="${VALUE#"${VALUE%%[![:space:]]*}"}"
@@ -174,7 +186,6 @@ _resolve_instance() {
     fi
 
     _dir_ref="${BASE_DIR}/${_inst_ref}"
-    # 同步更新全局实例变量
     INSTANCE="$_inst_ref"
     INSTANCE_DIR="$_dir_ref"
     NODES_FILE="${_dir_ref}/nodes.conf"
@@ -308,30 +319,10 @@ http {
 CONF
 }
 
-# v6.0: 支持 Multisite 子目录/子域名模式
-# 参数: $1=DEST  $2=MS_TYPE(single|subdirectory|subdomain)  $3=MS_DOMAIN(子域名根域)
+# 参数: $1=DEST
 _write_nginx_wp_conf() {
     local DEST="$1"
-    local MS_TYPE="${2:-single}"
-    local MS_DOMAIN="${3:-}"
-
-    # 子域名模式：通配符 server_name
     local SERVER_NAME_DIRECTIVE="server_name _;"
-    if [[ "$MS_TYPE" == "subdomain" && -n "$MS_DOMAIN" ]]; then
-        SERVER_NAME_DIRECTIVE="server_name ${MS_DOMAIN} *.${MS_DOMAIN};"
-    fi
-
-    # 子目录 Multisite 额外 rewrite 规则
-    local MULTISITE_REWRITE_BLOCK=""
-    if [[ "$MS_TYPE" == "subdirectory" ]]; then
-        MULTISITE_REWRITE_BLOCK='
-    # WordPress Multisite 子目录模式 rewrite
-    if (!-e $request_filename) {
-        rewrite /wp-admin$ $scheme://$host$uri/ permanent;
-        rewrite ^(/[^/]+)?(/wp-.*) $2 last;
-        rewrite ^(/[^/]+)?(/.*\.php) $2 last;
-    }'
-    fi
 
     # 用 printf 写文件，避免 heredoc 与变量展开的冲突
     {
@@ -370,10 +361,6 @@ _write_nginx_wp_conf() {
 '
         printf '    }
 '
-        if [[ -n "$MULTISITE_REWRITE_BLOCK" ]]; then
-            printf '%s
-' "$MULTISITE_REWRITE_BLOCK"
-        fi
         printf '
 '
         printf '    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|webp|avif)$ {
@@ -640,18 +627,16 @@ security.limit_extensions = .php
 CONF
 }
 
-# v6.0:
-#   - 新增 Multisite 常量注入
 # v6.4:
 #   - 新增 R2 / Advanced Media Offloader 常量，字面量烘焙进文件（随镜像分发），
 #     不再依赖容器 getenv()，主/工作节点共享同一份，不需要逐节点配置 .env
 # v6.5:
-#   - 新增 $18=PAGE_CACHE_ENABLED，与 Multisite 参数同样字面量烘焙、
-#     主/工作节点都传（不像 R2 凭证那样只在主节点传），确保全节点开关一致
+#   - 新增 PAGE_CACHE_ENABLED，字面量烘焙、主/工作节点都传（不像 R2 凭证那样
+#     只在主节点传），确保全节点开关一致
+# v6.9: 移除 Multisite 相关参数
 # 参数: $1=DEST $2=NODE_ROLE $3...$10=8个 salt 值
-#       $11=MS_TYPE(single|subdirectory|subdomain)  $12=MS_DOMAIN
-#       $13=R2_KEY $14=R2_SECRET $15=R2_BUCKET $16=R2_DOMAIN $17=R2_ENDPOINT
-#       $18=PAGE_CACHE_ENABLED(true|false)
+#       $11=R2_KEY $12=R2_SECRET $13=R2_BUCKET $14=R2_DOMAIN $15=R2_ENDPOINT
+#       $16=PAGE_CACHE_ENABLED(true|false)
 _write_wp_config_extra() {
     local DEST="$1"
     local NODE_ROLE="${2:-worker}"
@@ -663,14 +648,12 @@ _write_wp_config_extra() {
     local SECURE_AUTH_SALT="${8:-}"
     local LOGGED_IN_SALT="${9:-}"
     local NONCE_SALT="${10:-}"
-    local MS_TYPE="${11:-single}"
-    local MS_DOMAIN="${12:-}"
-    local R2_KEY="${13:-}"
-    local R2_SECRET="${14:-}"
-    local R2_BUCKET="${15:-}"
-    local R2_DOMAIN="${16:-}"
-    local R2_ENDPOINT="${17:-}"
-    local PAGE_CACHE_ENABLED="${18:-false}"
+    local R2_KEY="${11:-}"
+    local R2_SECRET="${12:-}"
+    local R2_BUCKET="${13:-}"
+    local R2_DOMAIN="${14:-}"
+    local R2_ENDPOINT="${15:-}"
+    local PAGE_CACHE_ENABLED="${16:-false}"
     [[ "$PAGE_CACHE_ENABLED" == "true" ]] || PAGE_CACHE_ENABLED="false"
 
     # 如果没有传入 salts（如老的调用路径），生成临时值并告警
@@ -764,28 +747,6 @@ PHP_BODY
         # 传了也是白传，advanced-cache.php 里 !defined(...) 恒为真，缓存永远不生效
         printf '\n// Redis 全页缓存开关（由 PAGE_CACHE_ENABLED 控制，见 advanced-cache.php）\n'
         printf "define('WP_PAGE_CACHE_ENABLED', %s);\n" "$PAGE_CACHE_ENABLED"
-
-        # Multisite 常量
-        if [[ "$MS_TYPE" == "subdirectory" || "$MS_TYPE" == "subdomain" ]]; then
-            printf '\n// WordPress Multisite\n'
-            printf "define('WP_ALLOW_MULTISITE', true);\n"
-            printf "define('MULTISITE',          true);\n"
-            if [[ "$MS_TYPE" == "subdomain" ]]; then
-                printf "define('SUBDOMAIN_INSTALL',  true);\n"
-            else
-                printf "define('SUBDOMAIN_INSTALL',  false);\n"
-            fi
-            if [[ -n "$MS_DOMAIN" ]]; then
-                printf "define('DOMAIN_CURRENT_SITE', '%s');\n" "$MS_DOMAIN"
-            else
-                printf "// DOMAIN_CURRENT_SITE 由运行时 HTTP_HOST 决定\n"
-                printf 'if (!defined("DOMAIN_CURRENT_SITE")) define("DOMAIN_CURRENT_SITE", $_SERVER["HTTP_HOST"] ?? "localhost");
-'
-            fi
-            printf "define('PATH_CURRENT_SITE',    '/');\n"
-            printf "define('SITE_ID_CURRENT_SITE', 1);\n"
-            printf "define('BLOG_ID_CURRENT_SITE', 1);\n"
-        fi
 
         # v6.4: Advanced Media Offloader - Cloudflare R2
         # 字面量烘焙进文件（随镜像分发到所有节点），不再依赖 .env / getenv()
@@ -964,7 +925,7 @@ services:
     network_mode: host
     environment:
       WG_IP:                  \${WG_IP}
-      WP_PORT:                \${WP_PORT:-80}
+      WP_PORT:                \${WP_PORT:-8080}
       WORDPRESS_DB_HOST:      \${DB_HOST}:3306
       WORDPRESS_DB_NAME:      \${WORDPRESS_DB_NAME}
       WORDPRESS_DB_USER:      \${WORDPRESS_DB_USER}
@@ -1009,7 +970,7 @@ services:
     network_mode: host
     environment:
       WG_IP:                  \${WG_IP}
-      WP_PORT:                \${WP_PORT:-80}
+      WP_PORT:                \${WP_PORT:-8080}
       WORDPRESS_DB_HOST:      \${DB_HOST}:3306
       WORDPRESS_DB_NAME:      \${WORDPRESS_DB_NAME}
       WORDPRESS_DB_USER:      \${WORDPRESS_DB_USER}
@@ -1156,13 +1117,6 @@ _setup_plugins() {
     local IS_AUTO_INSTALL="${2:-false}"
     local URL="${3:-}" TITLE="${4:-}" ADMIN="${5:-}"
     local PASS="${6:-}" EMAIL="${7:-}" LOCALE="${8:-zh_CN}"
-    # v6.0: Multisite 参数（从 .env 自动读取，此处接收覆盖值）
-    local MS_TYPE="${9:-}"
-    local MS_DOMAIN="${10:-}"
-    # 未传入则从 .env 读取
-    [[ -z "$MS_TYPE" ]] && MS_TYPE=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE" 2>/dev/null || true)
-    [[ -z "$MS_DOMAIN" ]] && MS_DOMAIN=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN" 2>/dev/null || true)
-    MS_TYPE="${MS_TYPE:-single}"
 
     info "等待 WordPress 容器就绪..."
     local RETRIES=30
@@ -1224,41 +1178,6 @@ _setup_plugins() {
             log "WordPress 安装成功！"
             echo -e "  站点: \e[32m${URL}\e[0m"
             echo -e "  账号: \e[32m${ADMIN}\e[0m / 密码: \e[32m${PASS}\e[0m"
-
-            # v6.2: Multisite 安装
-            if [[ "$MS_TYPE" == "subdirectory" || "$MS_TYPE" == "subdomain" ]]; then
-                info "配置 WordPress Multisite (${MS_TYPE})..."
-                local -a _MS_FLAGS=()
-                [[ "$MS_TYPE" == "subdomain" ]] && _MS_FLAGS=("--subdomains")
-                local _MS_ERR; _MS_ERR=$(mktemp)
-                if "${WP_CMD[@]}" core multisite-convert "${_MS_FLAGS[@]}" 2>"$_MS_ERR"; then
-                    log "Multisite 已启用（${MS_TYPE} 模式）"
-                    if [[ "$MS_TYPE" == "subdomain" && -n "$MS_DOMAIN" ]]; then
-                        info "  根域名: ${MS_DOMAIN}（确保 DNS 通配符解析已配置）"
-                    fi
-                    rm -f "$_MS_ERR"
-                    # 转换后必须重启容器，使 wp-config-extra.php 中的 Multisite 常量生效，
-                    # 否则后续 WP-CLI 命令无法在 Multisite 上下文中定位站点
-                    info "重启容器以应用 Multisite 常量..."
-                    dc "$DIR" restart wordpress 2>/dev/null || true
-                    local _MS_WAIT=20
-                    while ! "${WP_CMD[@]}" cli version &>/dev/null; do
-                        sleep 3
-                        _MS_WAIT=$((_MS_WAIT - 1))
-                        if [[ $_MS_WAIT -le 0 ]]; then
-                            warn "容器重启后未就绪，已中止后续插件配置（语言包/Redis），请稍后执行菜单11重试"
-                            return 1
-                        fi
-                    done
-                else
-                    warn "Multisite 转换失败，请在后台手动完成（工具→网络设置）"
-                    if [[ -s "$_MS_ERR" ]]; then
-                        warn "错误详情："
-                        sed 's/^/    /' "$_MS_ERR" >&2
-                    fi
-                    rm -f "$_MS_ERR"
-                fi
-            fi
         else
             log "数据库已有数据，跳过安装。"
         fi
@@ -1266,9 +1185,8 @@ _setup_plugins() {
 
     # v5.0: 语言包安装移至此处，IS_AUTO_INSTALL 分支外
     # 菜单 11 重试时也会执行
-    # v6.2: Multisite 模式下所有 WP-CLI 命令需加 --url 指定主站，避免 "Site not found" 错误
     local _WP_URL_FLAG=()
-    [[ "$MS_TYPE" != "single" && -n "$URL" ]] && _WP_URL_FLAG=("--url=${URL}")
+    [[ -n "$URL" ]] && _WP_URL_FLAG=("--url=${URL}")
 
     if [[ -n "$LOCALE" && "$LOCALE" != "en_US" ]]; then
         info "安装语言包: ${LOCALE}..."
@@ -1387,7 +1305,7 @@ EOF
         [[ $_RETRIES -le 0 ]] && error "仓库服务未能在预期时间内就绪，请检查容器日志"
     done
 
-    local REGISTRY_ADDR="${WG_IP}:${REG_PORT}"   # 补充定义
+    local REGISTRY_ADDR="${WG_IP}:${REG_PORT}"
     # 确保本机 Docker 信任该仓库
     _ensure_insecure_registry "${REGISTRY_ADDR}"
     log "私有仓库已部署！"
@@ -1403,47 +1321,28 @@ EOF
 cmd_master_init() {
     header "主节点初始化（全自动建站）"
 
-    # v6.0: 实例选择
     local DIR INST
     _resolve_instance DIR INST
     info "实例: ${INST}  目录: ${DIR}"
 
-    info "--- 站点配置 ---"
-    read -rp "站点 URL（如 https://example.com）: " WP_URL || true
-    [[ -n "$WP_URL" ]] || error "URL 不能为空"
-    read -rp "站点名称 [默认: My WordPress]: " WP_TITLE || true
-    WP_TITLE="${WP_TITLE:-My WordPress}"
-    read -rp "安装语言 [默认: zh_CN]: " WP_LOCALE || true
-    WP_LOCALE="${WP_LOCALE:-zh_CN}"
-    read -rp "管理员用户名 [默认: wpadmin]: " WP_ADMIN || true
-    WP_ADMIN="${WP_ADMIN:-wpadmin}"
-    local WP_PASS=""
-    read_secret "管理员密码 [留空随机生成]: " WP_PASS
+    # v6.9: 站点 URL / 名称 / 语言 / 管理员账号不再交互式询问，全部使用固定
+    # 默认值自动生成，降低部署门槛。如需自定义，可在运行脚本前通过环境变量
+    # 覆盖，例如：WP_TITLE="我的博客" WP_ADMIN=myadmin ./wp-deploy.sh
+    info "--- 站点配置（自动） ---"
+    local WP_TITLE="${WP_TITLE:-My WordPress}"
+    local WP_LOCALE="${WP_LOCALE:-zh_CN}"
+    # 默认管理员用户名不再用容易被撞库/爆破的 "admin"，追加随机后缀
+    local WP_ADMIN="${WP_ADMIN:-}"
+    if [[ -z "$WP_ADMIN" ]]; then
+        WP_ADMIN="wpadmin_$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 6; true)"
+    fi
+    local WP_PASS="${WP_PASS:-}"
     if [[ -z "$WP_PASS" ]]; then
         WP_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9!@#%^&*()' < /dev/urandom 2>/dev/null | head -c 16; true)
-        info "已生成随机密码: ${WP_PASS}"
     fi
-    read -rp "管理员邮箱 [默认: admin@example.com]: " WP_EMAIL || true
-    WP_EMAIL="${WP_EMAIL:-admin@example.com}"
-
-    # v6.0: Multisite 配置
-    info "--- Multisite（可选）---"
-    local WP_MULTISITE_TYPE="single" WP_MULTISITE_DOMAIN=""
-    read -rp "启用 WordPress Multisite？[y/N]: " _MS_ENABLE || true
-    if [[ "${_MS_ENABLE,,}" == "y" ]]; then
-        echo "  1. 子目录模式（/site1 /site2）"
-        echo "  2. 子域名模式（site1.example.com）"
-        read -rp "选择 [默认: 1]: " _MS_MODE || true
-        if [[ "${_MS_MODE:-1}" == "2" ]]; then
-            WP_MULTISITE_TYPE="subdomain"
-            read -rp "根域名（如 example.com）: " WP_MULTISITE_DOMAIN || true
-            [[ -n "$WP_MULTISITE_DOMAIN" ]] || error "子域名模式必须填写根域名"
-            info "  ⚠ 子域名模式需要 DNS 通配符解析 *.${WP_MULTISITE_DOMAIN} → 服务器IP"
-        else
-            WP_MULTISITE_TYPE="subdirectory"
-        fi
-        info "  Multisite 模式: ${WP_MULTISITE_TYPE}"
-    fi
+    local WP_EMAIL="${WP_EMAIL:-admin@example.com}"
+    info "  站点名称: ${WP_TITLE}  语言: ${WP_LOCALE}  管理员: ${WP_ADMIN}"
+    info "  管理员密码已自动生成，安装完成后会显示在结果里"
 
     # v6.6: Redis 全页缓存开关
     info "--- Redis 全页缓存（可选，默认关闭）---"
@@ -1477,13 +1376,25 @@ cmd_master_init() {
     local CF_TOKEN=""
     [[ -n "$CF_ZONE_ID" ]] && read_secret "CF API Token: " CF_TOKEN
 
-    read -rp "WordPress 监听端口 [默认: 80]: " WP_PORT || true
-    WP_PORT="${WP_PORT:-80}"
-    [[ "$WP_PORT" =~ ^[0-9]+$ ]] && (( WP_PORT >= 1 && WP_PORT <= 65535 )) || { WP_PORT=80; warn "无效端口，使用默认 80"; }
+    read -rp "WordPress 监听端口 [默认: 8080]: " WP_PORT || true
+    WP_PORT="${WP_PORT:-8080}"
+    [[ "$WP_PORT" =~ ^[0-9]+$ ]] && (( WP_PORT >= 1 && WP_PORT <= 65535 )) || { WP_PORT=8080; warn "无效端口，使用默认 8080"; }
 
     local WG_IP
     WG_IP=$(get_wg_ip)
     log "WireGuard IP: ${WG_IP}"
+
+    # v6.9: 站点 URL 不再交互式询问，默认使用 WireGuard 内网 IP 访问。
+    # 如需绑定真实域名，运行脚本前 export WP_URL=https://your-domain.com 即可。
+    local WP_URL="${WP_URL:-}"
+    if [[ -z "$WP_URL" ]]; then
+        if [[ "$WP_PORT" == "80" ]]; then
+            WP_URL="http://${WG_IP}"
+        else
+            WP_URL="http://${WG_IP}:${WP_PORT}"
+        fi
+    fi
+    info "  站点 URL: ${WP_URL}"
 
     info "检查关键服务连通性..."
     check_network "${DB_HOST}:3306" "${REDIS_HOST}:6379" || true
@@ -1533,10 +1444,8 @@ cmd_master_init() {
 '              "${CF_TOKEN}"
         printf 'WP_INSTANCE=%s
 '           "${INST}"
-        printf 'WP_MULTISITE_TYPE=%s
-'     "${WP_MULTISITE_TYPE}"
-        printf 'WP_MULTISITE_DOMAIN=%s
-'   "${WP_MULTISITE_DOMAIN}"
+        printf 'WP_LOCALE=%s
+'            "${WP_LOCALE}"
         printf 'PAGE_CACHE_ENABLED=%s
 '   "${WP_PAGE_CACHE_ENABLED}"
         printf 'WP_AUTH_KEY=%s
@@ -1559,7 +1468,7 @@ cmd_master_init() {
     chmod 600 "$DIR/.env"
 
     _write_nginx_main_conf    "$DIR/conf/nginx.conf"
-    _write_nginx_wp_conf      "$DIR/conf/nginx-wp.conf" "$WP_MULTISITE_TYPE" "$WP_MULTISITE_DOMAIN"
+    _write_nginx_wp_conf      "$DIR/conf/nginx-wp.conf"
     _sed_nginx_wp_conf        "$DIR/conf/nginx-wp.conf" "$WG_IP" "$WP_PORT"
     _write_php_uploads_ini    "$DIR/conf/php-uploads.ini"
     _write_opcache_ini        "$DIR/conf/opcache.ini"
@@ -1578,7 +1487,6 @@ cmd_master_init() {
     _write_wp_config_extra    "$DIR/conf/wp-config-extra.php" "master" \
         "$S_AUTH_KEY" "$S_SECURE_AUTH_KEY" "$S_LOGGED_IN_KEY" "$S_NONCE_KEY" \
         "$S_AUTH_SALT" "$S_SECURE_AUTH_SALT" "$S_LOGGED_IN_SALT" "$S_NONCE_SALT" \
-        "$WP_MULTISITE_TYPE" "$WP_MULTISITE_DOMAIN" \
         "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" \
         "$WP_PAGE_CACHE_ENABLED"
     _write_init_dockerfile    "$DIR"
@@ -1590,17 +1498,14 @@ cmd_master_init() {
     docker compose -f "$DIR/docker-compose.yml" build --pull || error "镜像构建失败"
     docker compose -f "$DIR/docker-compose.yml" up -d       || error "容器启动失败"
 
-    _setup_plugins "$DIR" "true"         "$WP_URL" "$WP_TITLE" "$WP_ADMIN" "$WP_PASS" "$WP_EMAIL" "$WP_LOCALE"         "$WP_MULTISITE_TYPE" "$WP_MULTISITE_DOMAIN"         || warn "插件配置未完全成功，可通过菜单 11 重试"
+    _setup_plugins "$DIR" "true" "$WP_URL" "$WP_TITLE" "$WP_ADMIN" "$WP_PASS" "$WP_EMAIL" "$WP_LOCALE" \
+        || warn "插件配置未完全成功，可通过菜单 11 重试"
 
     log "主节点初始化完成！"
     echo -e "  实例:     \e[36m${INST}\e[0m"
     echo -e "  内网访问: \e[33mhttp://${WG_IP}\e[0m"
     echo -e "  站点:     \e[33m${WP_URL}\e[0m"
     echo -e "  账号:     \e[32m${WP_ADMIN}\e[0m / \e[32m${WP_PASS}\e[0m"
-    if [[ "$WP_MULTISITE_TYPE" != "single" ]]; then
-        echo -e "  Multisite: \e[35m${WP_MULTISITE_TYPE}\e[0m"
-        [[ -n "$WP_MULTISITE_DOMAIN" ]] && echo -e "  根域名:   \e[35m${WP_MULTISITE_DOMAIN}\e[0m"
-    fi
     echo ""
     _c "1;33" ">>> WP-Cron 定时任务提示 <<<"
     echo -e "  内置 WP-Cron 已禁用，请在\e[33m某一台节点宿主机\e[0m添加以下 crontab："
@@ -1616,7 +1521,6 @@ cmd_master_init() {
 cmd_push() {
     header "打包推送镜像到私有仓库"
 
-    # v6.0: 实例选择
     local DIR INST
     _resolve_instance DIR INST
     [[ -f "$DIR/.env" ]] || error "未找到 .env：${DIR}，请先执行主节点初始化"
@@ -1701,11 +1605,6 @@ cmd_push() {
     P_LOGGED_IN_SALT=$(env_get    "$DIR/.env" "WP_LOGGED_IN_SALT")
     P_NONCE_SALT=$(env_get        "$DIR/.env" "WP_NONCE_SALT")
 
-    # v6.0: 读取 Multisite 配置
-    local P_MS_TYPE P_MS_DOMAIN
-    P_MS_TYPE=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE");   P_MS_TYPE="${P_MS_TYPE:-single}"
-    P_MS_DOMAIN=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN"); P_MS_DOMAIN="${P_MS_DOMAIN:-}"
-
     # v6.6: 读取页面缓存开关，主/工作节点镜像都传，确保全节点开关一致
     local P_PAGE_CACHE_ENABLED
     P_PAGE_CACHE_ENABLED=$(env_get "$DIR/.env" "PAGE_CACHE_ENABLED" 2>/dev/null || true)
@@ -1744,7 +1643,6 @@ cmd_push() {
         _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master" \
             "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
             "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT" \
-            "$P_MS_TYPE" "$P_MS_DOMAIN" \
             "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" \
             "$P_PAGE_CACHE_ENABLED"
         warn "主节点容器需重启后 salts 才会生效：菜单 10 → 重启节点"
@@ -1752,8 +1650,7 @@ cmd_push() {
 
     mkdir -p "$BUILD_DIR/conf"
     _write_nginx_main_conf   "$BUILD_DIR/conf/nginx.conf"
-    # v6.0: 镜像内 nginx-wp.conf 含 Multisite rewrite/server_name，保留 IP 占位符
-    _write_nginx_wp_conf     "$BUILD_DIR/conf/nginx-wp.conf" "$P_MS_TYPE" "$P_MS_DOMAIN"
+    _write_nginx_wp_conf     "$BUILD_DIR/conf/nginx-wp.conf"
     _write_php_uploads_ini   "$BUILD_DIR/conf/php-uploads.ini"
     _write_opcache_ini       "$BUILD_DIR/conf/opcache.ini"
     _write_php_fpm_www_conf  "$BUILD_DIR/conf/php-fpm-www.conf"
@@ -1761,14 +1658,13 @@ cmd_push() {
     # v6.6: 页面缓存 drop-in 文件，内容不区分开关状态，随镜像无条件打包
     _write_advanced_cache_php        "$BUILD_DIR/conf/advanced-cache.php"
     _write_pagecache_purge_mu_plugin "$BUILD_DIR/conf/pagecache-purge.php"
-    # v6.0: worker 角色 + 统一 salts + Multisite 常量
+    # v6.0: worker 角色 + 统一 salts
     # 注意: worker 节点不进 wp-admin、不跑 Test Connection，刻意不传 R2 凭证
-    # ($13-$17 留空)，避免凭证扩散到所有 worker 节点，减少泄露面
-    # v6.6: 但页面缓存开关（$18）主/工作节点都传，全节点开关必须一致
+    # （留空），避免凭证扩散到所有 worker 节点，减少泄露面
+    # v6.6: 但页面缓存开关（末位参数）主/工作节点都传，全节点开关必须一致
     _write_wp_config_extra   "$BUILD_DIR/conf/wp-config-extra.php" "worker" \
         "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
         "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT" \
-        "$P_MS_TYPE" "$P_MS_DOMAIN" \
         "" "" "" "" "" \
         "$P_PAGE_CACHE_ENABLED"
     _write_entrypoint_script "$BUILD_DIR/entrypoint.sh"
@@ -1833,14 +1729,13 @@ cmd_push() {
 cmd_pull_deploy() {
     header "工作节点拉取部署 / 更新"
 
-    # v6.0: 实例选择
     local DIR INST
     _resolve_instance DIR INST
     info "实例: ${INST}  目录: ${DIR}"
 
     local IS_FIRST=false
     local DB_HOST="" DB_NAME="" DB_USER="" DB_PW="" REDIS_HOST="" REDIS_PW=""
-    local WP_URL="" WP_PORT="80"
+    local WP_URL="${WP_URL:-}" WP_PORT="8080"
     local REGISTRY_HOST="" CF_ZONE_ID="" CF_TOKEN="" WG_IP=""
 
     if [[ ! -f "$DIR/.env" ]]; then
@@ -1860,10 +1755,6 @@ cmd_pull_deploy() {
         REDIS_HOST="${REDIS_HOST:-$DB_HOST}"; REDIS_HOST="${REDIS_HOST%%:*}"
         read_secret "Redis 密码: " REDIS_PW; [[ -n "$REDIS_PW" ]] || error "Redis 密码不能为空"
 
-        info "--- 站点 ---"
-        read -rp "站点 URL（如 https://example.com）: " WP_URL || true
-        [[ -n "$WP_URL" ]] || error "URL 不能为空"
-
         info "--- 私有镜像仓库 ---"
         read -rp "Registry 地址（如 10.10.0.1:5000）: " REGISTRY_HOST || true
         [[ -n "$REGISTRY_HOST" ]] || error "Registry 地址不能为空"
@@ -1872,12 +1763,24 @@ cmd_pull_deploy() {
         read -rp "CF Zone ID（留空跳过）: " CF_ZONE_ID || true; CF_ZONE_ID="${CF_ZONE_ID:-}"
         [[ -n "$CF_ZONE_ID" ]] && read_secret "CF API Token: " CF_TOKEN
 
-        read -rp "WordPress 监听端口 [默认: 80]: " WP_PORT || true
-        WP_PORT="${WP_PORT:-80}"
-        [[ "$WP_PORT" =~ ^[0-9]+$ ]] && (( WP_PORT >= 1 && WP_PORT <= 65535 )) || { WP_PORT=80; warn "无效端口，使用默认 80"; }
+        read -rp "WordPress 监听端口 [默认: 8080]: " WP_PORT || true
+        WP_PORT="${WP_PORT:-8080}"
+        [[ "$WP_PORT" =~ ^[0-9]+$ ]] && (( WP_PORT >= 1 && WP_PORT <= 65535 )) || { WP_PORT=8080; warn "无效端口，使用默认 8080"; }
         WG_IP=$(get_wg_ip)
         check_port "$WG_IP" "$WP_PORT"
         check_network "${DB_HOST}:3306" "${REDIS_HOST}:6379" || true
+
+        # v6.9: 站点 URL 不再交互式询问，默认使用 WireGuard 内网 IP 访问，
+        # 与主节点保持一致的自动派生逻辑。如需自定义域名，运行前
+        # export WP_URL=https://your-domain.com 即可。
+        if [[ -z "$WP_URL" ]]; then
+            if [[ "$WP_PORT" == "80" ]]; then
+                WP_URL="http://${WG_IP}"
+            else
+                WP_URL="http://${WG_IP}:${WP_PORT}"
+            fi
+        fi
+        info "  站点 URL: ${WP_URL}"
 
         mkdir -p "$DIR"/{data/uploads,data/cache,conf,logs}
     # [fix] v6.4: 预先 touch 出空文件，避免 Docker 在 bind mount 源文件
@@ -2145,15 +2048,10 @@ cmd_status() {
     echo -e "  WordPress 版本: \e[36m${WP_VER}\e[0m"
     echo -e "  当前镜像版本:   \e[32m$(env_get "$DIR/.env" IMAGE_TAG)\e[0m"
     echo -e "  仓库地址:       \e[36m$(env_get "$DIR/.env" REGISTRY_HOST)\e[0m"
-    local _WG _PORT _MS_TYPE _MS_DOMAIN
+    local _WG _PORT
     _WG=$(env_get "$DIR/.env" WG_IP)
     _PORT=$(env_get "$DIR/.env" WP_PORT); _PORT="${_PORT:-80}"
-    _MS_TYPE=$(env_get "$DIR/.env" WP_MULTISITE_TYPE 2>/dev/null || true); _MS_TYPE="${_MS_TYPE:-single}"
-    _MS_DOMAIN=$(env_get "$DIR/.env" WP_MULTISITE_DOMAIN 2>/dev/null || true)
     echo -e "  健康检查:       \e[36mhttp://${_WG}:${_PORT}/health\e[0m"
-    if [[ "$_MS_TYPE" != "single" ]]; then
-        echo -e "  Multisite:      \e[35m${_MS_TYPE}\e[0m${_MS_DOMAIN:+  根域名: \e[35m${_MS_DOMAIN}\e[0m}"
-    fi
 }
 
 cmd_logs() {
@@ -2234,20 +2132,18 @@ cmd_setup_r2() {
     chmod 600 "$DIR/.env"
     log "R2 凭证已写入 .env"
 
-    # 就地重新生成 wp-config-extra.php：复用已有 salts/Multisite 设置，
+    # 就地重新生成 wp-config-extra.php：复用已有 salts 设置，
     # 只刷新 R2 常量，不影响登录态、不需要重新生成 wp-config.php 主文件
-    # [fix] v6.6: 之前这里没读/传 PAGE_CACHE_ENABLED，函数内 $18 缺省为 false，
+    # [fix] v6.6: 之前这里没读/传 PAGE_CACHE_ENABLED，函数内页面缓存参数缺省为 false，
     # 配置 R2 会把已经开启的页面缓存开关静默改回关闭，这里补上读取+透传。
-    local AK SK LK NK AS SS LS NS MT MD PC
+    local AK SK LK NK AS SS LS NS PC
     AK=$(env_get "$DIR/.env" "WP_AUTH_KEY");        SK=$(env_get "$DIR/.env" "WP_SECURE_AUTH_KEY")
     LK=$(env_get "$DIR/.env" "WP_LOGGED_IN_KEY");   NK=$(env_get "$DIR/.env" "WP_NONCE_KEY")
     AS=$(env_get "$DIR/.env" "WP_AUTH_SALT");       SS=$(env_get "$DIR/.env" "WP_SECURE_AUTH_SALT")
     LS=$(env_get "$DIR/.env" "WP_LOGGED_IN_SALT");  NS=$(env_get "$DIR/.env" "WP_NONCE_SALT")
-    MT=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE" 2>/dev/null || true); MT="${MT:-single}"
-    MD=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN" 2>/dev/null || true)
     PC=$(env_get "$DIR/.env" "PAGE_CACHE_ENABLED" 2>/dev/null || true); [[ "$PC" == "true" ]] || PC="false"
     _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master" \
-        "$AK" "$SK" "$LK" "$NK" "$AS" "$SS" "$LS" "$NS" "$MT" "$MD" \
+        "$AK" "$SK" "$LK" "$NK" "$AS" "$SS" "$LS" "$NS" \
         "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" "$PC"
     log "wp-config-extra.php 已刷新（R2 常量已写入，salts 与页面缓存开关保持不变）"
 
@@ -2307,14 +2203,12 @@ cmd_setup_pagecache() {
         _write_init_compose "$DIR" "$INST"
     fi
 
-    # 就地重新生成 wp-config-extra.php：复用已有 salts/Multisite/R2 设置，只刷新开关常量
-    local AK SK LK NK AS SS LS NS MT MD R2K R2S R2B R2D R2E
+    # 就地重新生成 wp-config-extra.php：复用已有 salts/R2 设置，只刷新开关常量
+    local AK SK LK NK AS SS LS NS R2K R2S R2B R2D R2E
     AK=$(env_get "$DIR/.env" "WP_AUTH_KEY");        SK=$(env_get "$DIR/.env" "WP_SECURE_AUTH_KEY")
     LK=$(env_get "$DIR/.env" "WP_LOGGED_IN_KEY");   NK=$(env_get "$DIR/.env" "WP_NONCE_KEY")
     AS=$(env_get "$DIR/.env" "WP_AUTH_SALT");       SS=$(env_get "$DIR/.env" "WP_SECURE_AUTH_SALT")
     LS=$(env_get "$DIR/.env" "WP_LOGGED_IN_SALT");  NS=$(env_get "$DIR/.env" "WP_NONCE_SALT")
-    MT=$(env_get "$DIR/.env" "WP_MULTISITE_TYPE" 2>/dev/null || true); MT="${MT:-single}"
-    MD=$(env_get "$DIR/.env" "WP_MULTISITE_DOMAIN" 2>/dev/null || true)
     if [[ "$_ROLE" == "master" ]]; then
         R2K=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
         R2S=$(env_get "$DIR/.env" "R2_SECRET_KEY" 2>/dev/null || true)
@@ -2323,7 +2217,7 @@ cmd_setup_pagecache() {
         R2E=$(env_get "$DIR/.env" "R2_ENDPOINT" 2>/dev/null || true)
     fi
     _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "$_ROLE" \
-        "$AK" "$SK" "$LK" "$NK" "$AS" "$SS" "$LS" "$NS" "$MT" "$MD" \
+        "$AK" "$SK" "$LK" "$NK" "$AS" "$SS" "$LS" "$NS" \
         "$R2K" "$R2S" "$R2B" "$R2D" "$R2E" "$NEW"
     log "wp-config-extra.php 已刷新"
 
@@ -2350,9 +2244,7 @@ cmd_retry_plugins() {
         || { warn "wordpress 容器未运行，请先启动。"; return; }
     local _LOCALE _URL
     _LOCALE=$(env_get "$DIR/.env" "WP_LOCALE" 2>/dev/null || echo "zh_CN")
-    # [fix] Multisite 模式下 _setup_plugins 需要 URL 来构造 --url flag；
-    # 不传 URL 时 _WP_URL_FLAG 为空，所有 WP-CLI 命令报 "Site not found"。
-    # 从 .env 读取 WP_SITEURL_FALLBACK（master_init 时写入的站点 URL）作为 URL。
+    # 从 .env 读取 WP_SITEURL_FALLBACK（初始化时写入的站点 URL）传给 _setup_plugins。
     _URL=$(env_get "$DIR/.env" "WP_SITEURL_FALLBACK" 2>/dev/null || true)
     _setup_plugins "$DIR" "false" "${_URL}" "" "" "" "" "${_LOCALE:-zh_CN}" \
         || warn "插件配置未完全成功。"
@@ -2893,7 +2785,7 @@ interactive_menu() {
         echo ""
         _c "1;35" "========================================"
         _c "1;35" "  WordPress 多节点分发管理 v${SCRIPT_VERSION}"
-        _c "1;35" "  多实例 | Multisite | 单容器全打包"
+        _c "1;35" "  多实例 | 单容器全打包"
         _c "1;35" "========================================"
         echo -e "  \e[36m── 仓库管理 ──────────────────────────\e[0m"
         echo -e "  \e[32m 1.\e[0m 部署私有镜像仓库"
