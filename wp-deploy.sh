@@ -2,6 +2,13 @@
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
 # v7.1
+# v7.3: 修复 worker 节点首次部署时的 bind mount 目录误建 bug：
+#       cmd_pull_deploy 会先启动容器只为生成 wp-config.php，此时 nginx.conf/
+#       supervisord.conf 等 8 个配置文件还没从镜像导出，Docker 发现 bind
+#       mount 源文件不存在会自动建成同名目录，导致最终启动报
+#       "mount ... not a directory"。新增 _ensure_worker_conf_files，在任何
+#       docker compose up 之前统一校验/修复（找回误建目录里的文件，或
+#       touch 占位）。
 # v7.2: 新增私有镜像仓库管理菜单（cmd_registry_manage）：查看仓库状态/磁盘
 #       占用、列出 repositories、列出并按 tag 删除镜像（含 digest 共享校验，
 #       避免误删 latest）、按保留数量批量清理旧 tag、修改仓库认证密码、
@@ -18,7 +25,7 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # 脚本版本与自身路径（用于自更新）
-SCRIPT_VERSION="7.2"
+SCRIPT_VERSION="7.3"
 SCRIPT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_GITHUB_RAW="${SCRIPT_GITHUB_RAW:-https://raw.githubusercontent.com/lje02/liang/main/wp-deploy.sh}"
 
@@ -1016,6 +1023,40 @@ services:
       - ./conf/pagecache-purge.php:/var/www/html/wp-content/mu-plugins/pagecache-purge.php:ro
       - ./logs:/var/log/nginx
 YAML
+}
+
+# [fix] v7.3: worker 节点部署时曾出现过 bind mount 源文件缺失导致 Docker
+# 自动把 conf/supervisord.conf 等文件建成同名目录的问题。根因：cmd_pull_deploy
+# 首次部署时会先 `docker compose up -d` 启动容器用来生成 wp-config.php，
+# 而 nginx.conf / supervisord.conf 等其余 8 个文件此时还没从镜像导出，
+# Docker 发现 bind mount 源不存在就会建成目录，之后 docker cp 导出配置文件
+# 只会把文件拷进这个"应该是文件却是目录"的路径里，最终真正启动时报
+# "not a directory" 挂载失败。这里在任何 docker compose up 之前统一校验/
+# 修复：目录 → 尝试找回其中同名文件；不存在 → touch 空文件占位。
+# 用法: _ensure_worker_conf_files <DIR>
+_ensure_worker_conf_files() {
+    local DIR="$1"
+    local -a FILES=(
+        nginx.conf nginx-wp.conf php-uploads.ini opcache.ini
+        php-fpm-www.conf supervisord.conf advanced-cache.php pagecache-purge.php
+        wp-config.php wp-config-extra.php
+    )
+    mkdir -p "$DIR/conf"
+    local f
+    for f in "${FILES[@]}"; do
+        if [[ -d "$DIR/conf/$f" ]]; then
+            if [[ -f "$DIR/conf/$f/$f" ]]; then
+                mv "$DIR/conf/$f/$f" "$DIR/conf/${f}.recovered"
+                rm -rf "$DIR/conf/$f"
+                mv "$DIR/conf/${f}.recovered" "$DIR/conf/$f"
+                warn "  ${f}: 之前被 Docker 误建成目录，已找回其中文件并修复"
+            else
+                rm -rf "$DIR/conf/$f"
+                warn "  ${f}: 之前被 Docker 误建成空目录，已清理并重建为占位文件"
+            fi
+        fi
+        [[ -e "$DIR/conf/$f" ]] || touch "$DIR/conf/$f"
+    done
 }
 
 # ════════════════════════════════════════════════════════
@@ -2184,6 +2225,9 @@ cmd_pull_deploy() {
     local _WPCFG_MODE="ro"
     [[ -s "$DIR/conf/wp-config.php" ]] || _WPCFG_MODE="rw"
     _write_worker_compose "$DIR" "$INST" "$_WPCFG_MODE"
+    # [fix] v7.3: 必须在任何 docker compose up 之前确保所有 bind mount 源文件
+    # 都是"文件"而不是目录，见 _ensure_worker_conf_files 顶部注释
+    _ensure_worker_conf_files "$DIR"
 
     DB_HOST="${DB_HOST:-$(env_get "$DIR/.env" "DB_HOST")}"
     DB_NAME="${DB_NAME:-$(env_get "$DIR/.env" "WORDPRESS_DB_NAME")}"
