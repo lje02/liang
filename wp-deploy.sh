@@ -2057,6 +2057,16 @@ cmd_push() {
     P_PAGE_CACHE_ENABLED=$(env_get "$DIR/.env" "PAGE_CACHE_ENABLED" 2>/dev/null || true)
     [[ "$P_PAGE_CACHE_ENABLED" == "true" ]] || P_PAGE_CACHE_ENABLED="false"
 
+    # v7.5: R2 凭证要在 salts 是否重新生成的分支之外统一读取一次，
+    # 否则 worker 节点配置写入（在 if 分支之外）在 salts 已存在的
+    # 正常路径下会因 set -u 报 "unbound variable"
+    local R2_KEY R2_SECRET R2_BUCKET R2_DOMAIN R2_ENDPOINT
+    R2_KEY=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
+    R2_SECRET=$(env_get "$DIR/.env" "R2_SECRET_KEY" 2>/dev/null || true)
+    R2_BUCKET=$(env_get "$DIR/.env" "R2_BUCKET" 2>/dev/null || true)
+    R2_DOMAIN=$(env_get "$DIR/.env" "R2_DOMAIN" 2>/dev/null || true)
+    R2_ENDPOINT=$(env_get "$DIR/.env" "R2_ENDPOINT" 2>/dev/null || true)
+
     if [[ -z "$P_AUTH_KEY" ]]; then
         warn ".env 中未找到 Salts（旧版部署？），将生成新 Salts 并写回 .env"
         P_AUTH_KEY=$(_gen_salt);        P_SECURE_AUTH_KEY=$(_gen_salt)
@@ -2081,12 +2091,6 @@ cmd_push() {
             printf 'WP_NONCE_SALT=%s
 '        "${P_NONCE_SALT}"
         } >> "$DIR/.env"
-        local R2_KEY R2_SECRET R2_BUCKET R2_DOMAIN R2_ENDPOINT
-        R2_KEY=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
-        R2_SECRET=$(env_get "$DIR/.env" "R2_SECRET_KEY" 2>/dev/null || true)
-        R2_BUCKET=$(env_get "$DIR/.env" "R2_BUCKET" 2>/dev/null || true)
-        R2_DOMAIN=$(env_get "$DIR/.env" "R2_DOMAIN" 2>/dev/null || true)
-        R2_ENDPOINT=$(env_get "$DIR/.env" "R2_ENDPOINT" 2>/dev/null || true)
         _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master" \
             "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
             "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT" \
