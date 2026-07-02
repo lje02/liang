@@ -25,7 +25,7 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # 脚本版本与自身路径（用于自更新）
-SCRIPT_VERSION="7.4"
+SCRIPT_VERSION="7.3"
 SCRIPT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_GITHUB_RAW="${SCRIPT_GITHUB_RAW:-https://raw.githubusercontent.com/lje02/liang/main/wp-deploy.sh}"
 
@@ -2319,6 +2319,51 @@ cmd_pull_deploy() {
         warn "无法创建临时容器，跳过 wp-config-extra.php 导出"
     fi
 
+    # [fix] v7.4: 根因排查 — _ensure_worker_conf_files 只是把 supervisord.conf
+    # 等尚不存在的文件 touch 成"空文件占位"以避免 Docker 把 bind mount 源误建成
+    # 目录；但如果紧接着就用这批空占位文件启动容器（例如下面预启动生成
+    # wp-config.php），空的 supervisord.conf 会把镜像里真正烘焙好的配置整个
+    # 覆盖掉，supervisord 读到空 ini 直接报 "does not include supervisord
+    # section" 并无限重启。真正的修复是：在任何 docker compose up 之前，先把
+    # 这批配置文件从镜像里真实导出到宿主机，而不是仅仅满足"文件存在"这一条件。
+    # 因此把原来在 wp-config.php 生成之后才做的"从镜像导出配置文件"整体
+    # 提前到这里执行。
+    local _WG_IP_VAL _WP_PORT_VAL
+    _WG_IP_VAL=$(env_get "$DIR/.env" "WG_IP")
+    _WP_PORT_VAL=$(env_get "$DIR/.env" "WP_PORT"); _WP_PORT_VAL="${_WP_PORT_VAL:-80}"
+
+    info "从镜像导出配置文件..."
+    local _TMP_CID2
+    _TMP_CID2=$(docker create "${IMAGE_FULL}" sh 2>/dev/null || true)
+    if [[ -n "$_TMP_CID2" ]]; then
+        docker cp "${_TMP_CID2}:/etc/nginx/nginx.conf"          "$DIR/conf/nginx.conf"        2>/dev/null && log "  nginx.conf 已导出"        || warn "  nginx.conf 导出失败"
+        docker cp "${_TMP_CID2}:/etc/nginx/http.d/default.conf" "$DIR/conf/nginx-wp.conf"     2>/dev/null && log "  nginx-wp.conf 已导出"     || warn "  nginx-wp.conf 导出失败"
+        docker cp "${_TMP_CID2}:/usr/local/etc/php/conf.d/uploads.ini"   "$DIR/conf/php-uploads.ini"  2>/dev/null || true
+        docker cp "${_TMP_CID2}:/usr/local/etc/php/conf.d/opcache.ini"   "$DIR/conf/opcache.ini"      2>/dev/null || true
+        docker cp "${_TMP_CID2}:/usr/local/etc/php-fpm.d/www.conf"       "$DIR/conf/php-fpm-www.conf" 2>/dev/null || true
+        docker cp "${_TMP_CID2}:/etc/supervisord.conf"                    "$DIR/conf/supervisord.conf" 2>/dev/null && log "  supervisord.conf 已导出" || warn "  supervisord.conf 导出失败"
+        # v6.6: 页面缓存 drop-in 文件也要导出，_write_worker_compose 会 bind mount 回同样的路径
+        docker cp "${_TMP_CID2}:/var/www/html/wp-content/advanced-cache.php"  "$DIR/conf/advanced-cache.php"  2>/dev/null || true
+        docker cp "${_TMP_CID2}:/var/www/html/wp-content/mu-plugins/pagecache-purge.php" "$DIR/conf/pagecache-purge.php" 2>/dev/null || true
+        docker rm -f "$_TMP_CID2" &>/dev/null || true
+    else
+        warn "无法创建临时容器，跳过配置文件导出（将使用已有版本，若是首次部署可能导致容器无法启动）"
+    fi
+
+    if [[ -f "$DIR/conf/nginx-wp.conf" ]]; then
+        info "替换 nginx-wp.conf 占位符 → ${_WG_IP_VAL}:${_WP_PORT_VAL}"
+        _sed_nginx_wp_conf "$DIR/conf/nginx-wp.conf" "$_WG_IP_VAL" "$_WP_PORT_VAL"
+    else
+        warn "未能获取 nginx-wp.conf，nginx 将使用镜像内默认配置（含占位符）"
+    fi
+
+    # [fix] v7.4: supervisord.conf 是容器能否启动的硬性前提，若导出失败且本地
+    # 也没有历史版本可用，此时仍是空占位文件，预启动必然crash-loop，
+    # 提前失败比让容器进入重启循环更清晰。
+    if [[ ! -s "$DIR/conf/supervisord.conf" ]]; then
+        error "supervisord.conf 导出失败且本地无可用版本，无法启动容器，请检查镜像 ${IMAGE_FULL} 是否完整"
+    fi
+
     if [[ ! -s "$DIR/conf/wp-config.php" ]]; then
         info "预启动容器以生成 wp-config.php ..."
         # 上面已按 _WPCFG_MODE=rw 写过 compose；若文件意外不存在则补写一次，同样要 rw
@@ -2355,37 +2400,6 @@ cmd_pull_deploy() {
         # [fix] 无论生成成功与否，都要把 compose 重写回只读挂载，
         # 防止 worker 节点的 wp-config.php 长期保持可写状态
         _write_worker_compose "$DIR" "$INST" "ro"
-    fi
-
-    # v5.0: 统一占位符替换逻辑（主/工作节点一致）
-    local _WG_IP_VAL _WP_PORT_VAL
-    _WG_IP_VAL=$(env_get "$DIR/.env" "WG_IP")
-    _WP_PORT_VAL=$(env_get "$DIR/.env" "WP_PORT"); _WP_PORT_VAL="${_WP_PORT_VAL:-80}"
-
-    # 每次从新镜像导出全部 conf（确保与镜像版本一致，而非沿用旧文件）
-    info "从镜像导出配置文件..."
-    local _TMP_CID2
-    _TMP_CID2=$(docker create "${IMAGE_FULL}" sh 2>/dev/null || true)
-    if [[ -n "$_TMP_CID2" ]]; then
-        docker cp "${_TMP_CID2}:/etc/nginx/nginx.conf"          "$DIR/conf/nginx.conf"        2>/dev/null && log "  nginx.conf 已导出"        || warn "  nginx.conf 导出失败"
-        docker cp "${_TMP_CID2}:/etc/nginx/http.d/default.conf" "$DIR/conf/nginx-wp.conf"     2>/dev/null && log "  nginx-wp.conf 已导出"     || warn "  nginx-wp.conf 导出失败"
-        docker cp "${_TMP_CID2}:/usr/local/etc/php/conf.d/uploads.ini"   "$DIR/conf/php-uploads.ini"  2>/dev/null || true
-        docker cp "${_TMP_CID2}:/usr/local/etc/php/conf.d/opcache.ini"   "$DIR/conf/opcache.ini"      2>/dev/null || true
-        docker cp "${_TMP_CID2}:/usr/local/etc/php-fpm.d/www.conf"       "$DIR/conf/php-fpm-www.conf" 2>/dev/null || true
-        docker cp "${_TMP_CID2}:/etc/supervisord.conf"                    "$DIR/conf/supervisord.conf" 2>/dev/null || true
-        # v6.6: 页面缓存 drop-in 文件也要导出，_write_worker_compose 会 bind mount 回同样的路径
-        docker cp "${_TMP_CID2}:/var/www/html/wp-content/advanced-cache.php"  "$DIR/conf/advanced-cache.php"  2>/dev/null || true
-        docker cp "${_TMP_CID2}:/var/www/html/wp-content/mu-plugins/pagecache-purge.php" "$DIR/conf/pagecache-purge.php" 2>/dev/null || true
-        docker rm -f "$_TMP_CID2" &>/dev/null || true
-    else
-        warn "无法创建临时容器，跳过配置文件导出（将使用已有版本）"
-    fi
-
-    if [[ -f "$DIR/conf/nginx-wp.conf" ]]; then
-        info "替换 nginx-wp.conf 占位符 → ${_WG_IP_VAL}:${_WP_PORT_VAL}"
-        _sed_nginx_wp_conf "$DIR/conf/nginx-wp.conf" "$_WG_IP_VAL" "$_WP_PORT_VAL"
-    else
-        warn "未能获取 nginx-wp.conf，nginx 将使用镜像内默认配置（含占位符）"
     fi
 
     info "启动 / 更新容器..."
