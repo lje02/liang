@@ -1127,6 +1127,52 @@ _flush_all_caches() {
 }
 
 # ════════════════════════════════════════════════════════
+# _wait_container_running
+#   等待 wordpress 容器进入"稳定"的 running 状态。
+#   [fix] v7.4: 原来的就绪判断只做一次 `exec command -v wp` 探测，
+#   命中就立即往下执行 docker cp / docker exec 等多个步骤。如果容器
+#   当时正处于崩溃重启（network_mode: host 端口冲突、依赖未就绪、
+#   OOM 等原因都可能导致），这次探测有可能恰好卡在两次重启的间隙
+#   命中一次，导致紧随其后的 docker cp/exec 撞上 Docker daemon 报的
+#   "Container ... is restarting, wait until the container is running"，
+#   而脚本原来对此只是打印一条 warn 就放弃，没有重试也没有留下线索。
+#   这里改为：要求连续 2 次探测都看到 State.Status=running 才算真正
+#   稳定；一旦发现 restarting，立即打印最近日志辅助排障。
+#   参数: $1=DIR  $2=最大探测次数(默认20)  $3=探测间隔秒数(默认3)
+#   返回: 0=已稳定就绪  1=超时仍未稳定
+# ════════════════════════════════════════════════════════
+_wait_container_running() {
+    local DIR="$1" MAX_TRIES="${2:-20}" INTERVAL="${3:-3}"
+    local _CID _STATUS _STABLE_HITS=0 _TRY=0
+    while (( _TRY < MAX_TRIES )); do
+        _CID=$(dc "$DIR" ps -q wordpress 2>/dev/null)
+        if [[ -n "$_CID" ]]; then
+            _STATUS=$(docker inspect -f '{{.State.Status}}' "$_CID" 2>/dev/null || echo "unknown")
+            case "$_STATUS" in
+                running)
+                    _STABLE_HITS=$((_STABLE_HITS + 1))
+                    if (( _STABLE_HITS >= 2 )) \
+                    && dc "$DIR" exec -T wordpress sh -c 'command -v wp' &>/dev/null; then
+                        return 0
+                    fi
+                    ;;
+                restarting)
+                    warn "容器处于 restarting 状态（可能正在崩溃重启循环），最近日志："
+                    docker logs --tail 20 "$_CID" 2>&1 | sed 's/^/    /' >&2
+                    _STABLE_HITS=0
+                    ;;
+                *)
+                    _STABLE_HITS=0
+                    ;;
+            esac
+        fi
+        sleep "$INTERVAL"
+        _TRY=$((_TRY + 1))
+    done
+    return 1
+}
+
+# ════════════════════════════════════════════════════════
 # _wp_config_create_with_extra
 #   统一封装 wp-config.php 生成逻辑：
 #   - 用 --skip-salts 跳过随机 KEY/SALT（由 wp-config-extra.php 统一管理），
@@ -2279,21 +2325,31 @@ cmd_pull_deploy() {
         [[ -f "$DIR/docker-compose.yml" ]] || _write_worker_compose "$DIR" "$INST" "rw"
         dc "$DIR" up -d 2>/dev/null || true
 
-        local RETRIES=20
-        while ! dc "$DIR" exec -T wordpress sh -c 'command -v wp' &>/dev/null; do
-            sleep 3; RETRIES=$((RETRIES - 1))
-            [[ $RETRIES -le 0 ]] && { warn "容器未就绪，跳过 wp-config.php 生成"; break; }
-        done
-
-        if dc "$DIR" exec -T wordpress sh -c 'command -v wp' &>/dev/null; then
-            local CID
-            CID=$(docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" ps -q wordpress)
-            _wp_config_create_with_extra "$DIR" "$DB_NAME" "$DB_USER" "$DB_PW" "$DB_HOST" \
-            && dc "$DIR" exec -T wordpress cp /var/www/html/wp-config.php /tmp/wp-config-out.php \
-            && docker cp "${CID}:/tmp/wp-config-out.php" "$DIR/conf/wp-config.php" \
-            && chmod 644 "$DIR/conf/wp-config.php" \
-            && log "wp-config.php 已生成并导出至 conf/" \
-            || warn "wp-config.php 生成失败，请手动创建或稍后重试（菜单 12）"
+        # [fix] v7.4: 原来只探测一次 `command -v wp` 就直接往下做 docker cp/exec，
+        # 容器若恰好在两次重启间隙被撞见，会导致后续步骤报
+        # "Container ... is restarting" 而失败。改用 _wait_container_running
+        # 要求连续稳定 running，并对生成步骤本身做最多 3 次重试。
+        if _wait_container_running "$DIR" 20 3; then
+            local CID _ATTEMPT _GEN_OK=false
+            for _ATTEMPT in 1 2 3; do
+                CID=$(docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" ps -q wordpress)
+                if _wp_config_create_with_extra "$DIR" "$DB_NAME" "$DB_USER" "$DB_PW" "$DB_HOST" \
+                   && dc "$DIR" exec -T wordpress cp /var/www/html/wp-config.php /tmp/wp-config-out.php \
+                   && docker cp "${CID}:/tmp/wp-config-out.php" "$DIR/conf/wp-config.php" \
+                   && chmod 644 "$DIR/conf/wp-config.php"; then
+                    _GEN_OK=true
+                    break
+                fi
+                warn "wp-config.php 生成第 ${_ATTEMPT} 次尝试失败，等待容器重新稳定后重试..."
+                _wait_container_running "$DIR" 10 3 || true
+            done
+            if [[ "$_GEN_OK" == "true" ]]; then
+                log "wp-config.php 已生成并导出至 conf/"
+            else
+                warn "wp-config.php 生成失败（已重试 3 次），请手动创建或稍后重试（菜单 12）"
+            fi
+        else
+            warn "容器未能进入稳定运行状态，跳过 wp-config.php 生成"
         fi
 
         # [fix] 无论生成成功与否，都要把 compose 重写回只读挂载，
