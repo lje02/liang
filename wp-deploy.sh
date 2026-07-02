@@ -2,6 +2,12 @@
 # ============================================================
 # wp-deploy.sh — WordPress 多节点全自动部署
 # v7.1
+# v7.2: 新增私有镜像仓库管理菜单（cmd_registry_manage）：查看仓库状态/磁盘
+#       占用、列出 repositories、列出并按 tag 删除镜像（含 digest 共享校验，
+#       避免误删 latest）、按保留数量批量清理旧 tag、修改仓库认证密码、
+#       手动触发垃圾回收释放磁盘空间。同时提取 _registry_creds 公共函数，
+#       替换 cmd_push/cmd_pull_deploy/cmd_rollback/cmd_restore 中 4 处重复的
+#       仓库凭证读取逻辑。
 # v7.1: 去掉自更新的 GPG 签名校验（维护密钥/每次发布手动签名开销太大，
 #       回到 v6.9 的基础检查：bash 语法 + 关键字 + 版本号确认）。
 # v7.0: 默认管理员用户名不再用 "admin"；WordPress 默认监听端口 80 → 8080；
@@ -12,7 +18,7 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # 脚本版本与自身路径（用于自更新）
-SCRIPT_VERSION="7.1"
+SCRIPT_VERSION="7.2"
 SCRIPT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_GITHUB_RAW="${SCRIPT_GITHUB_RAW:-https://raw.githubusercontent.com/lje02/liang/main/wp-deploy.sh}"
 
@@ -243,6 +249,23 @@ _ensure_insecure_registry() {
     else
         warn "Docker 重启失败，请手动执行: systemctl restart docker"
         return 1
+    fi
+}
+
+# 读取仓库认证信息：优先从本机 REGISTRY_DIR/.env 读取（仓库与当前节点同机部署），
+# 否则交互式询问（仓库部署在其他节点）。
+# 用法: _registry_creds <用户名变量名> <密码变量名>
+# [refactor] v7.2: 原来 cmd_push/cmd_pull_deploy/cmd_rollback/cmd_restore 里各自
+# 复制了一份几乎相同的 if/else 读取逻辑，这里统一提取，避免 4 处分别维护。
+_registry_creds() {
+    local -n _u_ref=$1
+    local -n _p_ref=$2
+    if [[ -f "$REGISTRY_DIR/.env" ]]; then
+        _u_ref=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
+        _p_ref=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
+    else
+        read -rp "仓库用户名: " _u_ref || true
+        read_secret "仓库密码: " _p_ref
     fi
 }
 
@@ -1151,7 +1174,7 @@ _setup_plugins() {
         log "wp-config.php 已自动生成。"
 
         # [fix] v6.4: 主节点 wp-config.php 此前只存在于容器可写层，
-        # --force-recreate（如菜单17修改R2配置后的重启）会导致其丢失，
+        # --force-recreate（如菜单18修改R2配置后的重启）会导致其丢失，
         # 进而触发 WordPress 重新走安装向导。这里生成后立即导出落盘，
         # 并配合 _write_init_compose 中新增的 bind mount 持久化。
         local _CID_FOR_CFG
@@ -1161,7 +1184,7 @@ _setup_plugins() {
             && docker cp "${_CID_FOR_CFG}:/tmp/wp-config-out.php" "$DIR/conf/wp-config.php" \
             && chmod 644 "$DIR/conf/wp-config.php" \
             && log "wp-config.php 已落盘到 ${DIR}/conf/，重建容器不会再丢失" \
-            || warn "wp-config.php 落盘失败，重建容器（如菜单17）仍有丢失风险，请手动执行菜单11修复"
+            || warn "wp-config.php 落盘失败，重建容器（如菜单18）仍有丢失风险，请手动执行菜单12修复"
         else
             warn "未取得容器 ID，wp-config.php 未落盘，重建容器仍有丢失风险"
         fi
@@ -1184,7 +1207,7 @@ _setup_plugins() {
     fi
 
     # v5.0: 语言包安装移至此处，IS_AUTO_INSTALL 分支外
-    # 菜单 11 重试时也会执行
+    # 菜单 12 重试时也会执行
     local _WP_URL_FLAG=()
     [[ -n "$URL" ]] && _WP_URL_FLAG=("--url=${URL}")
 
@@ -1313,6 +1336,334 @@ EOF
     echo -e "  用户名:   \e[32m${REG_USER}\e[0m"
     echo -e "  密码:     \e[32m${REG_PASS}\e[0m"
     echo -e "  \e[36m工作节点 .env 中填写 REGISTRY_HOST=${REGISTRY_ADDR}\e[0m"
+}
+
+# ════════════════════════════════════════════════════════
+# 私有镜像仓库管理（v7.2 新增）
+# ════════════════════════════════════════════════════════
+# 获取指定 repo:tag 的 manifest digest（HEAD 请求，不下载 body）。
+# 用法: _reg_get_digest <repo> <tag>  → stdout 打印 digest（失败为空）
+_reg_get_digest() {
+    local REPO="$1" TAG="$2"
+    local HEADERS
+    HEADERS=$(curl -sI -u "${REG_USER}:${REG_PASS}" \
+        -H "Accept: application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.oci.image.index.v1+json" \
+        "http://${REGISTRY_HOST}/v2/${REPO}/manifests/${TAG}" 2>/dev/null) || return 1
+    printf '%s' "$HEADERS" | grep -i '^docker-content-digest:' | awk '{print $2}' | tr -d '\r'
+}
+
+# 对仓库执行垃圾回收，释放已删除 tag 占用的磁盘空间。
+# registry:2 的存储层删除 manifest 只是去掉引用，真正回收空间必须停机跑 GC。
+_reg_run_gc() {
+    read -rp "现在执行垃圾回收以释放磁盘空间？（会短暂停止仓库服务）[Y/n]: " _GC || true
+    if [[ "${_GC,,}" == "n" ]]; then
+        info "已跳过垃圾回收，可稍后在本菜单重新执行"
+        return
+    fi
+    [[ -f "$REGISTRY_DIR/docker-compose.yml" ]] || { warn "未找到仓库编排文件，无法执行垃圾回收"; return; }
+    info "停止仓库服务并执行垃圾回收..."
+    dc "$REGISTRY_DIR" stop
+    # -d/--delete-untagged 顺带清理没有任何 tag 指向的孤儿 manifest；
+    # env 中的 REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY 等配置会像 serve 一样被
+    # registry 二进制自动读取，不需要额外传参
+    if dc "$REGISTRY_DIR" run --rm registry bin/registry garbage-collect -d /etc/docker/registry/config.yml; then
+        log "垃圾回收完成"
+    else
+        warn "垃圾回收执行失败，请检查日志"
+    fi
+    dc "$REGISTRY_DIR" up -d
+    log "仓库服务已恢复"
+}
+
+cmd_registry_manage() {
+    header "私有镜像仓库管理"
+    [[ -f "$REGISTRY_DIR/.env" ]] || error "尚未部署私有仓库，请先执行菜单「部署私有镜像仓库」"
+
+    local REGISTRY_HOST REG_USER REG_PASS
+    REGISTRY_HOST=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_HOST")
+    REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
+    REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
+    [[ -n "$REGISTRY_HOST" && -n "$REG_USER" ]] || error "仓库配置不完整：${REGISTRY_DIR}/.env"
+
+    _ensure_insecure_registry "$REGISTRY_HOST"
+
+    # 统一带认证的 curl 封装（仓库当前只支持 HTTP，走 WireGuard 内网）
+    _reg_curl() { curl -sf -u "${REG_USER}:${REG_PASS}" "$@"; }
+
+    # ── 查看仓库状态 ──
+    _reg_status() {
+        header "仓库状态"
+        if [[ -f "$REGISTRY_DIR/docker-compose.yml" ]]; then
+            dc "$REGISTRY_DIR" ps
+        else
+            warn "未找到仓库编排文件：${REGISTRY_DIR}/docker-compose.yml"
+        fi
+        echo ""
+        if _reg_curl "http://${REGISTRY_HOST}/v2/" &>/dev/null; then
+            log "仓库 API 可访问：http://${REGISTRY_HOST}/v2/"
+        else
+            warn "仓库 API 无法访问，请检查容器是否运行"
+        fi
+        if [[ -d "$REGISTRY_DIR/data" ]]; then
+            echo -e "  磁盘占用: \e[36m$(du -sh "$REGISTRY_DIR/data" 2>/dev/null | cut -f1)\e[0m"
+        fi
+    }
+
+    # ── 列出所有 repositories，结果存入 _REPO_ARR（cmd_registry_manage 函数
+    #    作用域内的局部数组，靠 bash 动态作用域被下面的嵌套函数共享）──
+    local -a _REPO_ARR=()
+    _reg_load_repos() {
+        local JSON
+        JSON=$(_reg_curl "http://${REGISTRY_HOST}/v2/_catalog?n=1000") || { warn "无法获取仓库列表"; return 1; }
+        local REPOS; REPOS=$(echo "$JSON" | jq -r '.repositories[]?' | sort)
+        [[ -z "$REPOS" ]] && { warn "仓库为空"; return 1; }
+        _REPO_ARR=()
+        while IFS= read -r r; do _REPO_ARR+=("$r"); done <<< "$REPOS"
+        return 0
+    }
+
+    _reg_list_repos() {
+        header "镜像仓库列表"
+        _reg_load_repos || return
+        local i=1
+        for r in "${_REPO_ARR[@]}"; do echo "  ${i}. ${r}"; i=$((i+1)); done
+    }
+
+    # 交互选择一个 repo：优先让用户直接输入，留空则列出全部供选择
+    # 用法: _reg_pick_repo <结果变量名>
+    _reg_pick_repo() {
+        local -n _repo_ref=$1
+        read -rp "镜像仓库名（如 wordpress-实例名，留空列出所有后选择）: " _repo_ref || true
+        [[ -n "$_repo_ref" ]] && return 0
+        _reg_load_repos || return 1
+        local i=1
+        for r in "${_REPO_ARR[@]}"; do echo "  ${i}. ${r}"; i=$((i+1)); done
+        local _idx
+        read -rp "选择编号: " _idx || true
+        [[ "$_idx" =~ ^[0-9]+$ ]] && (( _idx >= 1 )) || { warn "无效编号"; return 1; }
+        _repo_ref="${_REPO_ARR[$((_idx-1))]}"
+        [[ -n "$_repo_ref" ]] || { warn "无效选择"; return 1; }
+    }
+
+    # ── 列出指定镜像的所有标签（含 digest 前 19 位，便于肉眼确认同一镜像）──
+    _reg_list_tags() {
+        header "镜像标签列表"
+        local REPO; _reg_pick_repo REPO || return
+        local JSON; JSON=$(_reg_curl "http://${REGISTRY_HOST}/v2/${REPO}/tags/list") \
+            || { warn "无法获取 ${REPO} 的标签列表"; return; }
+        local TAGS; TAGS=$(echo "$JSON" | jq -r '.tags[]?' | sort -r)
+        [[ -z "$TAGS" ]] && { warn "${REPO} 下无标签"; return; }
+        echo ""
+        echo "镜像: ${REPO}"
+        local i=1 t dg
+        while IFS= read -r t; do
+            dg=$(_reg_get_digest "$REPO" "$t")
+            printf "  %2d. %-28s %s\n" "$i" "$t" "${dg:0:19}"
+            i=$((i+1))
+        done <<< "$TAGS"
+    }
+
+    # ── 删除指定镜像的一个或多个标签 ──
+    _reg_delete_tag() {
+        header "删除镜像标签"
+        local REPO; _reg_pick_repo REPO || return
+        local JSON; JSON=$(_reg_curl "http://${REGISTRY_HOST}/v2/${REPO}/tags/list") \
+            || { warn "无法获取标签列表"; return; }
+        local TAGS; TAGS=$(echo "$JSON" | jq -r '.tags[]?' | sort -r)
+        [[ -z "$TAGS" ]] && { warn "${REPO} 下无标签"; return; }
+
+        # 一次性把所有 tag 的 digest 都取出来，既用于展示编号，
+        # 也用于下面的“共享 digest”安全校验（避免多次重复请求）
+        local -a TAG_ARR=() DG_ARR=()
+        local i=1 t
+        echo ""
+        while IFS= read -r t; do
+            local dg; dg=$(_reg_get_digest "$REPO" "$t")
+            printf "  %2d. %-28s %s\n" "$i" "$t" "${dg:0:19}"
+            TAG_ARR+=("$t"); DG_ARR+=("$dg")
+            i=$((i+1))
+        done <<< "$TAGS"
+
+        read -rp "选择要删除的标签编号（多个用逗号分隔）: " _SEL || true
+        [[ -n "$_SEL" ]] || { info "已取消"; return; }
+
+        local -a DEL_IDX=()
+        IFS=',' read -ra _IDXS <<< "$_SEL"
+        local _idx
+        for _idx in "${_IDXS[@]}"; do
+            _idx="${_idx// /}"
+            if [[ "$_idx" =~ ^[0-9]+$ ]] && (( _idx >= 1 )) && [[ -n "${TAG_ARR[$((_idx-1))]:-}" ]]; then
+                DEL_IDX+=("$((_idx-1))")
+            else
+                warn "忽略无效编号：${_idx}"
+            fi
+        done
+        [[ ${#DEL_IDX[@]} -gt 0 ]] || { warn "未选中任何有效标签"; return; }
+
+        # digest → 标签名 映射，用于检测「多个 tag 指向同一镜像」
+        # （比如 v202601010101 和 latest 是同一次 push 产物，删其一按 digest
+        # 删除会把另一个也一起删掉）
+        local -A DG_TAGS=()
+        for i in "${!TAG_ARR[@]}"; do
+            [[ -n "${DG_ARR[$i]}" ]] && DG_TAGS["${DG_ARR[$i]}"]+="${TAG_ARR[$i]} "
+        done
+
+        echo ""
+        warn "将删除以下标签："
+        local -a DEL_TAGS=()
+        for _idx in "${DEL_IDX[@]}"; do
+            local _t="${TAG_ARR[$_idx]}" _dg="${DG_ARR[$_idx]}"
+            DEL_TAGS+=("$_t")
+            echo "  - ${_t}"
+            local _siblings="${DG_TAGS[$_dg]:-}" _extra=""
+            local _s
+            for _s in $_siblings; do
+                [[ "$_s" == "$_t" ]] && continue
+                [[ " ${DEL_TAGS[*]} " == *" ${_s} "* ]] && continue
+                _extra+="${_s} "
+            done
+            [[ -n "$_extra" ]] && warn "    ⚠ 与标签 [${_extra}] 指向同一镜像，会被一并删除！"
+        done
+
+        read -rp "确认删除？此操作不可恢复 [y/N]: " CONFIRM || true
+        [[ "${CONFIRM,,}" == "y" ]] || { info "已取消"; return; }
+
+        local _fail=0
+        for _idx in "${DEL_IDX[@]}"; do
+            local _t="${TAG_ARR[$_idx]}" _dg="${DG_ARR[$_idx]}"
+            if [[ -z "$_dg" ]]; then
+                warn "  ${_t}: 无法获取 digest，跳过"; _fail=1; continue
+            fi
+            if curl -sf -o /dev/null -u "${REG_USER}:${REG_PASS}" -X DELETE \
+                    "http://${REGISTRY_HOST}/v2/${REPO}/manifests/${_dg}"; then
+                log "  ${_t}: 已删除标记"
+            else
+                warn "  ${_t}: 删除失败"; _fail=1
+            fi
+        done
+        [[ "$_fail" -eq 0 ]] || warn "部分标签删除失败，请检查"
+        info "标记删除不会立即释放磁盘空间，需执行垃圾回收"
+        _reg_run_gc
+    }
+
+    # ── 按保留数量批量清理旧标签（latest 始终跳过）──
+    _reg_prune_tags() {
+        header "批量清理旧标签"
+        local REPO; _reg_pick_repo REPO || return
+        local KEEP
+        read -rp "保留最近几个版本（latest 不计入，始终保留）[默认: 5]: " KEEP || true
+        KEEP="${KEEP:-5}"
+        [[ "$KEEP" =~ ^[0-9]+$ ]] || error "无效数字"
+
+        local JSON; JSON=$(_reg_curl "http://${REGISTRY_HOST}/v2/${REPO}/tags/list") \
+            || { warn "无法获取标签列表"; return; }
+        local TAGS; TAGS=$(echo "$JSON" | jq -r '.tags[]?' | grep -v '^latest$' | sort -r || true)
+        [[ -z "$TAGS" ]] && { warn "${REPO} 下无可清理标签"; return; }
+
+        local -a ALL_ARR OLD_ARR
+        mapfile -t ALL_ARR <<< "$TAGS"
+        if [[ ${#ALL_ARR[@]} -le $KEEP ]]; then
+            info "当前共 ${#ALL_ARR[@]} 个版本，未超过保留数量 ${KEEP}，无需清理"
+            return
+        fi
+        OLD_ARR=("${ALL_ARR[@]:$KEEP}")
+
+        echo ""
+        echo "共 ${#ALL_ARR[@]} 个版本，保留最近 ${KEEP} 个，以下 ${#OLD_ARR[@]} 个将被删除："
+        printf '  - %s\n' "${OLD_ARR[@]}"
+        read -rp "确认删除以上版本？此操作不可恢复 [y/N]: " CONFIRM || true
+        [[ "${CONFIRM,,}" == "y" ]] || { info "已取消"; return; }
+
+        local _latest_dg; _latest_dg=$(_reg_get_digest "$REPO" "latest" 2>/dev/null || true)
+        local _t _dg _fail=0
+        for _t in "${OLD_ARR[@]}"; do
+            _dg=$(_reg_get_digest "$REPO" "$_t")
+            if [[ -z "$_dg" ]]; then warn "  ${_t}: 无法获取 digest，跳过"; _fail=1; continue; fi
+            if [[ -n "$_latest_dg" && "$_dg" == "$_latest_dg" ]]; then
+                warn "  ${_t}: 与 latest 指向同一镜像，为避免误删 latest 已跳过"
+                continue
+            fi
+            if curl -sf -o /dev/null -u "${REG_USER}:${REG_PASS}" -X DELETE \
+                    "http://${REGISTRY_HOST}/v2/${REPO}/manifests/${_dg}"; then
+                log "  ${_t}: 已删除"
+            else
+                warn "  ${_t}: 删除失败"; _fail=1
+            fi
+        done
+        [[ "$_fail" -eq 0 ]] || warn "部分标签删除失败，请检查"
+        info "标记删除不会立即释放磁盘空间，需执行垃圾回收"
+        _reg_run_gc
+    }
+
+    # ── 修改仓库认证密码 ──
+    _reg_change_password() {
+        header "修改仓库认证密码"
+        local NEW_USER NEW_PASS
+        read -rp "用户名 [默认: ${REG_USER}]: " NEW_USER || true
+        NEW_USER="${NEW_USER:-$REG_USER}"
+        read_secret "新密码 [留空随机生成]: " NEW_PASS
+        if [[ -z "$NEW_PASS" ]]; then
+            NEW_PASS=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 20; true)
+            info "已生成随机密码: ${NEW_PASS}"
+        fi
+
+        local HTPASSWD_TMP; HTPASSWD_TMP=$(mktemp)
+        trap 'rm -f "$HTPASSWD_TMP"' RETURN ERR
+        local HTPASSWD_OK=false
+        if command -v htpasswd &>/dev/null; then
+            printf '%s' "$NEW_PASS" | htpasswd -Bin "$NEW_USER" > "$HTPASSWD_TMP" && HTPASSWD_OK=true
+        fi
+        if [[ "$HTPASSWD_OK" != "true" ]]; then
+            if printf '%s' "$NEW_PASS" | docker run --rm -i --entrypoint htpasswd \
+                    httpd:alpine -Bin "$NEW_USER" > "$HTPASSWD_TMP" 2>/dev/null; then
+                HTPASSWD_OK=true
+            fi
+        fi
+        if [[ "$HTPASSWD_OK" != "true" ]] || [[ ! -s "$HTPASSWD_TMP" ]]; then
+            rm -f "$HTPASSWD_TMP"
+            error "无法生成 htpasswd，请安装 apache2-utils 或确保 Docker 可用"
+        fi
+        mv "$HTPASSWD_TMP" "$REGISTRY_DIR/auth/htpasswd"
+        chmod 600 "$REGISTRY_DIR/auth/htpasswd"
+
+        env_set "$REGISTRY_DIR/.env" "REGISTRY_USER" "$NEW_USER"
+        env_set "$REGISTRY_DIR/.env" "REGISTRY_PASS" "$NEW_PASS"
+
+        info "重启仓库服务以应用新密码..."
+        dc "$REGISTRY_DIR" restart || warn "重启失败，请手动执行"
+
+        # 更新当前会话内的凭证，后续菜单操作立即生效
+        REG_USER="$NEW_USER"; REG_PASS="$NEW_PASS"
+        log "密码已更新！"
+        echo -e "  用户名: \e[32m${NEW_USER}\e[0m"
+        echo -e "  密码:   \e[32m${NEW_PASS}\e[0m"
+        warn "仓库若独立部署在其他机器，该机器上的 push/pull_deploy/rollback 会话密码不会自动同步，请手动告知新密码"
+    }
+
+    while true; do
+        echo ""
+        echo -e "  仓库地址: \e[36m${REGISTRY_HOST}\e[0m"
+        echo "  1. 查看仓库状态（容器 + 磁盘占用）"
+        echo "  2. 列出所有镜像仓库"
+        echo "  3. 列出指定镜像的所有标签"
+        echo "  4. 删除指定镜像标签（含垃圾回收）"
+        echo "  5. 批量清理旧标签（保留最近 N 个）"
+        echo "  6. 修改仓库认证密码"
+        echo "  7. 手动执行垃圾回收"
+        echo "  0. 返回主菜单"
+        read -rp "选择: " _RM_CHOICE || true
+        case "$_RM_CHOICE" in
+            1) _reg_status ;;
+            2) _reg_list_repos ;;
+            3) _reg_list_tags ;;
+            4) _reg_delete_tag ;;
+            5) _reg_prune_tags ;;
+            6) _reg_change_password ;;
+            7) _reg_run_gc ;;
+            0) break ;;
+            *) warn "无效输入" ;;
+        esac
+    done
 }
 
 # ════════════════════════════════════════════════════════
@@ -1499,7 +1850,7 @@ cmd_master_init() {
     docker compose -f "$DIR/docker-compose.yml" up -d       || error "容器启动失败"
 
     _setup_plugins "$DIR" "true" "$WP_URL" "$WP_TITLE" "$WP_ADMIN" "$WP_PASS" "$WP_EMAIL" "$WP_LOCALE" \
-        || warn "插件配置未完全成功，可通过菜单 11 重试"
+        || warn "插件配置未完全成功，可通过菜单 12 重试"
 
     log "主节点初始化完成！"
     echo -e "  实例:     \e[36m${INST}\e[0m"
@@ -1512,7 +1863,7 @@ cmd_master_init() {
     echo -e "  \e[36m*/5 * * * * docker exec \$(docker ps -qf name=wordpress) wp --allow-root cron event run --due-now --path=/var/www/html >/dev/null 2>&1\e[0m"
     echo -e "  或使用 crontab -e 添加，建议选主节点执行。"
     echo ""
-    echo -e "  \e[36m在后台完成主题/插件配置后，执行菜单 3（打包推送）分发到工作节点。\e[0m"
+    echo -e "  \e[36m在后台完成主题/插件配置后，执行菜单 4（打包推送）分发到工作节点。\e[0m"
 }
 
 # ════════════════════════════════════════════════════════
@@ -1538,7 +1889,7 @@ cmd_push() {
 
     local CID
     CID=$(docker compose -f "$DIR/docker-compose.yml" --env-file "$DIR/.env" ps -q wordpress 2>/dev/null || true)
-    [[ -n "$CID" ]] || error "wordpress 容器未运行，请先启动主节点（菜单 8）再推送"
+    [[ -n "$CID" ]] || error "wordpress 容器未运行，请先启动主节点（菜单 9）再推送"
 
     local WP_VER
     WP_VER=$(docker exec "$CID" \
@@ -1645,7 +1996,7 @@ cmd_push() {
             "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT" \
             "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" \
             "$P_PAGE_CACHE_ENABLED"
-        warn "主节点容器需重启后 salts 才会生效：菜单 10 → 重启节点"
+        warn "主节点容器需重启后 salts 才会生效：菜单 11 → 重启节点"
     fi
 
     mkdir -p "$BUILD_DIR/conf"
@@ -1678,13 +2029,7 @@ cmd_push() {
     || error "镜像构建失败"
 
     local REG_USER REG_PASS
-    if [[ -f "$REGISTRY_DIR/.env" ]]; then
-        REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
-        REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
-    else
-        read -rp "仓库用户名: " REG_USER || true
-        read_secret "仓库密码: " REG_PASS
-    fi
+    _registry_creds REG_USER REG_PASS
     # 确保本机 Docker 信任私有仓库（仓库机可能独立部署）
     _ensure_insecure_registry "$REGISTRY_HOST"
     docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" \
@@ -1716,7 +2061,7 @@ cmd_push() {
     echo -e "  实例:    \e[36m${INST}\e[0m"
     echo -e "  镜像:    \e[32m${IMAGE_BASE}:${IMAGE_TAG}\e[0m"
     echo -e "  WP 版本: \e[36m${WP_VER}\e[0m"
-    echo -e "  \e[36m工作节点执行菜单 4（拉取部署/更新），选择相同实例名即可。\e[0m"
+    echo -e "  \e[36m工作节点执行菜单 5（拉取部署/更新），选择相同实例名即可。\e[0m"
 
     # 正常结束：主动清理并重置 trap，避免 EXIT trap 泄漏到后续菜单操作
     _push_cleanup
@@ -1846,13 +2191,7 @@ cmd_pull_deploy() {
     DB_PW="${DB_PW:-$(env_get "$DIR/.env" "WORDPRESS_DB_PASSWORD")}"
 
     local REG_USER REG_PASS
-    if [[ -f "$REGISTRY_DIR/.env" ]]; then
-        REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
-        REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
-    else
-        read -rp "仓库用户名: " REG_USER || true
-        read_secret "仓库密码: " REG_PASS
-    fi
+    _registry_creds REG_USER REG_PASS
     # 确保本机 Docker 信任私有仓库
     _ensure_insecure_registry "$REGISTRY_HOST"
     docker login "$REGISTRY_HOST" -u "$REG_USER" --password-stdin <<<"$REG_PASS" \
@@ -1910,7 +2249,7 @@ cmd_pull_deploy() {
             && docker cp "${CID}:/tmp/wp-config-out.php" "$DIR/conf/wp-config.php" \
             && chmod 644 "$DIR/conf/wp-config.php" \
             && log "wp-config.php 已生成并导出至 conf/" \
-            || warn "wp-config.php 生成失败，请手动创建或稍后重试（菜单 11）"
+            || warn "wp-config.php 生成失败，请手动创建或稍后重试（菜单 12）"
         fi
 
         # [fix] 无论生成成功与否，都要把 compose 重写回只读挂载，
@@ -1988,13 +2327,7 @@ cmd_rollback() {
     [[ -n "$REGISTRY_HOST" ]] || error ".env 中缺少 REGISTRY_HOST"
 
     local REG_USER REG_PASS
-    if [[ -f "$REGISTRY_DIR/.env" ]]; then
-        REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
-        REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
-    else
-        read -rp "仓库用户名: " REG_USER || true
-        read_secret "仓库密码: " REG_PASS
-    fi
+    _registry_creds REG_USER REG_PASS
 
     local TAGS_JSON
     TAGS_JSON=$(curl -sf -u "${REG_USER}:${REG_PASS}" \
@@ -2013,7 +2346,9 @@ cmd_rollback() {
     done <<< "$TAGS"
 
     read -rp "选择版本编号: " TAG_IDX || true
-    [[ "$TAG_IDX" =~ ^[0-9]+$ ]] || error "无效编号"
+    # [fix] v7.2: 原来只校验数字格式，输入 "0" 时 TAG_IDX-1 = -1，
+    # bash 数组负下标会取到最后一个元素，被当成合法选择（本该拒绝）
+    [[ "$TAG_IDX" =~ ^[0-9]+$ ]] && (( TAG_IDX >= 1 )) || error "无效编号"
     local SELECTED_TAG="${TAG_ARR[$((TAG_IDX-1))]}"
     [[ -n "$SELECTED_TAG" ]] || error "无效选择"
 
@@ -2674,23 +3009,17 @@ cmd_restore() {
         # [fix] 原来只做 insecure-registry 配置，没有 docker login。
         # 全新节点或登录态过期时，docker compose up 拉取私有镜像会 401 失败。
         local _REG_USER _REG_PASS
-        if [[ -f "$REGISTRY_DIR/.env" ]]; then
-            _REG_USER=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_USER")
-            _REG_PASS=$(env_get "$REGISTRY_DIR/.env" "REGISTRY_PASS")
-        else
-            read -rp "仓库用户名: " _REG_USER || true
-            read_secret "仓库密码: " _REG_PASS
-        fi
+        _registry_creds _REG_USER _REG_PASS
         docker login "$_REGISTRY_HOST" -u "$_REG_USER" --password-stdin <<<"$_REG_PASS" \
         || { warn "仓库登录失败，容器可能无法拉取镜像"; }
         info "重启容器（镜像: ${_REGISTRY_HOST}/wordpress-${_RESTORED_INST}:${_IMAGE_TAG}）..."
         dc "$DIR" up -d --force-recreate 2>/dev/null \
         && log "容器已重启" \
-        || warn "容器重启失败，请手动执行菜单 8（启动节点）"
+        || warn "容器重启失败，请手动执行菜单 9（启动节点）"
         # [fix] v6.7: up -d 期间可能已按需拉取镜像，登录态不再需要，登出缩短凭证残留窗口
         docker logout "$_REGISTRY_HOST" &>/dev/null || true
     else
-        warn "未找到 REGISTRY_HOST，跳过自动重启，请手动执行菜单 8"
+        warn "未找到 REGISTRY_HOST，跳过自动重启，请手动执行菜单 9"
     fi
 
     echo ""
@@ -2789,50 +3118,52 @@ interactive_menu() {
         _c "1;35" "========================================"
         echo -e "  \e[36m── 仓库管理 ──────────────────────────\e[0m"
         echo -e "  \e[32m 1.\e[0m 部署私有镜像仓库"
+        echo -e "  \e[32m 2.\e[0m 镜像仓库管理（状态/标签/清理/改密）"
         echo -e "  \e[36m── 主节点操作 ────────────────────────\e[0m"
-        echo -e "  \e[32m 2.\e[0m 主节点初始化（建站 + 配置插件）"
-        echo -e "  \e[32m 3.\e[0m 打包推送（核心+主题+插件 → 推送仓库）"
+        echo -e "  \e[32m 3.\e[0m 主节点初始化（建站 + 配置插件）"
+        echo -e "  \e[32m 4.\e[0m 打包推送（核心+主题+插件 → 推送仓库）"
         echo -e "  \e[36m── 工作节点操作 ──────────────────────\e[0m"
-        echo -e "  \e[32m 4.\e[0m 拉取部署 / 更新（首次 + 后续统一入口）"
-        echo -e "  \e[33m 5.\e[0m 镜像回滚"
+        echo -e "  \e[32m 5.\e[0m 拉取部署 / 更新（首次 + 后续统一入口）"
+        echo -e "  \e[33m 6.\e[0m 镜像回滚"
         echo -e "  \e[36m── 日常运维 ──────────────────────────\e[0m"
-        echo -e "  \e[32m 6.\e[0m 查看状态（含 WP 版本 + 健康检查地址）"
-        echo -e "  \e[32m 7.\e[0m 查看日志"
-        echo -e "  \e[32m 8.\e[0m 启动节点"
-        echo -e "  \e[32m 9.\e[0m 停止节点"
-        echo -e "  \e[32m10.\e[0m 重启节点"
-        echo -e "  \e[33m11.\e[0m 重试插件配置 / 补装语言包"
-        echo -e "  \e[33m12.\e[0m 手动刷新全层缓存"
-        echo -e "  \e[36m13.\e[0m 节点列表管理"
-        echo -e "  \e[31m14.\e[0m 删除节点（不可恢复）"
-        echo -e "  \e[32m15.\e[0m 备份配置（.env + conf → rsync / S3 / AList）"
-        echo -e "  \e[32m16.\e[0m 还原配置（本地 / rsync / S3 / AList）"
-        echo -e "  \e[32m17.\e[0m 配置 R2 媒体卸载（Advanced Media Offloader）"
-        echo -e "  \e[36m18.\e[0m 脚本自更新（从 GitHub 拉取）"
-        echo -e "  \e[32m19.\e[0m 配置 Redis 全页缓存开关"
+        echo -e "  \e[32m 7.\e[0m 查看状态（含 WP 版本 + 健康检查地址）"
+        echo -e "  \e[32m 8.\e[0m 查看日志"
+        echo -e "  \e[32m 9.\e[0m 启动节点"
+        echo -e "  \e[32m10.\e[0m 停止节点"
+        echo -e "  \e[32m11.\e[0m 重启节点"
+        echo -e "  \e[33m12.\e[0m 重试插件配置 / 补装语言包"
+        echo -e "  \e[33m13.\e[0m 手动刷新全层缓存"
+        echo -e "  \e[36m14.\e[0m 节点列表管理"
+        echo -e "  \e[31m15.\e[0m 删除节点（不可恢复）"
+        echo -e "  \e[32m16.\e[0m 备份配置（.env + conf → rsync / S3 / AList）"
+        echo -e "  \e[32m17.\e[0m 还原配置（本地 / rsync / S3 / AList）"
+        echo -e "  \e[32m18.\e[0m 配置 R2 媒体卸载（Advanced Media Offloader）"
+        echo -e "  \e[36m19.\e[0m 脚本自更新（从 GitHub 拉取）"
+        echo -e "  \e[32m20.\e[0m 配置 Redis 全页缓存开关"
         echo -e "  \e[36m 0.\e[0m 退出"
         echo "----------------------------------------"
         read -rp "选择: " CHOICE || true
         case "$CHOICE" in
             1)  cmd_registry ;;
-            2)  cmd_master_init ;;
-            3)  cmd_push ;;
-            4)  cmd_pull_deploy ;;
-            5)  cmd_rollback ;;
-            6)  cmd_status ;;
-            7)  cmd_logs ;;
-            8)  cmd_start ;;
-            9)  cmd_stop ;;
-            10) cmd_restart ;;
-            11) cmd_retry_plugins ;;
-            12) cmd_flush ;;
-            13) cmd_nodes ;;
-            14) cmd_destroy ;;
-            15) cmd_backup ;;
-            16) cmd_restore ;;
-            17) cmd_setup_r2 ;;
-            18) cmd_self_update ;;
-            19) cmd_setup_pagecache ;;
+            2)  cmd_registry_manage ;;
+            3)  cmd_master_init ;;
+            4)  cmd_push ;;
+            5)  cmd_pull_deploy ;;
+            6)  cmd_rollback ;;
+            7)  cmd_status ;;
+            8)  cmd_logs ;;
+            9)  cmd_start ;;
+            10) cmd_stop ;;
+            11) cmd_restart ;;
+            12) cmd_retry_plugins ;;
+            13) cmd_flush ;;
+            14) cmd_nodes ;;
+            15) cmd_destroy ;;
+            16) cmd_backup ;;
+            17) cmd_restore ;;
+            18) cmd_setup_r2 ;;
+            19) cmd_self_update ;;
+            20) cmd_setup_pagecache ;;
             0)  info "再见！"; exit 0 ;;
             *)  warn "无效输入" ;;
         esac
