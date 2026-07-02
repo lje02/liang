@@ -25,7 +25,7 @@ export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
 
 # 脚本版本与自身路径（用于自更新）
-SCRIPT_VERSION="7.3"
+SCRIPT_VERSION="7.3.1"
 SCRIPT_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SCRIPT_GITHUB_RAW="${SCRIPT_GITHUB_RAW:-https://raw.githubusercontent.com/lje02/liang/main/wp-deploy.sh}"
 
