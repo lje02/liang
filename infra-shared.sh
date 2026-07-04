@@ -15,13 +15,8 @@
 #   ./infra-shared.sh restore [DIR] <备份tar.gz[.enc]|rsync://user@host[:port]/path/file|alist:///path/file> [解密密钥]  # 全量恢复（可用于机器重装后整体拉起；加密备份留空密钥会交互询问）
 #   ./infra-shared.sh tune-db    [DIR]               # 查看/调整 MariaDB 性能参数
 #   ./infra-shared.sh tune-redis [DIR]               # 查看/调整 Redis 性能参数
-#   ./infra-shared.sh rsync-push   [DIR] [LOCAL_DIR]   # 推送备份到远端
-#   ./infra-shared.sh rsync-pull   [DIR] [LOCAL_DEST]  # 拉取远端备份到本地
-#   ./infra-shared.sh rsync-config [DIR]               # 配置/查看远端 rsync 参数
-#   ./infra-shared.sh alist-push   [DIR] [LOCAL_DIR]   # 上传备份到 AList 网盘
-#   ./infra-shared.sh alist-pull   [DIR] [LOCAL_DEST]  # 从 AList 网盘下载备份
-#   ./infra-shared.sh alist-list   [DIR] [REMOTE_PATH] # 列出 AList 网盘备份文件
-#   ./infra-shared.sh alist-config [DIR]               # 配置/测试 AList 连接
+#   ./infra-shared.sh rsync-config [DIR]               # 配置/查看远端 rsync 参数（backup --rsync / restore rsync://... 会用到）
+#   ./infra-shared.sh alist-config [DIR]               # 配置/测试 AList 连接（backup --alist / restore alist:///... 会用到）
 #   ./infra-shared.sh status  [DIR]
 #   ./infra-shared.sh start   [DIR] [db|redis]
 #   ./infra-shared.sh stop    [DIR] [db|redis]
@@ -960,24 +955,6 @@ cmd_rsync_config() {
     fi
 }
 
-# rsync-push [DIR] [LOCAL_DIR]
-cmd_rsync_push() {
-    local dir="${1:-$DEFAULT_DIR}" local_dir="${2:-${1:-$DEFAULT_DIR}/backup}"
-    [[ -d "$local_dir" ]] || error "本地目录不存在: ${local_dir}"
-    load_env "$dir"
-    header "推送备份 → 远端"
-    _rsync_push "$dir" "${local_dir%/}/" ""
-}
-
-# rsync-pull [DIR] [LOCAL_DEST]
-cmd_rsync_pull() {
-    local dir="${1:-$DEFAULT_DIR}" local_dest="${2:-${1:-$DEFAULT_DIR}/backup/remote}"
-    load_env "$dir"
-    header "拉取远端备份 → ${local_dest}"
-    _load_rsync_conf "$dir"
-    _rsync_pull "$dir" "${RSYNC_REMOTE_DIR%/}/" "$local_dest"
-    log "文件已拉取到: ${local_dest}"
-}
 
 # ════════════════════════════════════════════════════════════
 # AList 网盘工具函数
@@ -1351,30 +1328,6 @@ cmd_alist_config() {
             ;;
         esac
     fi
-}
-
-# alist-push [DIR] [LOCAL_DIR]
-cmd_alist_push() {
-    local dir="${1:-$DEFAULT_DIR}" local_dir="${2:-${1:-$DEFAULT_DIR}/backup}"
-    [[ -d "$local_dir" ]] || error "本地目录不存在: ${local_dir}"
-    header "上传备份到 AList 网盘"
-    _alist_push "$dir" "$local_dir"
-}
-
-# alist-pull [DIR] [LOCAL_DEST]
-cmd_alist_pull() {
-    local dir="${1:-$DEFAULT_DIR}" local_dest="${2:-${1:-$DEFAULT_DIR}/backup/alist}"
-    header "从 AList 网盘下载备份 → ${local_dest}"
-    _alist_pull "$dir" "$local_dest"
-    log "文件已下载到: ${local_dest}"
-}
-
-# alist-list [DIR] [REMOTE_PATH]
-cmd_alist_list() {
-    local dir="${1:-$DEFAULT_DIR}" remote_path="${2:-}"
-    load_env "$dir"
-    header "AList 网盘备份文件列表"
-    _alist_list "$dir" "$remote_path"
 }
 
 
@@ -2031,40 +1984,18 @@ menu_bk() {
         echo "  说明：全量备份 = .env+配置+MariaDB全库(含用户权限)+Redis数据，打包为单个 tar.gz"
         echo "        备份时可选加密（生成 .tar.gz.enc），远端/网盘被攻破也只是密文，密钥务必额外保存"
         echo "        文件可直接拷走；机器重装后用「全量恢复」一步整体拉起。"
-        echo "  ─── 本地 ────────────────────────────────────"
-        echo "  1) 全量备份（本地）"
-        echo "  2) 全量恢复（本地文件）"
-        echo "  ─── 远端 rsync ──────────────────────────────"
-        echo "  3) 全量备份并推送到 rsync 远端"
-        echo "  4) 推送现有备份到 rsync 远端"
-        echo "  5) 从 rsync 远端拉取备份文件"
-        echo "  6) 从 rsync 远端文件直接全量恢复"
-        echo "  7) 配置 / 测试 rsync 远端"
-        echo "  ─── AList 网盘 ──────────────────────────────"
-        echo "  8) 全量备份并上传到 AList 网盘"
-        echo "  9) 上传现有备份到 AList 网盘"
-        echo "  a) 从 AList 网盘下载备份"
-        echo "  b) 从 AList 网盘直接全量恢复"
-        echo "  c) 列出 AList 网盘备份文件"
-        echo "  d) 配置 / 测试 AList 连接"
+        echo "  ─────────────────────────────────────────────"
+        echo "  1) 全量备份"
+        echo "  2) 全量恢复"
+        echo "  3) 远端配置（rsync / AList，仅推送/拉取备份时需要）"
         echo "  ─────────────────────────────────────────────"
         echo "  0) 返回"
         echo
-        read -rp "  请选择 [0-9/a-d]: " CH
+        read -rp "  请选择 [0-3]: " CH
         case "$CH" in
-            1) menu_bk_backup         ;;
-            2) menu_bk_restore        ;;
-            3) menu_bk_backup_rsync   ;;
-            4) menu_bk_push           ;;
-            5) menu_bk_pull           ;;
-            6) menu_bk_restore_remote ;;
-            7) menu_bk_rsync_config   ;;
-            8) menu_bk_backup_alist   ;;
-            9) menu_bk_alist_push     ;;
-            a|A) menu_bk_alist_pull   ;;
-            b|B) menu_bk_alist_restore;;
-            c|C) menu_bk_alist_list   ;;
-            d|D) menu_bk_alist_config ;;
+            1) menu_bk_backup        ;;
+            2) menu_bk_restore       ;;
+            3) menu_bk_remote_config ;;
             0) return ;;
             *) warn "无效选项"; sleep 1 ;;
         esac
@@ -2072,105 +2003,92 @@ menu_bk() {
 }
 
 menu_bk_backup() {
-    _db_menu_head "全量备份（本地）"
-    _ask "输出目录" DEST "${DIR}/backup"
+    _db_menu_head "全量备份"
+    echo "  保存位置？"
+    echo "  1) 仅本地"
+    echo "  2) 本地 + 推送到 rsync 远端"
+    echo "  3) 本地 + 上传到 AList 网盘"
+    read -rp "  请选择 [1-3，默认 1]: " LOC_CH
+    local _flags=()
+    case "$LOC_CH" in
+        2) load_env "$DIR"
+           if [[ -z "${RSYNC_REMOTE:-}" ]]; then
+               warn "尚未配置 rsync 远端，先去配置一下"; menu_bk_remote_config_rsync
+               load_env "$DIR"; [[ -z "${RSYNC_REMOTE:-}" ]] && { warn "未完成配置，本次改为仅本地备份"; }
+           fi
+           [[ -n "${RSYNC_REMOTE:-}" ]] && _flags+=("--rsync") ;;
+        3) load_env "$DIR"
+           if [[ -z "${ALIST_URL:-}" && -z "${ALIST_MOUNT:-}" ]]; then
+               warn "尚未配置 AList 网盘，先去配置一下"; menu_bk_remote_config_alist
+               load_env "$DIR"
+               [[ -z "${ALIST_URL:-}" && -z "${ALIST_MOUNT:-}" ]] && { warn "未完成配置，本次改为仅本地备份"; }
+           fi
+           [[ -n "${ALIST_URL:-}" || -n "${ALIST_MOUNT:-}" ]] && _flags+=("--alist") ;;
+        *) : ;;  # 仅本地
+    esac
+    _ask "本地输出目录" DEST "${DIR}/backup"
     read -rp "  是否加密备份归档？[y/N]（推荐；密钥请务必额外保存） " ENC_YN; echo
-    local _flags=(); [[ "${ENC_YN,,}" == "y" ]] && _flags+=("--encrypt")
+    [[ "${ENC_YN,,}" == "y" ]] && _flags+=("--encrypt")
     _menu_run cmd_backup "$DIR" "$DEST" "${_flags[@]}" || true; _pause
 }
 
 menu_bk_restore() {
-    _db_menu_head "全量恢复（本地文件）"
+    _db_menu_head "全量恢复"
     info "支持机器重装后的场景：DIR 可以是全新目录，将从备份归档重建全部配置和数据"
-    _ask "全量备份文件（infra-full-backup_*.tar.gz 或 .tar.gz.enc）" BK_FILE ""
+    echo "  备份来源？"
+    echo "  1) 本地文件"
+    echo "  2) rsync 远端"
+    echo "  3) AList 网盘"
+    read -rp "  请选择 [1-3，默认 1]: " SRC_CH
+    local BK_FILE=""
+    case "$SRC_CH" in
+        2)
+            load_env "$DIR" 2>/dev/null || true
+            info "正在列出 rsync 远端目录..."
+            ( _load_rsync_conf "$DIR" 2>/dev/null && _rsync_list "$DIR" 2>/dev/null ) \
+                || warn "无法列出远端文件（请确认已在「远端配置」里配置过 rsync）"
+            echo
+            _ask "远端文件路径（rsync://user@host[:port]/path/infra-full-backup_*.tar.gz[.enc]）" BK_FILE ""
+            ;;
+        3)
+            load_env "$DIR" 2>/dev/null || true
+            info "正在列出 AList 网盘目录..."
+            ( _alist_list "$DIR" 2>/dev/null ) \
+                || warn "无法列出网盘文件（请确认已在「远端配置」里配置过 AList）"
+            echo
+            echo "  输入格式: alist:///AList内部路径/文件名.tar.gz"
+            _ask "AList 文件路径（alist:///...）" BK_FILE ""
+            ;;
+        *)
+            _ask "全量备份文件（infra-full-backup_*.tar.gz 或 .tar.gz.enc）" BK_FILE ""
+            ;;
+    esac
     [[ -n "$BK_FILE" ]] || { warn "不能为空"; _pause; return; }
     echo; _menu_run cmd_restore "$DIR" "$BK_FILE" || true; _pause
 }
 
-menu_bk_backup_rsync() {
-    _db_menu_head "全量备份并推送到远端"
-    _ask "本地输出目录" DEST "${DIR}/backup"
-    read -rp "  是否加密备份归档？[y/N]（推荐；远端一旦被攻破也只是密文；密钥请务必额外保存） " ENC_YN; echo
-    local _flags=("--rsync"); [[ "${ENC_YN,,}" == "y" ]] && _flags+=("--encrypt")
-    _menu_run cmd_backup "$DIR" "$DEST" "${_flags[@]}" || true; _pause
-}
-
-menu_bk_push() {
-    _db_menu_head "推送现有备份目录到远端"
-    _ask "本地备份目录" LOCAL_DIR "${DIR}/backup"; echo
-    _menu_run cmd_rsync_push "$DIR" "$LOCAL_DIR" || true; _pause
-}
-
-menu_bk_pull() {
-    _db_menu_head "从远端拉取备份文件到本地"
-    _ask "本地存放目录" LOCAL_DEST "${DIR}/backup/remote"; echo
-    _menu_run cmd_rsync_pull "$DIR" "$LOCAL_DEST" || true; _pause
-}
-
-menu_bk_restore_remote() {
-    _db_menu_head "从远端文件直接全量恢复"
-    info "支持机器重装后的场景：DIR 可以是全新目录"
-    # 先列出远端文件供参考
-    info "正在列出远端备份目录..."
-    load_env "$DIR" 2>/dev/null || true
-    (
-        _load_rsync_conf "$DIR" 2>/dev/null \
-        && _rsync_list "$DIR" 2>/dev/null
-    ) || warn "无法列出远端文件（请确认 rsync 已配置）"
+# ── 远端配置：rsync / AList 二选一进入对应的配置向导 ─────────
+menu_bk_remote_config() {
+    _mhdr; _c "1;33" "  ▶ 远端配置"; echo
+    echo "  1) 配置 / 测试 rsync 远端"
+    echo "  2) 配置 / 测试 AList 网盘"
+    echo "  0) 返回"
     echo
-    _ask "远端文件路径（rsync://user@host[:port]/path/infra-full-backup_*.tar.gz）" REMOTE_FILE ""
-    [[ -n "$REMOTE_FILE" ]] || { warn "不能为空"; _pause; return; }
-    echo; _menu_run cmd_restore "$DIR" "$REMOTE_FILE" || true; _pause
+    read -rp "  请选择 [0-2]: " CH
+    case "$CH" in
+        1) menu_bk_remote_config_rsync ;;
+        2) menu_bk_remote_config_alist ;;
+        0) return ;;
+        *) warn "无效选项"; sleep 1 ;;
+    esac
 }
 
-menu_bk_rsync_config() {
+menu_bk_remote_config_rsync() {
     _db_menu_head "配置 rsync 远端"
     _menu_run cmd_rsync_config "$DIR" || true; _pause
 }
 
-# ── AList 菜单函数 ────────────────────────────────────────────
-menu_bk_backup_alist() {
-    _db_menu_head "全量备份并上传到 AList 网盘"
-    _ask "本地临时目录" DEST "${DIR}/backup"
-    read -rp "  是否加密备份归档？[y/N]（推荐；网盘账号一旦泄露也只是密文；密钥请务必额外保存） " ENC_YN; echo
-    local _flags=("--alist"); [[ "${ENC_YN,,}" == "y" ]] && _flags+=("--encrypt")
-    _menu_run cmd_backup "$DIR" "$DEST" "${_flags[@]}" || true; _pause
-}
-
-menu_bk_alist_push() {
-    _db_menu_head "上传现有备份目录到 AList 网盘"
-    _ask "本地备份目录" LOCAL_DIR "${DIR}/backup"; echo
-    _menu_run cmd_alist_push "$DIR" "$LOCAL_DIR" || true; _pause
-}
-
-menu_bk_alist_pull() {
-    _db_menu_head "从 AList 网盘下载备份文件到本地"
-    _ask "本地存放目录" LOCAL_DEST "${DIR}/backup/alist"; echo
-    _menu_run cmd_alist_pull "$DIR" "$LOCAL_DEST" || true; _pause
-}
-
-menu_bk_alist_restore() {
-    _db_menu_head "从 AList 网盘直接全量恢复"
-    info "支持机器重装后的场景：DIR 可以是全新目录"
-    # 先列出网盘上的文件供参考
-    info "正在列出 AList 网盘备份目录..."
-    load_env "$DIR" 2>/dev/null || true
-    ( _alist_list "$DIR" 2>/dev/null ) || warn "无法列出 AList 文件（请先完成 alist-config）"
-    echo
-    echo "  输入格式: alist:///AList内部路径/文件名.tar.gz"
-    echo "  示例:     alist:///onedrive/backup/infra/infra-full-backup_20250101_120000.tar.gz"
-    _ask "AList 文件路径（alist:///...）" ALIST_FILE ""
-    [[ -n "$ALIST_FILE" ]] || { warn "不能为空"; _pause; return; }
-    echo; _menu_run cmd_restore "$DIR" "$ALIST_FILE" || true; _pause
-}
-
-menu_bk_alist_list() {
-    _db_menu_head "列出 AList 网盘备份文件"
-    _ask "AList 内部路径（留空用默认）" ALIST_PATH ""; echo
-    _menu_run cmd_alist_list "$DIR" ${ALIST_PATH:+"$ALIST_PATH"} || true; _pause
-}
-
-menu_bk_alist_config() {
+menu_bk_remote_config_alist() {
     _db_menu_head "配置 AList 连接"
     _menu_run cmd_alist_config "$DIR" || true; _pause
 }
@@ -2222,12 +2140,7 @@ main() {
         restore)      cmd_restore      "$@" ;;
         tune-db)      cmd_tune_db      "$@" ;;
         tune-redis)   cmd_tune_redis   "$@" ;;
-        rsync-push)   cmd_rsync_push   "$@" ;;
-        rsync-pull)   cmd_rsync_pull   "$@" ;;
         rsync-config) cmd_rsync_config "$@" ;;
-        alist-push)   cmd_alist_push   "$@" ;;
-        alist-pull)   cmd_alist_pull   "$@" ;;
-        alist-list)   cmd_alist_list   "$@" ;;
         alist-config) cmd_alist_config "$@" ;;
         status)    cmd_status   "$@" ;;
         start)     cmd_start    "$@" ;;
