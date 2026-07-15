@@ -673,9 +673,14 @@ CONF
 #   - 新增 PAGE_CACHE_ENABLED，字面量烘焙、主/工作节点都传（不像 R2 凭证那样
 #     只在主节点传），确保全节点开关一致
 # v6.9: 移除 Multisite 相关参数
+# v7.6: 新增自建 S3 兼容对象存储（MinIO / OVHcloud / Scaleway 等）参数支持，
+#       与 R2 一样字面量烘焙进 wp-config-extra.php，二者可同时配置，
+#       实际生效哪一个由 wp-admin 的 Media Offloader 后台 Provider 选择决定
 # 参数: $1=DEST $2=NODE_ROLE $3...$10=8个 salt 值
 #       $11=R2_KEY $12=R2_SECRET $13=R2_BUCKET $14=R2_DOMAIN $15=R2_ENDPOINT
 #       $16=PAGE_CACHE_ENABLED(true|false)
+#       $17=MINIO_KEY $18=MINIO_SECRET $19=MINIO_BUCKET $20=MINIO_DOMAIN
+#       $21=MINIO_ENDPOINT $22=MINIO_PATH_STYLE(true|false) $23=MINIO_REGION
 _write_wp_config_extra() {
     local DEST="$1"
     local NODE_ROLE="${2:-worker}"
@@ -694,6 +699,14 @@ _write_wp_config_extra() {
     local R2_ENDPOINT="${15:-}"
     local PAGE_CACHE_ENABLED="${16:-false}"
     [[ "$PAGE_CACHE_ENABLED" == "true" ]] || PAGE_CACHE_ENABLED="false"
+    local MINIO_KEY="${17:-}"
+    local MINIO_SECRET="${18:-}"
+    local MINIO_BUCKET="${19:-}"
+    local MINIO_DOMAIN="${20:-}"
+    local MINIO_ENDPOINT="${21:-}"
+    local MINIO_PATH_STYLE="${22:-false}"
+    [[ "$MINIO_PATH_STYLE" == "true" ]] || MINIO_PATH_STYLE="false"
+    local MINIO_REGION="${23:-}"
 
     # 如果没有传入 salts（如老的调用路径），生成临时值并告警
     if [[ -z "$AUTH_KEY" ]]; then
@@ -797,8 +810,23 @@ PHP_BODY
             printf "define('ADVMO_CLOUDFLARE_R2_DOMAIN',   '%s');\n" "${R2_DOMAIN//\'/\\\'}"
             printf "define('ADVMO_CLOUDFLARE_R2_ENDPOINT', '%s');\n" "${R2_ENDPOINT//\'/\\\'}"
         fi
+
+        # v7.6: Advanced Media Offloader - 自建 S3 兼容对象存储（MinIO Provider）
+        # 适用于 MinIO / OVHcloud / Scaleway / Vultr / IBM COS 等任何兼容 S3 API 的自建桶
+        if [[ -n "$MINIO_KEY" ]]; then
+            printf '\n// Advanced Media Offloader - 自建 S3 兼容对象存储（MinIO）\n'
+            printf "define('ADVMO_MINIO_KEY',      '%s');\n" "${MINIO_KEY//\'/\\\'}"
+            printf "define('ADVMO_MINIO_SECRET',   '%s');\n" "${MINIO_SECRET//\'/\\\'}"
+            printf "define('ADVMO_MINIO_BUCKET',   '%s');\n" "${MINIO_BUCKET//\'/\\\'}"
+            printf "define('ADVMO_MINIO_DOMAIN',   '%s');\n" "${MINIO_DOMAIN//\'/\\\'}"
+            printf "define('ADVMO_MINIO_ENDPOINT', '%s');\n" "${MINIO_ENDPOINT//\'/\\\'}"
+            printf "define('ADVMO_MINIO_PATH_STYLE_ENDPOINT', %s);\n" "$MINIO_PATH_STYLE"
+            if [[ -n "$MINIO_REGION" ]]; then
+                printf "define('ADVMO_MINIO_REGION', '%s');\n" "${MINIO_REGION//\'/\\\'}"
+            fi
+        fi
     } > "$DEST"
-    # [fix] v6.7: 此文件含 8 个 WP salts + 主节点的 R2 Secret Access Key，
+    # [fix] v6.7: 此文件含 8 个 WP salts + 主节点的 R2 / 自建 S3 兼容桶 Secret Access Key，
     # 默认 umask 下落盘后是明文可被本机其他用户读取，写完立即收紧权限。
     # [fix] v6.8: 600 会导致容器内 www-data 无法读取该 bind-mount 文件
     # （require_once 报 Permission denied），改为 644。
@@ -1931,11 +1959,22 @@ cmd_master_init() {
     R2_BUCKET=$(env_get "$DIR/.env" "R2_BUCKET" 2>/dev/null || true)
     R2_DOMAIN=$(env_get "$DIR/.env" "R2_DOMAIN" 2>/dev/null || true)
     R2_ENDPOINT=$(env_get "$DIR/.env" "R2_ENDPOINT" 2>/dev/null || true)
+    # v7.6: 自建 S3 兼容对象存储（MinIO）凭证，同 R2 一样从 .env 读取
+    local MINIO_KEY MINIO_SECRET MINIO_BUCKET MINIO_DOMAIN MINIO_ENDPOINT MINIO_PATH_STYLE MINIO_REGION
+    MINIO_KEY=$(env_get "$DIR/.env" "MINIO_ACCESS_KEY" 2>/dev/null || true)
+    MINIO_SECRET=$(env_get "$DIR/.env" "MINIO_SECRET_KEY" 2>/dev/null || true)
+    MINIO_BUCKET=$(env_get "$DIR/.env" "MINIO_BUCKET" 2>/dev/null || true)
+    MINIO_DOMAIN=$(env_get "$DIR/.env" "MINIO_DOMAIN" 2>/dev/null || true)
+    MINIO_ENDPOINT=$(env_get "$DIR/.env" "MINIO_ENDPOINT" 2>/dev/null || true)
+    MINIO_PATH_STYLE=$(env_get "$DIR/.env" "MINIO_PATH_STYLE" 2>/dev/null || true)
+    MINIO_REGION=$(env_get "$DIR/.env" "MINIO_REGION" 2>/dev/null || true)
     _write_wp_config_extra    "$DIR/conf/wp-config-extra.php" "master" \
         "$S_AUTH_KEY" "$S_SECURE_AUTH_KEY" "$S_LOGGED_IN_KEY" "$S_NONCE_KEY" \
         "$S_AUTH_SALT" "$S_SECURE_AUTH_SALT" "$S_LOGGED_IN_SALT" "$S_NONCE_SALT" \
         "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" \
-        "$WP_PAGE_CACHE_ENABLED"
+        "$WP_PAGE_CACHE_ENABLED" \
+        "$MINIO_KEY" "$MINIO_SECRET" "$MINIO_BUCKET" "$MINIO_DOMAIN" "$MINIO_ENDPOINT" \
+        "$MINIO_PATH_STYLE" "$MINIO_REGION"
     _write_init_dockerfile    "$DIR"
     _write_entrypoint_script  "$DIR/entrypoint.sh"
     _write_init_compose       "$DIR" "$INST"
@@ -2066,6 +2105,15 @@ cmd_push() {
     R2_BUCKET=$(env_get "$DIR/.env" "R2_BUCKET" 2>/dev/null || true)
     R2_DOMAIN=$(env_get "$DIR/.env" "R2_DOMAIN" 2>/dev/null || true)
     R2_ENDPOINT=$(env_get "$DIR/.env" "R2_ENDPOINT" 2>/dev/null || true)
+    # v7.6: 自建 S3 兼容对象存储（MinIO）凭证，同 R2 一样统一在分支外读取一次
+    local MINIO_KEY MINIO_SECRET MINIO_BUCKET MINIO_DOMAIN MINIO_ENDPOINT MINIO_PATH_STYLE MINIO_REGION
+    MINIO_KEY=$(env_get "$DIR/.env" "MINIO_ACCESS_KEY" 2>/dev/null || true)
+    MINIO_SECRET=$(env_get "$DIR/.env" "MINIO_SECRET_KEY" 2>/dev/null || true)
+    MINIO_BUCKET=$(env_get "$DIR/.env" "MINIO_BUCKET" 2>/dev/null || true)
+    MINIO_DOMAIN=$(env_get "$DIR/.env" "MINIO_DOMAIN" 2>/dev/null || true)
+    MINIO_ENDPOINT=$(env_get "$DIR/.env" "MINIO_ENDPOINT" 2>/dev/null || true)
+    MINIO_PATH_STYLE=$(env_get "$DIR/.env" "MINIO_PATH_STYLE" 2>/dev/null || true)
+    MINIO_REGION=$(env_get "$DIR/.env" "MINIO_REGION" 2>/dev/null || true)
 
     if [[ -z "$P_AUTH_KEY" ]]; then
         warn ".env 中未找到 Salts（旧版部署？），将生成新 Salts 并写回 .env"
@@ -2095,7 +2143,9 @@ cmd_push() {
             "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
             "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT" \
             "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" \
-            "$P_PAGE_CACHE_ENABLED"
+            "$P_PAGE_CACHE_ENABLED" \
+            "$MINIO_KEY" "$MINIO_SECRET" "$MINIO_BUCKET" "$MINIO_DOMAIN" "$MINIO_ENDPOINT" \
+            "$MINIO_PATH_STYLE" "$MINIO_REGION"
         warn "主节点容器需重启后 salts 才会生效：菜单 11 → 重启节点"
     fi
 
@@ -2115,11 +2165,14 @@ cmd_push() {
     # 与主节点一样字面量烘焙相同的 R2 凭证进镜像。worker 仍不进 wp-admin、
     # 不跑 Test Connection，但插件运行时的上传/卸载逻辑需要这几个 ADVMO_* 常量。
     # v6.6: 页面缓存开关（末位参数）主/工作节点都传，全节点开关必须一致
+    # v7.6: 自建 S3 兼容对象存储（MinIO）凭证与 R2 一样字面量烘焙进 worker 镜像
     _write_wp_config_extra   "$BUILD_DIR/conf/wp-config-extra.php" "worker" \
         "$P_AUTH_KEY" "$P_SECURE_AUTH_KEY" "$P_LOGGED_IN_KEY" "$P_NONCE_KEY" \
         "$P_AUTH_SALT" "$P_SECURE_AUTH_SALT" "$P_LOGGED_IN_SALT" "$P_NONCE_SALT" \
         "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" \
-        "$P_PAGE_CACHE_ENABLED"
+        "$P_PAGE_CACHE_ENABLED" \
+        "$MINIO_KEY" "$MINIO_SECRET" "$MINIO_BUCKET" "$MINIO_DOMAIN" "$MINIO_ENDPOINT" \
+        "$MINIO_PATH_STYLE" "$MINIO_REGION"
     _write_entrypoint_script "$BUILD_DIR/entrypoint.sh"
     _write_master_dockerfile "$BUILD_DIR"
 
@@ -2606,9 +2659,19 @@ cmd_setup_r2() {
     AS=$(env_get "$DIR/.env" "WP_AUTH_SALT");       SS=$(env_get "$DIR/.env" "WP_SECURE_AUTH_SALT")
     LS=$(env_get "$DIR/.env" "WP_LOGGED_IN_SALT");  NS=$(env_get "$DIR/.env" "WP_NONCE_SALT")
     PC=$(env_get "$DIR/.env" "PAGE_CACHE_ENABLED" 2>/dev/null || true); [[ "$PC" == "true" ]] || PC="false"
+    # v7.6: 补读已有的自建 S3 兼容对象存储（MinIO）凭证，避免只配置 R2 时把它冲掉
+    local MK MS MB MD ME MP MR
+    MK=$(env_get "$DIR/.env" "MINIO_ACCESS_KEY" 2>/dev/null || true)
+    MS=$(env_get "$DIR/.env" "MINIO_SECRET_KEY" 2>/dev/null || true)
+    MB=$(env_get "$DIR/.env" "MINIO_BUCKET" 2>/dev/null || true)
+    MD=$(env_get "$DIR/.env" "MINIO_DOMAIN" 2>/dev/null || true)
+    ME=$(env_get "$DIR/.env" "MINIO_ENDPOINT" 2>/dev/null || true)
+    MP=$(env_get "$DIR/.env" "MINIO_PATH_STYLE" 2>/dev/null || true)
+    MR=$(env_get "$DIR/.env" "MINIO_REGION" 2>/dev/null || true)
     _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master" \
         "$AK" "$SK" "$LK" "$NK" "$AS" "$SS" "$LS" "$NS" \
-        "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" "$PC"
+        "$R2_KEY" "$R2_SECRET" "$R2_BUCKET" "$R2_DOMAIN" "$R2_ENDPOINT" "$PC" \
+        "$MK" "$MS" "$MB" "$MD" "$ME" "$MP" "$MR"
     log "wp-config-extra.php 已刷新（R2 常量已写入，salts 与页面缓存开关保持不变）"
     info "提示: 以上只更新了主节点本机。worker 节点的 R2 凭证是构建镜像时随镜像烘焙下发的，"
     info "      需要重新执行\"构建并推送镜像\"+\"worker 节点拉取部署\"，worker 才能拿到新凭证。"
@@ -2619,6 +2682,102 @@ cmd_setup_r2() {
         if [[ "${_R2_APPLY,,}" == "y" ]]; then
             dc "$DIR" restart wordpress \
                 && log "容器已重启，请到 Media Offloader 后台选择 Cloudflare R2 并 Test Connection" \
+                || warn "容器重启失败，请手动执行 docker compose restart wordpress"
+        else
+            info "记得稍后执行菜单重启容器，或手动 docker compose restart wordpress 使配置生效"
+        fi
+    else
+        info "节点未运行，下次启动时会自动加载该配置"
+    fi
+}
+
+# v7.6: 自建 S3 兼容对象存储（MinIO / OVHcloud / Scaleway / Vultr / IBM COS 等）
+# 与 cmd_setup_r2 结构一致，写入独立的 MINIO_* .env 键，
+# 对应 Advanced Media Offloader 的 MinIO Provider（ADVMO_MINIO_* 常量）
+cmd_setup_minio() {
+    local DIR INST; _resolve_instance DIR INST
+    [[ -f "$DIR/.env" ]] || error "未找到 .env，请先完成节点初始化"
+
+    local _ROLE; _ROLE=$(env_get "$DIR/.env" "NODE_ROLE" 2>/dev/null || true)
+    _ROLE="${_ROLE:-master}"
+    if [[ "$_ROLE" != "master" ]]; then
+        error "自建桶凭证只能在主节点配置（当前节点角色: ${_ROLE}）。Media Offloader 后台只有主节点能访问。"
+    fi
+
+    info "--- Advanced Media Offloader · 自建 S3 兼容对象存储（MinIO Provider） ---"
+    info "  适用于 MinIO / OVHcloud / Scaleway / Vultr / IBM COS 等任何兼容 S3 API 的自建桶"
+    local _CUR_KEY _CUR_BUCKET _CUR_DOMAIN _CUR_ENDPOINT _CUR_PATH_STYLE _CUR_REGION
+    _CUR_KEY=$(env_get "$DIR/.env" "MINIO_ACCESS_KEY" 2>/dev/null || true)
+    _CUR_BUCKET=$(env_get "$DIR/.env" "MINIO_BUCKET" 2>/dev/null || true)
+    _CUR_DOMAIN=$(env_get "$DIR/.env" "MINIO_DOMAIN" 2>/dev/null || true)
+    _CUR_ENDPOINT=$(env_get "$DIR/.env" "MINIO_ENDPOINT" 2>/dev/null || true)
+    _CUR_PATH_STYLE=$(env_get "$DIR/.env" "MINIO_PATH_STYLE" 2>/dev/null || true)
+    _CUR_REGION=$(env_get "$DIR/.env" "MINIO_REGION" 2>/dev/null || true)
+    [[ -n "$_CUR_KEY" ]] && info "  当前已配置（留空回车保留原值）"
+
+    local MINIO_KEY MINIO_SECRET MINIO_BUCKET MINIO_DOMAIN MINIO_ENDPOINT MINIO_PATH_STYLE MINIO_REGION
+    read -rp "Access Key Id [${_CUR_KEY:+已设置}]: " MINIO_KEY || true
+    MINIO_KEY="${MINIO_KEY:-$_CUR_KEY}"
+    [[ -n "$MINIO_KEY" ]] || error "Access Key 不能为空"
+    read_secret "Secret Access Key（留空保留原值）: " MINIO_SECRET
+    [[ -n "$MINIO_SECRET" ]] || MINIO_SECRET=$(env_get "$DIR/.env" "MINIO_SECRET_KEY" 2>/dev/null || true)
+    [[ -n "$MINIO_SECRET" ]] || error "Secret Key 不能为空"
+    read -rp "Bucket 名称 [${_CUR_BUCKET}]: " MINIO_BUCKET || true
+    MINIO_BUCKET="${MINIO_BUCKET:-$_CUR_BUCKET}"
+    [[ -n "$MINIO_BUCKET" ]] || error "Bucket 不能为空"
+    read -rp "Endpoint（完整 https://your-minio-host:port，S3 API 地址）[${_CUR_ENDPOINT}]: " MINIO_ENDPOINT || true
+    MINIO_ENDPOINT="${MINIO_ENDPOINT:-$_CUR_ENDPOINT}"
+    [[ -n "$MINIO_ENDPOINT" ]] || error "Endpoint 不能为空"
+    read -rp "自定义域名 / CDN Domain（完整 https:// URL，可留空）[${_CUR_DOMAIN}]: " MINIO_DOMAIN || true
+    MINIO_DOMAIN="${MINIO_DOMAIN:-$_CUR_DOMAIN}"
+    read -rp "Path-Style Endpoint？多数自建 MinIO 需要开启 [y/N${_CUR_PATH_STYLE:+，当前:$_CUR_PATH_STYLE}]: " _PS || true
+    if [[ -n "$_PS" ]]; then
+        [[ "${_PS,,}" == "y" ]] && MINIO_PATH_STYLE="true" || MINIO_PATH_STYLE="false"
+    else
+        MINIO_PATH_STYLE="${_CUR_PATH_STYLE:-false}"
+    fi
+    read -rp "Bucket Region（无区域概念可留空，默认 us-east-1）[${_CUR_REGION}]: " MINIO_REGION || true
+    MINIO_REGION="${MINIO_REGION:-$_CUR_REGION}"
+
+    env_set "$DIR/.env" "MINIO_ACCESS_KEY" "$MINIO_KEY"
+    env_set "$DIR/.env" "MINIO_SECRET_KEY" "$MINIO_SECRET"
+    env_set "$DIR/.env" "MINIO_BUCKET"     "$MINIO_BUCKET"
+    env_set "$DIR/.env" "MINIO_DOMAIN"     "$MINIO_DOMAIN"
+    env_set "$DIR/.env" "MINIO_ENDPOINT"   "$MINIO_ENDPOINT"
+    env_set "$DIR/.env" "MINIO_PATH_STYLE" "$MINIO_PATH_STYLE"
+    env_set "$DIR/.env" "MINIO_REGION"     "$MINIO_REGION"
+    chmod 600 "$DIR/.env"
+    log "自建桶凭证已写入 .env"
+
+    # 就地重新生成 wp-config-extra.php：复用已有 salts/页面缓存设置，
+    # 同时补读已有 R2 凭证，避免只配置自建桶时把 R2 冲掉
+    local AK SK LK NK AS SS LS NS PC
+    AK=$(env_get "$DIR/.env" "WP_AUTH_KEY");        SK=$(env_get "$DIR/.env" "WP_SECURE_AUTH_KEY")
+    LK=$(env_get "$DIR/.env" "WP_LOGGED_IN_KEY");   NK=$(env_get "$DIR/.env" "WP_NONCE_KEY")
+    AS=$(env_get "$DIR/.env" "WP_AUTH_SALT");       SS=$(env_get "$DIR/.env" "WP_SECURE_AUTH_SALT")
+    LS=$(env_get "$DIR/.env" "WP_LOGGED_IN_SALT");  NS=$(env_get "$DIR/.env" "WP_NONCE_SALT")
+    PC=$(env_get "$DIR/.env" "PAGE_CACHE_ENABLED" 2>/dev/null || true); [[ "$PC" == "true" ]] || PC="false"
+    local R2K R2S R2B R2D R2E
+    R2K=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
+    R2S=$(env_get "$DIR/.env" "R2_SECRET_KEY" 2>/dev/null || true)
+    R2B=$(env_get "$DIR/.env" "R2_BUCKET" 2>/dev/null || true)
+    R2D=$(env_get "$DIR/.env" "R2_DOMAIN" 2>/dev/null || true)
+    R2E=$(env_get "$DIR/.env" "R2_ENDPOINT" 2>/dev/null || true)
+    _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "master" \
+        "$AK" "$SK" "$LK" "$NK" "$AS" "$SS" "$LS" "$NS" \
+        "$R2K" "$R2S" "$R2B" "$R2D" "$R2E" "$PC" \
+        "$MINIO_KEY" "$MINIO_SECRET" "$MINIO_BUCKET" "$MINIO_DOMAIN" "$MINIO_ENDPOINT" \
+        "$MINIO_PATH_STYLE" "$MINIO_REGION"
+    log "wp-config-extra.php 已刷新（自建桶常量已写入，salts 与页面缓存开关保持不变）"
+    info "提示: 以上只更新了主节点本机。worker 节点的凭证是构建镜像时随镜像烘焙下发的，"
+    info "      需要重新执行\"构建并推送镜像\"+\"worker 节点拉取部署\"，worker 才能拿到新凭证。"
+
+    if dc "$DIR" ps --services --filter status=running 2>/dev/null | grep -q "wordpress"; then
+        info "wp-config-extra.php 通过 require_once 加载，重启容器（非 force-recreate）即可生效"
+        read -rp "立即重启容器？[y/N]: " _MINIO_APPLY || true
+        if [[ "${_MINIO_APPLY,,}" == "y" ]]; then
+            dc "$DIR" restart wordpress \
+                && log "容器已重启，请到 Media Offloader 后台选择 MinIO 并 Test Connection" \
                 || warn "容器重启失败，请手动执行 docker compose restart wordpress"
         else
             info "记得稍后执行菜单重启容器，或手动 docker compose restart wordpress 使配置生效"
@@ -2675,28 +2834,47 @@ cmd_setup_pagecache() {
     LK=$(env_get "$DIR/.env" "WP_LOGGED_IN_KEY");   NK=$(env_get "$DIR/.env" "WP_NONCE_KEY")
     AS=$(env_get "$DIR/.env" "WP_AUTH_SALT");       SS=$(env_get "$DIR/.env" "WP_SECURE_AUTH_SALT")
     LS=$(env_get "$DIR/.env" "WP_LOGGED_IN_SALT");  NS=$(env_get "$DIR/.env" "WP_NONCE_SALT")
+    # v7.6: 自建 S3 兼容对象存储（MinIO）凭证，与 R2 同样处理：
+    # 主节点从 .env 读取，worker 从现有 wp-config-extra.php 的 ADVMO_MINIO_* 常量原样提取
+    local MK MS MB MD ME MP MR
     if [[ "$_ROLE" == "master" ]]; then
         R2K=$(env_get "$DIR/.env" "R2_ACCESS_KEY" 2>/dev/null || true)
         R2S=$(env_get "$DIR/.env" "R2_SECRET_KEY" 2>/dev/null || true)
         R2B=$(env_get "$DIR/.env" "R2_BUCKET" 2>/dev/null || true)
         R2D=$(env_get "$DIR/.env" "R2_DOMAIN" 2>/dev/null || true)
         R2E=$(env_get "$DIR/.env" "R2_ENDPOINT" 2>/dev/null || true)
+        MK=$(env_get "$DIR/.env" "MINIO_ACCESS_KEY" 2>/dev/null || true)
+        MS=$(env_get "$DIR/.env" "MINIO_SECRET_KEY" 2>/dev/null || true)
+        MB=$(env_get "$DIR/.env" "MINIO_BUCKET" 2>/dev/null || true)
+        MD=$(env_get "$DIR/.env" "MINIO_DOMAIN" 2>/dev/null || true)
+        ME=$(env_get "$DIR/.env" "MINIO_ENDPOINT" 2>/dev/null || true)
+        MP=$(env_get "$DIR/.env" "MINIO_PATH_STYLE" 2>/dev/null || true)
+        MR=$(env_get "$DIR/.env" "MINIO_REGION" 2>/dev/null || true)
     else
         # v7.5: worker 的 R2 凭证不在本机 .env（由主节点构建镜像时字面量烘焙进
         # wp-config-extra.php，随镜像 docker cp 下发），本机 .env 里查不到。
         # 这里就地刷新页面缓存开关时，如果直接留空会把已下发的 R2 凭证冲掉，
         # 所以改成从当前文件里的 ADVMO_* 常量原样提取，保持不变地写回。
+        # v7.6: 自建桶（MinIO）凭证同理处理。
         if [[ -f "$DIR/conf/wp-config-extra.php" ]]; then
             R2K=$(sed -n "s/.*define('ADVMO_CLOUDFLARE_R2_KEY',\s*'\(.*\)');/\1/p"      "$DIR/conf/wp-config-extra.php" | head -1)
             R2S=$(sed -n "s/.*define('ADVMO_CLOUDFLARE_R2_SECRET',\s*'\(.*\)');/\1/p"   "$DIR/conf/wp-config-extra.php" | head -1)
             R2B=$(sed -n "s/.*define('ADVMO_CLOUDFLARE_R2_BUCKET',\s*'\(.*\)');/\1/p"   "$DIR/conf/wp-config-extra.php" | head -1)
             R2D=$(sed -n "s/.*define('ADVMO_CLOUDFLARE_R2_DOMAIN',\s*'\(.*\)');/\1/p"   "$DIR/conf/wp-config-extra.php" | head -1)
             R2E=$(sed -n "s/.*define('ADVMO_CLOUDFLARE_R2_ENDPOINT',\s*'\(.*\)');/\1/p" "$DIR/conf/wp-config-extra.php" | head -1)
+            MK=$(sed -n "s/.*define('ADVMO_MINIO_KEY',\s*'\(.*\)');/\1/p"      "$DIR/conf/wp-config-extra.php" | head -1)
+            MS=$(sed -n "s/.*define('ADVMO_MINIO_SECRET',\s*'\(.*\)');/\1/p"   "$DIR/conf/wp-config-extra.php" | head -1)
+            MB=$(sed -n "s/.*define('ADVMO_MINIO_BUCKET',\s*'\(.*\)');/\1/p"   "$DIR/conf/wp-config-extra.php" | head -1)
+            MD=$(sed -n "s/.*define('ADVMO_MINIO_DOMAIN',\s*'\(.*\)');/\1/p"   "$DIR/conf/wp-config-extra.php" | head -1)
+            ME=$(sed -n "s/.*define('ADVMO_MINIO_ENDPOINT',\s*'\(.*\)');/\1/p" "$DIR/conf/wp-config-extra.php" | head -1)
+            MP=$(sed -n "s/.*define('ADVMO_MINIO_PATH_STYLE_ENDPOINT',\s*\(true\|false\));/\1/p" "$DIR/conf/wp-config-extra.php" | head -1)
+            MR=$(sed -n "s/.*define('ADVMO_MINIO_REGION',\s*'\(.*\)');/\1/p"   "$DIR/conf/wp-config-extra.php" | head -1)
         fi
     fi
     _write_wp_config_extra "$DIR/conf/wp-config-extra.php" "$_ROLE" \
         "$AK" "$SK" "$LK" "$NK" "$AS" "$SS" "$LS" "$NS" \
-        "$R2K" "$R2S" "$R2B" "$R2D" "$R2E" "$NEW"
+        "$R2K" "$R2S" "$R2B" "$R2D" "$R2E" "$NEW" \
+        "$MK" "$MS" "$MB" "$MD" "$ME" "$MP" "$MR"
     log "wp-config-extra.php 已刷新"
 
     if dc "$DIR" ps --services --filter status=running 2>/dev/null | grep -q "wordpress"; then
@@ -3283,6 +3461,7 @@ interactive_menu() {
         echo -e "  \e[32m18.\e[0m 配置 R2 媒体卸载（Advanced Media Offloader）"
         echo -e "  \e[36m19.\e[0m 脚本自更新（从 GitHub 拉取）"
         echo -e "  \e[32m20.\e[0m 配置 Redis 全页缓存开关"
+        echo -e "  \e[32m21.\e[0m 配置自建对象存储媒体卸载（MinIO / S3 兼容自建桶）"
         echo -e "  \e[36m 0.\e[0m 退出"
         echo "----------------------------------------"
         read -rp "选择: " CHOICE || true
@@ -3307,6 +3486,7 @@ interactive_menu() {
             18) cmd_setup_r2 ;;
             19) cmd_self_update ;;
             20) cmd_setup_pagecache ;;
+            21) cmd_setup_minio ;;
             0)  info "再见！"; exit 0 ;;
             *)  warn "无效输入" ;;
         esac
